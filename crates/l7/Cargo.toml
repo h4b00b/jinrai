@@ -1,0 +1,24 @@
+[package]
+name = "jinrai-l7"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "L7 HTTP/API constant-rate load generation."
+
+[dependencies]
+jinrai-core   = { workspace = true }
+jinrai-safety = { workspace = true }
+
+# Async runtime — the L7 engine builds its own multi-thread runtime inside
+# execute() so core stays runtime-agnostic.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+# HTTP client. rustls (no OpenSSL/system TLS), trimmed default features, one
+# shared Client for connection pooling. `resolve_to_addrs` is used to pin the
+# host to the gate-authorized IP(s).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+# Latency percentiles.
+hdrhistogram = "7"
+
+[lints.rust]
+unsafe_code = "forbid"

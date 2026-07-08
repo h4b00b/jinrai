@@ -1,0 +1,27 @@
+[package]
+name = "jinrai"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "jinrai CLI — orchestration and the operator-facing safety gate."
+
+[[bin]]
+name = "jinrai"
+path = "src/main.rs"
+
+[dependencies]
+jinrai-core    = { workspace = true }
+jinrai-safety  = { workspace = true }
+jinrai-l34     = { workspace = true }
+jinrai-l7      = { workspace = true }
+jinrai-metrics = { workspace = true }
+# std-only arg parsing for now; clap is a Phase 2 decision, weighed against
+# the supply-chain policy.
+# Ctrl-C -> kill-switch. A cross-platform signal hook is impossible under this
+# crate's forbid(unsafe); `ctrlc` is the minimal, widely-audited handler crate,
+# and a working abort control is safety-critical for a live traffic generator.
+ctrlc = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

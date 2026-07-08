@@ -1,0 +1,605 @@
+//! Append-only, tamper-evident audit log for jinrai runs.
+//!
+//! Every consequential action — a run being authorized, completing, or being
+//! refused — is appended as one JSON object per line (JSONL). For an authorized
+//! dual-use traffic generator, an accountable trail of *what was fired at whom,
+//! by whom, and with what outcome* is a compliance requirement, not a nicety.
+//!
+//! ## Tamper-evidence (hash chain)
+//!
+//! Each record carries the SHA-256 hash of the previous record (`prev`) and its
+//! own hash (`hash`), computed over the record's entire serialized body
+//! *including* `prev`. Any edit to any field breaks that record's `hash`; any
+//! deletion, reordering, or insertion breaks the `prev` linkage of the
+//! neighbouring record. [`verify`] walks the file and reports the first break.
+//!
+//! This gives **tamper-evidence**, not cryptographic non-repudiation: an actor
+//! who can rewrite the whole file can recompute a fresh consistent chain. Closing
+//! that gap needs a secret key (HMAC) or external anchoring and is out of scope
+//! here; the chain defeats casual edits, truncation, and selective deletion,
+//! which is what an on-host audit log is realistically up against.
+//!
+//! The format is deliberately plain JSONL so it stays greppable / `jq`-able and
+//! needs no bespoke reader.
+
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use jinrai_core::RunReport;
+use sha2::{Digest, Sha256};
+
+/// The `prev` value of the very first record — a chain "genesis" anchor.
+const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// One auditable event. Serialized as the tail fields of a JSONL record; the
+/// common envelope (seq, timestamps, operator, prev/hash) is added by
+/// [`AuditLog`].
+#[derive(Debug, Clone)]
+pub enum AuditEvent {
+    /// Targets passed the gate and a run is about to start.
+    RunAuthorized {
+        layer: String,
+        mode: String,
+        rate_per_sec: u64,
+        duration_secs: u64,
+        /// Authorized target descriptors (IP literals or host names).
+        targets: Vec<String>,
+        /// The operator-supplied allowlist rules in effect for this run.
+        allow_rules: Vec<String>,
+    },
+    /// A run finished; carries the outcome metrics.
+    RunCompleted {
+        layer_label: String,
+        units_sent: u64,
+        errors: u64,
+        aborted_early: bool,
+        p50_micros: u64,
+        p90_micros: u64,
+        p99_micros: u64,
+        max_micros: u64,
+    },
+    /// A run was refused (fail-closed) before or during execution.
+    RunRefused {
+        /// Where it was refused: e.g. "authorization", "preflight", "outcome".
+        stage: String,
+        reason: String,
+    },
+}
+
+impl AuditEvent {
+    /// Build a `RunCompleted` event straight from a [`RunReport`].
+    pub fn completed(report: &RunReport) -> Self {
+        AuditEvent::RunCompleted {
+            layer_label: report.layer_label.clone(),
+            units_sent: report.units_sent,
+            errors: report.errors,
+            aborted_early: report.aborted_early,
+            p50_micros: report.p50_micros,
+            p90_micros: report.p90_micros,
+            p99_micros: report.p99_micros,
+            max_micros: report.max_micros,
+        }
+    }
+
+    /// Serialize just this event's fields (no leading/trailing comma or braces).
+    fn fields_json(&self) -> String {
+        match self {
+            AuditEvent::RunAuthorized {
+                layer,
+                mode,
+                rate_per_sec,
+                duration_secs,
+                targets,
+                allow_rules,
+            } => format!(
+                "\"event\":\"run_authorized\",\"layer\":\"{}\",\"mode\":\"{}\",\
+                 \"rate_per_sec\":{},\"duration_secs\":{},\"targets\":{},\"allow_rules\":{}",
+                json_escape(layer),
+                json_escape(mode),
+                rate_per_sec,
+                duration_secs,
+                json_str_array(targets),
+                json_str_array(allow_rules),
+            ),
+            AuditEvent::RunCompleted {
+                layer_label,
+                units_sent,
+                errors,
+                aborted_early,
+                p50_micros,
+                p90_micros,
+                p99_micros,
+                max_micros,
+            } => format!(
+                "\"event\":\"run_completed\",\"layer\":\"{}\",\"units_sent\":{},\"errors\":{},\
+                 \"aborted_early\":{},\"latency_us\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}}",
+                json_escape(layer_label),
+                units_sent,
+                errors,
+                aborted_early,
+                p50_micros,
+                p90_micros,
+                p99_micros,
+                max_micros,
+            ),
+            AuditEvent::RunRefused { stage, reason } => format!(
+                "\"event\":\"run_refused\",\"stage\":\"{}\",\"reason\":\"{}\"",
+                json_escape(stage),
+                json_escape(reason),
+            ),
+        }
+    }
+}
+
+/// An append-only, hash-chained audit log backed by a file.
+///
+/// Opening an existing log recovers the last record's hash and sequence number
+/// so new records continue the *same* chain across process runs — that
+/// cross-run continuity is what lets [`verify`] detect a whole run being deleted
+/// from the middle of the file.
+pub struct AuditLog {
+    file: File,
+    path: PathBuf,
+    operator: String,
+    seq: u64,
+    prev_hash: String,
+}
+
+impl AuditLog {
+    /// Open (creating if absent) the log at `path`, attributing records to
+    /// `operator`. Refuses to open a log whose tail record is unparsable, so we
+    /// never append onto a corrupted chain (fail-closed).
+    pub fn open(path: impl AsRef<Path>, operator: impl Into<String>) -> Result<Self, AuditError> {
+        let path = path.as_ref().to_path_buf();
+
+        // Recover chain state from any existing content.
+        let (seq, prev_hash) = match File::open(&path) {
+            Ok(f) => {
+                let mut last = None;
+                for line in BufReader::new(f).lines() {
+                    let line = line.map_err(|e| AuditError::io(&path, e))?;
+                    if !line.trim().is_empty() {
+                        last = Some(line);
+                    }
+                }
+                match last {
+                    Some(line) => {
+                        let hash = extract_hash(&line)
+                            .ok_or_else(|| AuditError::Corrupt {
+                                path: path.clone(),
+                                line: 0,
+                                detail: "existing log's last record has no readable hash".into(),
+                            })?;
+                        let seq = extract_seq(&line).ok_or_else(|| AuditError::Corrupt {
+                            path: path.clone(),
+                            line: 0,
+                            detail: "existing log's last record has no readable seq".into(),
+                        })?;
+                        (seq + 1, hash)
+                    }
+                    None => (0, GENESIS.to_string()),
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (0, GENESIS.to_string()),
+            Err(e) => return Err(AuditError::io(&path, e)),
+        };
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| AuditError::io(&path, e))?;
+
+        Ok(Self {
+            file,
+            path,
+            operator: operator.into(),
+            seq,
+            prev_hash,
+        })
+    }
+
+    /// The path this log writes to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append one record for `event`, extending the hash chain, and flush it to
+    /// disk before returning. A failure here is surfaced to the caller so an
+    /// operator can treat "could not record the audit trail" as a reason to
+    /// abort rather than emit untracked traffic.
+    pub fn record(&mut self, event: &AuditEvent) -> Result<(), AuditError> {
+        let ts_unix = now_unix();
+        // Body = everything except the trailing hash field. The hash is computed
+        // over exactly this string, so any later edit to any field is detectable.
+        let body = format!(
+            "{{\"seq\":{},\"ts_unix\":{},\"ts\":\"{}\",\"operator\":\"{}\",{},\"prev\":\"{}\"",
+            self.seq,
+            ts_unix,
+            format_rfc3339(ts_unix),
+            json_escape(&self.operator),
+            event.fields_json(),
+            self.prev_hash,
+        );
+        let hash = sha256_hex(body.as_bytes());
+        let line = format!("{body},\"hash\":\"{hash}\"}}\n");
+
+        self.file
+            .write_all(line.as_bytes())
+            .map_err(|e| AuditError::io(&self.path, e))?;
+        self.file
+            .flush()
+            .map_err(|e| AuditError::io(&self.path, e))?;
+
+        self.seq += 1;
+        self.prev_hash = hash;
+        Ok(())
+    }
+}
+
+/// Walk the log at `path` and confirm the hash chain is intact.
+///
+/// Returns the number of records verified on success. On the first inconsistency
+/// (a record whose recomputed hash differs, or whose `prev` does not match the
+/// preceding record's hash) it returns an [`AuditError::Tampered`] naming the
+/// offending line.
+pub fn verify(path: impl AsRef<Path>) -> Result<usize, AuditError> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| AuditError::io(path, e))?;
+
+    let mut expected_prev = GENESIS.to_string();
+    let mut count = 0usize;
+
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        let lineno = idx + 1;
+        let line = line.map_err(|e| AuditError::io(path, e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (body, stored_hash) = split_body_hash(&line).ok_or_else(|| AuditError::Corrupt {
+            path: path.to_path_buf(),
+            line: lineno,
+            detail: "record is not a well-formed audit line (no hash field)".into(),
+        })?;
+
+        let recomputed = sha256_hex(body.as_bytes());
+        if recomputed != stored_hash {
+            return Err(AuditError::Tampered {
+                path: path.to_path_buf(),
+                line: lineno,
+                detail: "record hash does not match its contents (edited in place)".into(),
+            });
+        }
+
+        let prev = extract_prev(body).ok_or_else(|| AuditError::Corrupt {
+            path: path.to_path_buf(),
+            line: lineno,
+            detail: "record has no readable prev field".into(),
+        })?;
+        if prev != expected_prev {
+            return Err(AuditError::Tampered {
+                path: path.to_path_buf(),
+                line: lineno,
+                detail: "record's prev hash breaks the chain (a record was removed, \
+                         reordered, or inserted)"
+                    .into(),
+            });
+        }
+
+        expected_prev = stored_hash.to_string();
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Errors from opening, writing, or verifying an audit log.
+#[derive(Debug)]
+pub enum AuditError {
+    /// Underlying filesystem error.
+    Io { path: PathBuf, source: io::Error },
+    /// The file exists but a record could not be parsed as an audit line.
+    Corrupt {
+        path: PathBuf,
+        line: usize,
+        detail: String,
+    },
+    /// The chain is internally inconsistent — evidence of tampering.
+    Tampered {
+        path: PathBuf,
+        line: usize,
+        detail: String,
+    },
+}
+
+impl AuditError {
+    fn io(path: &Path, source: io::Error) -> Self {
+        AuditError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for AuditError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuditError::Io { path, source } => {
+                write!(f, "audit log I/O error on {}: {source}", path.display())
+            }
+            AuditError::Corrupt { path, line, detail } => write!(
+                f,
+                "audit log {} is corrupt at line {line}: {detail}",
+                path.display()
+            ),
+            AuditError::Tampered { path, line, detail } => write!(
+                f,
+                "audit log {} FAILED integrity check at line {line}: {detail}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuditError {}
+
+// --- serialization / parsing helpers -------------------------------------
+
+/// Split an audit line into (body, stored_hash), where `body` is exactly the
+/// string that was hashed. Because every `"` inside a JSON *value* is escaped to
+/// `\"`, the structural `,"hash":"` separator cannot occur inside any field
+/// value, so locating it (from the right, to be safe) is unambiguous.
+fn split_body_hash(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim_end();
+    let marker = ",\"hash\":\"";
+    let at = line.rfind(marker)?;
+    let body = &line[..at];
+    let rest = &line[at + marker.len()..]; // `<hex>"}`
+    let hex = rest.strip_suffix("\"}")?;
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some((body, hex))
+    } else {
+        None
+    }
+}
+
+/// Read the `hash` value out of a full record line.
+fn extract_hash(line: &str) -> Option<String> {
+    split_body_hash(line).map(|(_, h)| h.to_string())
+}
+
+/// Read the `prev` value out of a record body (or full line).
+fn extract_prev(s: &str) -> Option<&str> {
+    let marker = "\"prev\":\"";
+    let at = s.rfind(marker)?;
+    let rest = &s[at + marker.len()..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Read the leading `seq` integer out of a record line.
+fn extract_seq(line: &str) -> Option<u64> {
+    let marker = "\"seq\":";
+    let at = line.find(marker)?;
+    let rest = &line[at + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Minimal JSON string escaping for the field values we emit.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn json_str_array(items: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, s) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(s));
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format a Unix timestamp (seconds) as an RFC 3339 UTC string, e.g.
+/// `2026-07-08T12:34:56Z`. Uses the standard days-from-civil algorithm so the
+/// audit log carries a human-readable time without pulling in a date crate.
+fn format_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Convert a count of days since the Unix epoch (1970-01-01) to a (year, month,
+/// day) civil date. Howard Hinnant's public-domain algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authorized_event() -> AuditEvent {
+        AuditEvent::RunAuthorized {
+            layer: "L4".into(),
+            mode: "udp-flood".into(),
+            rate_per_sec: 100,
+            duration_secs: 10,
+            targets: vec!["10.0.0.9".into()],
+            allow_rules: vec!["10.0.0.0/8".into()],
+        }
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("jinrai-audit-test-{}-{}.jsonl", std::process::id(), name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        // Epoch and a couple of anchored dates.
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
+        // A midnight in 2026 (1_783_641_600 = 20644 whole days since the epoch).
+        assert_eq!(format_rfc3339(1_783_641_600), "2026-07-10T00:00:00Z");
+    }
+
+    #[test]
+    fn append_then_verify_ok() {
+        let path = tmp_path("ok");
+        {
+            let mut log = AuditLog::open(&path, "tester@example.com").unwrap();
+            log.record(&authorized_event()).unwrap();
+            let r = RunReport {
+                layer_label: "L4 (udp-flood)".into(),
+                units_sent: 42,
+                ..Default::default()
+            };
+            log.record(&AuditEvent::completed(&r)).unwrap();
+        }
+        assert_eq!(verify(&path).unwrap(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn chain_continues_across_reopen() {
+        // Deleting a record from the middle must be detectable *because* the
+        // second session chained onto the first.
+        let path = tmp_path("reopen");
+        {
+            let mut log = AuditLog::open(&path, "op").unwrap();
+            log.record(&authorized_event()).unwrap();
+        }
+        {
+            let mut log = AuditLog::open(&path, "op").unwrap();
+            log.record(&AuditEvent::RunRefused {
+                stage: "outcome".into(),
+                reason: "target unreachable".into(),
+            })
+            .unwrap();
+        }
+        assert_eq!(verify(&path).unwrap(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn in_place_edit_is_detected() {
+        let path = tmp_path("edit");
+        {
+            let mut log = AuditLog::open(&path, "op").unwrap();
+            log.record(&authorized_event()).unwrap();
+        }
+        // Flip a byte inside a field value without touching the hash.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let tampered = content.replace("10.0.0.9", "10.0.0.1");
+        assert_ne!(content, tampered);
+        std::fs::write(&path, tampered).unwrap();
+
+        match verify(&path) {
+            Err(AuditError::Tampered { line, .. }) => assert_eq!(line, 1),
+            other => panic!("expected Tampered, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn deleting_a_record_breaks_the_chain() {
+        let path = tmp_path("delete");
+        {
+            let mut log = AuditLog::open(&path, "op").unwrap();
+            log.record(&authorized_event()).unwrap();
+            log.record(&AuditEvent::RunRefused {
+                stage: "preflight".into(),
+                reason: "no CAP_NET_RAW".into(),
+            })
+            .unwrap();
+            log.record(&AuditEvent::completed(&RunReport::default())).unwrap();
+        }
+        // Remove the middle record; the third's prev now dangles.
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "{}", lines[0]).unwrap();
+        writeln!(f, "{}", lines[2]).unwrap();
+        drop(f);
+
+        match verify(&path) {
+            Err(AuditError::Tampered { line, .. }) => assert_eq!(line, 2),
+            other => panic!("expected Tampered on the second surviving line, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn split_body_hash_is_unambiguous_with_tricky_values() {
+        // A reason string containing the literal characters of the hash marker
+        // must not confuse the splitter (the real one has an unescaped quote).
+        let path = tmp_path("tricky");
+        {
+            let mut log = AuditLog::open(&path, "op").unwrap();
+            log.record(&AuditEvent::RunRefused {
+                stage: "authorization".into(),
+                reason: "weird \",\\\"hash\\\":\\\" value".into(),
+            })
+            .unwrap();
+        }
+        assert_eq!(verify(&path).unwrap(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+}

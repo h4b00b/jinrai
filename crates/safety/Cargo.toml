@@ -1,0 +1,13 @@
+[package]
+name = "jinrai-safety"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Authorization gate: allowlist, kill-switch, rate caps. std-only by policy."
+
+[dependencies]
+# NONE. This crate is the trust anchor and stays dependency-free on purpose.
+
+[lints.rust]
+unsafe_code = "forbid"     # the gate must never use unsafe

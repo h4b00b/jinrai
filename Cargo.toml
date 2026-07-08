@@ -1,0 +1,35 @@
+# jinrai — internal network resilience / stress-testing tool
+# Workspace root. Coordinated by PM; see README.md for team + roadmap.
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/safety",
+    "crates/l34",
+    "crates/l7",
+    "crates/metrics",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false            # internal tool, never published to crates.io
+authors = ["h4b00b"]
+
+[workspace.dependencies]
+# Internal crates
+jinrai-core    = { path = "crates/core" }
+jinrai-safety  = { path = "crates/safety" }
+jinrai-l34     = { path = "crates/l34" }
+jinrai-l7      = { path = "crates/l7" }
+jinrai-metrics = { path = "crates/metrics" }
+
+# Deliberately NO external deps in the workspace-wide set yet.
+# Each crate declares its own; `safety` and `core` stay std-only by policy.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
