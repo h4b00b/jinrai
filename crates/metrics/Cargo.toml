@@ -1,0 +1,19 @@
+[package]
+name = "jinrai-metrics"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Telemetry, reporting and a tamper-evident audit log (Phase 4)."
+
+[dependencies]
+jinrai-core = { workspace = true }
+# SHA-256 for the append-only audit log's hash chain (tamper-evidence). std has
+# no hash primitive; `sha2` is the standard, widely-audited RustCrypto impl.
+# `metrics` is not a trust anchor (unlike `safety`/`core`), so a vetted dep here
+# is an acceptable, deliberate supply-chain call — same reasoning as `ctrlc` in
+# the CLI.
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"

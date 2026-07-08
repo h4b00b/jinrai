@@ -1,0 +1,13 @@
+[package]
+name = "jinrai-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Shared engine vocabulary and module contract. std-only for now."
+
+[dependencies]
+jinrai-safety = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
