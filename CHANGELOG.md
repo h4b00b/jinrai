@@ -10,7 +10,30 @@ the safety gate, authorization, or auditability are called out under
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **L7 request primitives** — the L7 engine is no longer GET-only. `--l7-method`
+  selects `get` | `post` | `head` (fast, reqwest-based, constant-rate) plus two
+  slow-connection primitives, `slowloris` and `slowbody`. `--body` supplies a
+  POST body; `--cache-bust` appends a unique `_cb=<n>` query to every request so
+  caches/CDNs cannot serve a stored response.
+- **Slow-connection L7 engine (`l7::slow`)** — Slowloris (partial request
+  headers, never terminated) and slow-body / RUDY (oversized `Content-Length`
+  with the body trickled a byte at a time). Bounded by `--slow-connections`
+  (concurrent ceiling) and `--drip-ms` (keep-alive interval); the rate cap is
+  reinterpreted as connections-opened-per-second. Header-profile techniques
+  (null/oddball `User-Agent`, `Cookie`, `Referer`, …) are expressed via the
+  existing `--header` flag rather than hard-coded vendor "bypass" presets.
+
+### Security
+
+- The fast and slow L7 primitives share the **identical** trust boundary: the
+  URL host is authorized as a datum and resolved exactly once to a pinned connect
+  address, so every request/connection only ever reaches the gate-authorized
+  target. The cache-buster mutates only the query string — never the host — so
+  the datum authorization and the pinned resolution still hold for every request.
+- Slow mode is **http-only** for now: an `https` URL is refused fail-closed
+  (dribbling raw bytes through a TLS session is not implemented).
 
 ## [0.1.0] — 2026-07-08
 

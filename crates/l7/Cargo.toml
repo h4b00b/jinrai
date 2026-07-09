@@ -12,7 +12,7 @@ jinrai-safety = { workspace = true }
 
 # Async runtime — the L7 engine builds its own multi-thread runtime inside
 # execute() so core stays runtime-agnostic.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 # HTTP client. rustls (no OpenSSL/system TLS), trimmed default features, one
 # shared Client for connection pooling. `resolve_to_addrs` is used to pin the
 # host to the gate-authorized IP(s).
