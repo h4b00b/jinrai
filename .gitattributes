@@ -1,0 +1,11 @@
+# Normalize line endings: store text as LF in the repo, regardless of the
+# platform the working tree is checked out on. Prevents the whole-file CRLF
+# churn that otherwise appears in diffs on Windows checkouts.
+* text=auto eol=lf
+
+# Explicitly LF for source and scripts.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+*.lock text eol=lf

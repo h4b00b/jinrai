@@ -1,7 +1,7 @@
 # jinrai
 
 Internal network **resilience / stress-testing** tool for authorized internal infrastructure.
-Covers L3/L4 and L7. Built in-house and validated in-house per company policy.
+Covers L3/L4 and L7. Built in-house and validated in-house.
 
 > **Scope & authorization.** This tool is for testing infrastructure we own or
 > are explicitly authorized to test. It is **fail-closed**: it refuses to send
@@ -23,7 +23,7 @@ jinrai/  (Cargo workspace)
 ├── crates/core     # engine vocabulary + StressModule contract
 ├── crates/safety   # ⚠ THE GATE: allowlist, kill-switch, authorization (std-only, zero deps)
 ├── crates/l34      # L3/L4 packet generation — lab/isolated nets only  (UDP / TCP-connect / SYN)
-├── crates/l7       # L7 HTTP/API constant-rate load                    (tokio + reqwest/rustls)
+├── crates/l7       # L7 HTTP load: GET/POST/HEAD + Slowloris/slow-body  (tokio + reqwest/rustls)
 ├── crates/metrics  # reporting + tamper-evident audit log             (SHA-256 hash chain)
 └── crates/cli      # `jinrai` binary — orchestration + operator gate
 ```
@@ -77,6 +77,31 @@ DNS-name host against the DNS rules) and only then resolved once and pinned:
 ```sh
 jinrai --layer l7 --allow '*.staging.internal' \
        --url https://api.staging.internal/health --rate 200 --duration 30
+```
+
+`--l7-method` selects the request primitive (default `get`):
+
+| Method | Kind | Notes |
+|---|---|---|
+| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host) |
+| `slowloris` | slow connection | partial request headers, never terminated |
+| `slowbody` | slow connection | oversized `Content-Length`, body trickled a byte at a time (RUDY) |
+
+For slow modes the rate cap means *connections opened per second*; `--slow-connections`
+is the concurrent ceiling and `--drip-ms` the keep-alive write interval. Slow mode is
+http-only for now (an `https` URL is refused fail-closed). Header-profile tests
+(`User-Agent`, `Cookie`, `Referer`, …) use the repeatable `--header` flag.
+
+```sh
+# POST flood with a body and cache-busting
+jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
+       --url http://api.staging.internal/ingest --body '{"probe":1}' \
+       --cache-bust --rate 200 --duration 30
+
+# Slowloris: hold 200 half-open connections, one header line every 10s
+jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
+       --url http://api.staging.internal/ --slow-connections 200 \
+       --drip-ms 10000 --rate 50 --duration 60
 ```
 
 **L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,
