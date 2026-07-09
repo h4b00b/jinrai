@@ -53,18 +53,66 @@ use tokio::time::MissedTickBehavior;
 use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
 use jinrai_safety::{AuthorizedTarget, Authorization, SafetyError};
 
-/// What to request. Method is GET for the MVP (see module-level TODO).
+pub mod slow;
+pub use slow::{L7SlowEngine, SlowConfig, SlowMode};
+
+/// Which HTTP request shape to generate. Every variant reuses the *same*
+/// constant-rate dispatch, rate-cap, kill-switch and latency histogram — they
+/// differ only in how each individual request is built. This is the L7 analogue
+/// of [`jinrai_l34::L4Mode`]: a small closed set of request-flood primitives,
+/// deliberately *not* a bag of vendor-specific "bypass" presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum L7Method {
+    /// Plain GET flood (the historical MVP).
+    #[default]
+    Get,
+    /// POST flood; carries [`RequestSpec::body`] as the request body.
+    Post,
+    /// HEAD flood — exercises method-specific handling / rate limits.
+    Head,
+}
+
+impl L7Method {
+    fn label(self) -> &'static str {
+        match self {
+            L7Method::Get => "l7-http-get",
+            L7Method::Post => "l7-http-post",
+            L7Method::Head => "l7-http-head",
+        }
+    }
+}
+
+/// What to request. A GET/POST/HEAD against one authorized datum, optionally
+/// with a body and per-request cache-busting.
 #[derive(Debug, Clone)]
 pub struct RequestSpec {
     /// Absolute URL, e.g. `http://127.0.0.1:8080/health`.
     pub url: String,
-    /// Optional extra request headers as `(name, value)` pairs.
+    /// Which request primitive to run.
+    pub method: L7Method,
+    /// Optional extra request headers as `(name, value)` pairs. This is also the
+    /// hook for header-profile techniques (null/oddball User-Agent, a fixed
+    /// Cookie, a Referer, …): the operator supplies them here rather than the
+    /// engine hard-coding vendor-specific evasion.
     pub headers: Vec<(String, String)>,
+    /// Request body sent with each POST (ignored for GET/HEAD).
+    pub body: Option<Vec<u8>>,
+    /// Cache-buster: append a unique `_cb=<n>` query parameter to every request
+    /// so caches/CDNs cannot serve a stored response. Only the **query** is
+    /// mutated — never the host — so the datum authorization and the pinned DNS
+    /// resolution still hold for every request.
+    pub cache_bust: bool,
 }
 
 impl RequestSpec {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into(), headers: Vec::new() }
+        Self {
+            url: url.into(),
+            method: L7Method::Get,
+            headers: Vec::new(),
+            body: None,
+            cache_bust: false,
+        }
     }
 }
 
@@ -88,6 +136,9 @@ pub enum L7Error {
     BadHeader(String),
     /// Building the HTTP client failed.
     Client(String),
+    /// A slow-connection run was asked for an `https` URL. Dribbling raw bytes
+    /// through a TLS session is not implemented yet; slow mode is http-only.
+    SlowHttpsUnsupported,
 }
 
 impl std::fmt::Display for L7Error {
@@ -101,6 +152,9 @@ impl std::fmt::Display for L7Error {
             L7Error::Refused(e) => write!(f, "datum refused by safety gate: {e}"),
             L7Error::BadHeader(s) => write!(f, "invalid header: {s}"),
             L7Error::Client(s) => write!(f, "failed to build HTTP client: {s}"),
+            L7Error::SlowHttpsUnsupported => {
+                write!(f, "slow mode is http-only for now; refusing https URL (TLS dribble not implemented)")
+            }
         }
     }
 }
@@ -108,13 +162,55 @@ impl std::fmt::Display for L7Error {
 impl std::error::Error for L7Error {}
 
 /// The URL's host after it has been authorized as a datum. `ip` is `Some` when
-/// the host was an IP literal (so no DNS is needed at all).
-struct Datum {
-    target: AuthorizedTarget,
-    url: Url,
-    host: String,
-    port: u16,
-    ip: Option<IpAddr>,
+/// the host was an IP literal (so no DNS is needed at all). Crate-visible so the
+/// slow-connection engine ([`slow`]) shares the exact same safety boundary.
+pub(crate) struct Datum {
+    pub(crate) target: AuthorizedTarget,
+    pub(crate) url: Url,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) ip: Option<IpAddr>,
+}
+
+/// Authorize a URL's host as a datum: an IP-literal host against the IP/CIDR
+/// rules, a DNS-name host against the DNS rules. No DNS resolution happens here
+/// for name targets — the name string itself is what is authorized. Shared by
+/// [`L7Engine`] and [`slow::L7SlowEngine`] so there is a single trust boundary.
+pub(crate) fn authorize_datum(gate: &Authorization, url_str: &str) -> Result<Datum, L7Error> {
+    let url = Url::parse(url_str).map_err(|e| L7Error::InvalidUrl(e.to_string()))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(L7Error::UnsupportedScheme(other.to_string())),
+    }
+    let host = url.host_str().ok_or(L7Error::MissingHost)?.to_string();
+    let port = url.port_or_known_default().ok_or(L7Error::MissingHost)?;
+
+    // Datum-based: an IP-literal host is checked as an IP; anything else is
+    // checked as a DNS name (its resolved IP is never independently checked).
+    let (target, ip) = if let Ok(ip) = host.parse::<IpAddr>() {
+        (gate.authorize(ip).map_err(L7Error::Refused)?, Some(ip))
+    } else {
+        (gate.authorize_host(&host).map_err(L7Error::Refused)?, None)
+    };
+
+    Ok(Datum { target, url, host, port, ip })
+}
+
+/// Resolve an authorized datum to connect address(es) exactly ONCE: the IP
+/// itself for a literal, else a single DNS lookup. This is the only resolution
+/// in a run — pinning to it closes the TOCTOU window. Shared by both engines.
+pub(crate) fn resolve_addrs(datum: &Datum) -> Result<Vec<SocketAddr>, L7Error> {
+    let addrs: Vec<SocketAddr> = match datum.ip {
+        Some(ip) => vec![SocketAddr::new(ip, datum.port)],
+        None => (datum.host.as_str(), datum.port)
+            .to_socket_addrs()
+            .map_err(|e| L7Error::Dns(e.to_string()))?
+            .collect(),
+    };
+    if addrs.is_empty() {
+        return Err(L7Error::NoAddresses);
+    }
+    Ok(addrs)
 }
 
 /// The L7 HTTP load engine. Holds the request spec and a clone of the safety
@@ -139,23 +235,7 @@ impl L7Engine {
     }
 
     fn authorize_datum(&self) -> Result<Datum, L7Error> {
-        let url = Url::parse(&self.spec.url).map_err(|e| L7Error::InvalidUrl(e.to_string()))?;
-        match url.scheme() {
-            "http" | "https" => {}
-            other => return Err(L7Error::UnsupportedScheme(other.to_string())),
-        }
-        let host = url.host_str().ok_or(L7Error::MissingHost)?.to_string();
-        let port = url.port_or_known_default().ok_or(L7Error::MissingHost)?;
-
-        // Datum-based: an IP-literal host is checked as an IP; anything else is
-        // checked as a DNS name (its resolved IP is never independently checked).
-        let (target, ip) = if let Ok(ip) = host.parse::<IpAddr>() {
-            (self.gate.authorize(ip).map_err(L7Error::Refused)?, Some(ip))
-        } else {
-            (self.gate.authorize_host(&host).map_err(L7Error::Refused)?, None)
-        };
-
-        Ok(Datum { target, url, host, port, ip })
+        authorize_datum(&self.gate, &self.spec.url)
     }
 
     fn headers(&self) -> Result<HeaderMap, L7Error> {
@@ -176,18 +256,9 @@ impl L7Engine {
     fn prepare(&self) -> Result<(reqwest::Client, Url), L7Error> {
         let datum = self.authorize_datum()?;
 
-        // Connect address(es): the IP itself for a literal, else a single DNS
-        // lookup. This is the only resolution in the whole run.
-        let addrs: Vec<SocketAddr> = match datum.ip {
-            Some(ip) => vec![SocketAddr::new(ip, datum.port)],
-            None => (datum.host.as_str(), datum.port)
-                .to_socket_addrs()
-                .map_err(|e| L7Error::Dns(e.to_string()))?
-                .collect(),
-        };
-        if addrs.is_empty() {
-            return Err(L7Error::NoAddresses);
-        }
+        // Connect address(es): the only resolution in the whole run (see
+        // `resolve_addrs`).
+        let addrs = resolve_addrs(&datum)?;
 
         let headers = self.headers()?;
         let client = reqwest::Client::builder()
@@ -215,7 +286,7 @@ impl StressModule for L7Engine {
     }
 
     fn name(&self) -> &str {
-        "l7-http"
+        self.spec.method.label()
     }
 
     fn execute(&mut self, plan: &RunPlan) -> RunReport {
@@ -229,7 +300,11 @@ impl StressModule for L7Engine {
         // Rate cap: min spacing between dispatches. `None` => refuse to send.
         let Some(interval_dur) = plan.rate_cap.min_interval() else {
             return RunReport {
-                layer_label: format!("L7 http GET {} (rate cap 0 — sent nothing)", self.spec.url),
+                layer_label: format!(
+                    "L7 {} {} (rate cap 0 — sent nothing)",
+                    self.spec.method.label(),
+                    self.spec.url
+                ),
                 aborted_early: false,
                 ..Default::default()
             };
@@ -253,6 +328,12 @@ impl StressModule for L7Engine {
 
         let kill = plan.kill.clone();
         let duration = plan.duration;
+
+        // Per-request shape, captured once and shared across dispatched tasks.
+        let method = self.spec.method;
+        let body = self.spec.body.clone().map(Arc::new);
+        let cache_bust = self.spec.cache_bust;
+        let cb_counter = Arc::new(AtomicU64::new(0));
 
         // Clones move into the runtime; the originals are read back afterwards.
         let sent_w = sent.clone();
@@ -286,9 +367,29 @@ impl StressModule for L7Engine {
                 let sent = sent_w.clone();
                 let errors = errors_w.clone();
                 let hist = hist_w.clone();
+                let body = body.clone();
+                let cb_counter = cb_counter.clone();
                 tasks.spawn(async move {
+                    // Cache-buster touches ONLY the query string, so the host
+                    // remains the gate-authorized, DNS-pinned one.
+                    let req_url = if cache_bust {
+                        let mut u = url;
+                        let n = cb_counter.fetch_add(1, Ordering::Relaxed);
+                        u.query_pairs_mut().append_pair("_cb", &n.to_string());
+                        u
+                    } else {
+                        url
+                    };
+                    let req = match method {
+                        L7Method::Get => client.get(req_url),
+                        L7Method::Head => client.head(req_url),
+                        L7Method::Post => match &body {
+                            Some(bytes) => client.post(req_url).body(bytes.as_ref().clone()),
+                            None => client.post(req_url),
+                        },
+                    };
                     let started = Instant::now();
-                    match client.get(url).send().await {
+                    match req.send().await {
                         Ok(_resp) => {
                             let micros = started.elapsed().as_micros() as u64;
                             sent.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +414,7 @@ impl StressModule for L7Engine {
 
         let hist = hist.lock().unwrap_or_else(|p| p.into_inner());
         RunReport {
-            layer_label: format!("L7 http GET {}", self.spec.url),
+            layer_label: format!("L7 {} {}", self.spec.method.label(), self.spec.url),
             units_sent: sent.load(Ordering::Relaxed),
             errors: errors.load(Ordering::Relaxed),
             aborted_early: aborted,
@@ -327,7 +428,7 @@ impl StressModule for L7Engine {
 
 /// Resolve when the kill switch trips. Polled at a fine granularity so a run
 /// stops promptly even when the dispatch interval is coarse (low rates).
-async fn wait_for_kill(kill: jinrai_safety::KillSwitch) {
+pub(crate) async fn wait_for_kill(kill: jinrai_safety::KillSwitch) {
     loop {
         if kill.is_tripped() {
             return;
@@ -468,6 +569,22 @@ mod tests {
         let report = engine.execute(&plan);
         assert_eq!(report.units_sent, 0);
         assert!(report.aborted_early);
+    }
+
+    #[test]
+    fn method_surfaces_in_engine_name() {
+        // The chosen primitive must be visible in the module name (logs/reports)
+        // and default to GET, preserving the historical behaviour.
+        for (method, want) in [
+            (L7Method::Get, "l7-http-get"),
+            (L7Method::Post, "l7-http-post"),
+            (L7Method::Head, "l7-http-head"),
+        ] {
+            let spec = RequestSpec { method, ..RequestSpec::new("http://127.0.0.1:9/") };
+            let engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), spec);
+            assert_eq!(engine.name(), want);
+        }
+        assert_eq!(RequestSpec::new("http://127.0.0.1:9/").method, L7Method::Get);
     }
 
     #[test]

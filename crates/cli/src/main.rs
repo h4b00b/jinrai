@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use jinrai_core::{Layer, RateCap, RunPlan, RunReport, StressModule};
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
-use jinrai_l7::{L7Engine, RequestSpec};
+use jinrai_l7::{L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode};
 use jinrai_metrics::{AuditEvent, AuditLog};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
 
@@ -47,10 +47,22 @@ REQUIRED:
 OPTIONS:
     --layer <l4|l7>       Module to run (default: l7)
     --l4-mode <udp|tcp|syn>  L3/L4 primitive (default: udp). 'syn' needs CAP_NET_RAW/root.
+    --l7-method <METHOD>  L7 primitive (default: get). One of:
+                            get | post | head   fast request flood
+                            slowloris            slow partial headers (Slowloris)
+                            slowbody             slow trickled POST body (RUDY)
+                          For slow modes the rate cap is connections-opened/sec.
+    --body <STRING>       Request body sent with each POST (l7-method post)
+    --cache-bust          Append a unique _cb=<n> query to every l7 request so
+                          caches/CDNs cannot serve a stored response (query only;
+                          the host is never altered)
+    --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
+    --drip-ms <MS>        Keep-alive write interval for slow modes (default: 10000)
     --payload-size <N>    UDP payload bytes (default: 64, l4-mode udp)
     --rate <N>            Rate cap, units/sec (default: 100)
     --duration <SECS>     Run duration (default: 10)
-    --header <K: V>       Extra request header for l7 (repeatable)
+    --header <K: V>       Extra request header for l7 (repeatable). Also the hook
+                          for header-profile tests (User-Agent, Cookie, Referer…)
     --audit-log <PATH>    Append a tamper-evident audit record for this run to
                           PATH (authorized/completed/refused). Operator identity
                           comes from $JINRAI_OPERATOR (else the OS user).
@@ -71,11 +83,24 @@ fn main() -> ExitCode {
     }
 }
 
+/// The selected L7 primitive: either a fast request-flood method (reqwest-based)
+/// or a slow-connection primitive (raw TCP, connection-holding).
+#[derive(Debug, Clone, Copy)]
+enum L7Kind {
+    Fast(L7Method),
+    Slow(SlowMode),
+}
+
 struct Args {
     allow: Vec<String>,
     targets: Vec<IpAddr>,
     url: Option<String>,
     headers: Vec<(String, String)>,
+    l7_kind: L7Kind,
+    body: Option<String>,
+    cache_bust: bool,
+    slow_connections: usize,
+    drip_ms: u64,
     layer: Layer,
     l4_mode: L4Mode,
     port: Option<u16>,
@@ -182,13 +207,34 @@ fn run_l7(
         .clone()
         .ok_or("--layer l7 requires --url <URL>")?;
 
-    let spec = RequestSpec { url: url.clone(), headers: args.headers.clone() };
-    let mut engine = L7Engine::new(gate, spec);
-
-    // Authorize the datum up front so we can fail-closed with a clear message
-    // and a non-zero exit BEFORE any traffic is generated.
-    let targets = match engine.authorize_target() {
-        Ok(t) => t,
+    // Build the selected engine and authorize its datum up front. Both engines
+    // authorize identically (datum + resolve-once); we box to a trait object so
+    // the audit/plan/execute flow below is shared. Fail-closed with a clear
+    // message and non-zero exit BEFORE any traffic is generated.
+    let built: Result<(Box<dyn StressModule>, Vec<AuthorizedTarget>), _> = match args.l7_kind {
+        L7Kind::Fast(method) => {
+            let spec = RequestSpec {
+                url: url.clone(),
+                method,
+                headers: args.headers.clone(),
+                body: args.body.clone().map(String::into_bytes),
+                cache_bust: args.cache_bust,
+            };
+            let engine = L7Engine::new(gate, spec);
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
+        L7Kind::Slow(mode) => {
+            let cfg = SlowConfig {
+                mode,
+                max_conns: args.slow_connections,
+                drip: Duration::from_millis(args.drip_ms),
+            };
+            let engine = L7SlowEngine::new(gate, url.clone(), cfg);
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
+    };
+    let (mut engine, targets) = match built {
+        Ok(pair) => pair,
         Err(e) => {
             audit_record(
                 &mut audit,
@@ -341,6 +387,11 @@ fn parse_args() -> Result<Args, String> {
     let mut targets = Vec::new();
     let mut url = None;
     let mut headers = Vec::new();
+    let mut l7_kind = L7Kind::Fast(L7Method::Get);
+    let mut body = None;
+    let mut cache_bust = false;
+    let mut slow_connections = 100usize;
+    let mut drip_ms = 10_000u64;
     let mut layer = Layer::L7;
     let mut l4_mode = L4Mode::Udp;
     let mut port = None;
@@ -367,6 +418,32 @@ fn parse_args() -> Result<Args, String> {
                 targets.push(ip);
             }
             "--url" => url = Some(next_val(&mut it, "--url")?),
+            "--l7-method" => {
+                l7_kind = match next_val(&mut it, "--l7-method")?.as_str() {
+                    "get" => L7Kind::Fast(L7Method::Get),
+                    "post" => L7Kind::Fast(L7Method::Post),
+                    "head" => L7Kind::Fast(L7Method::Head),
+                    "slowloris" => L7Kind::Slow(SlowMode::Headers),
+                    "slowbody" => L7Kind::Slow(SlowMode::Body),
+                    other => {
+                        return Err(format!(
+                            "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody)"
+                        ))
+                    }
+                }
+            }
+            "--body" => body = Some(next_val(&mut it, "--body")?),
+            "--cache-bust" => cache_bust = true,
+            "--slow-connections" => {
+                slow_connections = next_val(&mut it, "--slow-connections")?
+                    .parse()
+                    .map_err(|_| "invalid --slow-connections".to_string())?;
+            }
+            "--drip-ms" => {
+                drip_ms = next_val(&mut it, "--drip-ms")?
+                    .parse()
+                    .map_err(|_| "invalid --drip-ms".to_string())?;
+            }
             "--l4-mode" => {
                 l4_mode = match next_val(&mut it, "--l4-mode")?.as_str() {
                     "udp" => L4Mode::Udp,
@@ -424,6 +501,11 @@ fn parse_args() -> Result<Args, String> {
         targets,
         url,
         headers,
+        l7_kind,
+        body,
+        cache_bust,
+        slow_connections,
+        drip_ms,
         layer,
         l4_mode,
         port,
