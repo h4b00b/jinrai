@@ -10,17 +10,33 @@ mod audit;
 
 pub use audit::{verify, AuditError, AuditEvent, AuditLog};
 
-use jinrai_core::RunReport;
+use jinrai_core::{RunReport, SloVerdict};
 
 /// Render a run report as a plain-text summary line.
 ///
-/// Latency percentiles are appended only when at least one unit completed
-/// (stub layers report `units_sent == 0` and have no latency to show).
+/// A status-class breakdown is appended when any response was classified, and
+/// latency percentiles when at least one unit completed (stub / slow layers
+/// report `units_sent == 0` or all-zero status counts and have neither to show).
 pub fn render(report: &RunReport) -> String {
     let mut line = format!(
         "[{}] sent={} errors={} aborted_early={}",
         report.layer_label, report.units_sent, report.errors, report.aborted_early
     );
+    let classified =
+        report.status_2xx + report.status_3xx + report.status_4xx + report.status_5xx;
+    if classified > 0 || report.timeouts > 0 {
+        line.push_str(&format!(
+            " status(2xx={} 3xx={} 4xx={} 5xx={} timeout={})",
+            report.status_2xx,
+            report.status_3xx,
+            report.status_4xx,
+            report.status_5xx,
+            report.timeouts,
+        ));
+    }
+    if report.aborted_by_watchdog {
+        line.push_str(" watchdog=ABORTED");
+    }
     if report.units_sent > 0 {
         line.push_str(&format!(
             " latency_us(p50={} p90={} p99={} max={})",
@@ -28,6 +44,11 @@ pub fn render(report: &RunReport) -> String {
         ));
     }
     line
+}
+
+/// Render an SLO verdict as a one-line `SLO: PASS` / `SLO: FAIL (...)` summary.
+pub fn render_verdict(verdict: &SloVerdict) -> String {
+    format!("SLO: {verdict}")
 }
 
 #[cfg(test)]
@@ -41,24 +62,38 @@ mod tests {
             units_sent: 42,
             errors: 1,
             aborted_early: false,
+            status_2xx: 40,
+            status_5xx: 2,
             p50_micros: 1200,
             p90_micros: 3400,
             p99_micros: 9800,
             max_micros: 15000,
+            ..Default::default()
         };
         assert_eq!(
             render(&r),
             "[L7] sent=42 errors=1 aborted_early=false \
+             status(2xx=40 3xx=0 4xx=0 5xx=2 timeout=0) \
              latency_us(p50=1200 p90=3400 p99=9800 max=15000)"
         );
     }
 
     #[test]
-    fn omits_latency_when_nothing_sent() {
+    fn omits_latency_and_status_when_nothing_sent() {
         let r = RunReport {
             layer_label: "L4 (stub)".into(),
             ..Default::default()
         };
         assert_eq!(render(&r), "[L4 (stub)] sent=0 errors=0 aborted_early=false");
+    }
+
+    #[test]
+    fn renders_verdict_pass_and_fail() {
+        use jinrai_core::{SloBreach, SloVerdict};
+        assert_eq!(render_verdict(&SloVerdict::default()), "SLO: PASS");
+        let fail = SloVerdict {
+            breaches: vec![SloBreach::ServerErrorRate { observed: 0.2, limit: 0.1 }],
+        };
+        assert_eq!(render_verdict(&fail), "SLO: FAIL (5xx-rate 20.0% > 10.0%)");
     }
 }

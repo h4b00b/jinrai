@@ -14,9 +14,9 @@ use std::net::IpAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use jinrai_core::{Layer, RateCap, RunPlan, RunReport, StressModule};
+use jinrai_core::{Layer, RateCap, RunPlan, RunReport, SloSpec, SloVerdict, StressModule};
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
-use jinrai_l7::{L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode};
+use jinrai_l7::{L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode, WatchdogConfig};
 use jinrai_metrics::{AuditEvent, AuditLog};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
 
@@ -63,6 +63,18 @@ OPTIONS:
     --duration <SECS>     Run duration (default: 10)
     --header <K: V>       Extra request header for l7 (repeatable). Also the hook
                           for header-profile tests (User-Agent, Cookie, Referer…)
+
+    SLO / health-watchdog (l7 fast methods; classifies each response):
+    --slo-max-error-rate <F>  FAIL if transport-error rate exceeds F (0.0–1.0)
+    --slo-max-5xx-rate <F>    FAIL if 5xx-response rate exceeds F
+    --slo-max-4xx-rate <F>    FAIL if 4xx-response rate exceeds F (off by default)
+    --slo-max-p99-ms <MS>     FAIL if end-of-run p99 latency exceeds MS
+                          A run that misses any declared SLO exits non-zero.
+    --watchdog                Auto-abort the run when a rate SLO is breached for
+                          several consecutive windows (only STOPS traffic). Needs
+                          at least one --slo-max-*-rate to have something to watch.
+    --watchdog-window <SECS>  Watchdog sample window (default: 5)
+    --watchdog-breaches <K>   Consecutive breaching windows before abort (default: 3)
     --audit-log <PATH>    Append a tamper-evident audit record for this run to
                           PATH (authorized/completed/refused). Operator identity
                           comes from $JINRAI_OPERATOR (else the OS user).
@@ -108,6 +120,10 @@ struct Args {
     ack_l34_lab: bool,
     rate: u64,
     duration_secs: u64,
+    slo: SloSpec,
+    watchdog: bool,
+    watchdog_window_secs: u64,
+    watchdog_breaches: u32,
     audit_log: Option<String>,
     verify_audit: Option<String>,
 }
@@ -220,7 +236,13 @@ fn run_l7(
                 body: args.body.clone().map(String::into_bytes),
                 cache_bust: args.cache_bust,
             };
-            let engine = L7Engine::new(gate, spec);
+            let mut engine = L7Engine::new(gate, spec).with_slo(args.slo);
+            if args.watchdog {
+                engine = engine.with_watchdog(WatchdogConfig {
+                    window: Duration::from_secs(args.watchdog_window_secs.max(1)),
+                    max_breaches: args.watchdog_breaches.max(1),
+                });
+            }
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
         L7Kind::Slow(mode) => {
@@ -269,11 +291,48 @@ fn run_l7(
         },
     )?;
 
+    // SLO/watchdog apply to the fast request-flood methods only: the slow modes
+    // never receive a response to classify. Warn rather than silently ignore.
+    if matches!(args.l7_kind, L7Kind::Slow(_)) && !args.slo.is_empty() {
+        eprintln!("warning: --slo-* / --watchdog are ignored for slow-connection methods (no response to classify)");
+    } else if args.watchdog && !args.slo.has_rate_thresholds() {
+        eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
+    }
+
     let plan = RunPlan { targets, rate_cap, duration, kill };
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let report = engine.execute(&plan);
     println!("{}", jinrai_metrics::render(&report));
-    audit_record(&mut audit, AuditEvent::completed(&report))?;
+
+    // Evaluate the SLO verdict (only when the operator declared one, and only for
+    // fast methods that produced a classification).
+    let verdict = if !args.slo.is_empty() && matches!(args.l7_kind, L7Kind::Fast(_)) {
+        let v = args.slo.evaluate(&report);
+        println!("{}", jinrai_metrics::render_verdict(&v));
+        Some(v)
+    } else {
+        None
+    };
+
+    audit_record(&mut audit, AuditEvent::completed(&report, verdict.as_ref()))?;
+    check_l7_outcome(&report, verdict.as_ref())
+}
+
+/// Post-run gate for L7: a watchdog abort or an unmet SLO exits non-zero so
+/// automation can tell "the target held" from "the target buckled". An operator
+/// Ctrl-C (aborted_early without the watchdog) is not itself a failure.
+fn check_l7_outcome(report: &RunReport, verdict: Option<&SloVerdict>) -> Result<(), String> {
+    if report.aborted_by_watchdog {
+        return Err(format!(
+            "SLO watchdog aborted the run (sustained breach): {}",
+            report.layer_label
+        ));
+    }
+    if let Some(v) = verdict {
+        if !v.passed() {
+            return Err(format!("target did not meet SLO — {v}"));
+        }
+    }
     Ok(())
 }
 
@@ -357,7 +416,7 @@ fn run_l4(
     println!("running module '{}' ({:?})...", module.name(), module.layer());
     let report = module.execute(&plan);
     println!("{}", jinrai_metrics::render(&report));
-    audit_record(&mut audit, AuditEvent::completed(&report))?;
+    audit_record(&mut audit, AuditEvent::completed(&report, None))?;
 
     // A run that could not complete, or that emitted nothing while every attempt
     // failed, must NOT report success: exit non-zero so automation and operators
@@ -399,6 +458,10 @@ fn parse_args() -> Result<Args, String> {
     let mut ack_l34_lab = false;
     let mut rate = 100u64;
     let mut duration_secs = 10u64;
+    let mut slo = SloSpec::default();
+    let mut watchdog = false;
+    let mut watchdog_window_secs = 5u64;
+    let mut watchdog_breaches = 3u32;
     let mut audit_log = None;
     let mut verify_audit = None;
 
@@ -490,6 +553,26 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "invalid --duration".to_string())?;
             }
+            "--slo-max-error-rate" => slo.max_error_rate = Some(parse_rate(&mut it, "--slo-max-error-rate")?),
+            "--slo-max-5xx-rate" => slo.max_5xx_rate = Some(parse_rate(&mut it, "--slo-max-5xx-rate")?),
+            "--slo-max-4xx-rate" => slo.max_4xx_rate = Some(parse_rate(&mut it, "--slo-max-4xx-rate")?),
+            "--slo-max-p99-ms" => {
+                let ms: u64 = next_val(&mut it, "--slo-max-p99-ms")?
+                    .parse()
+                    .map_err(|_| "invalid --slo-max-p99-ms".to_string())?;
+                slo.max_p99_micros = Some(ms.saturating_mul(1000));
+            }
+            "--watchdog" => watchdog = true,
+            "--watchdog-window" => {
+                watchdog_window_secs = next_val(&mut it, "--watchdog-window")?
+                    .parse()
+                    .map_err(|_| "invalid --watchdog-window".to_string())?;
+            }
+            "--watchdog-breaches" => {
+                watchdog_breaches = next_val(&mut it, "--watchdog-breaches")?
+                    .parse()
+                    .map_err(|_| "invalid --watchdog-breaches".to_string())?;
+            }
             "--audit-log" => audit_log = Some(next_val(&mut it, "--audit-log")?),
             "--verify-audit" => verify_audit = Some(next_val(&mut it, "--verify-audit")?),
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
@@ -513,6 +596,10 @@ fn parse_args() -> Result<Args, String> {
         ack_l34_lab,
         rate,
         duration_secs,
+        slo,
+        watchdog,
+        watchdog_window_secs,
+        watchdog_breaches,
         audit_log,
         verify_audit,
     })
@@ -520,4 +607,16 @@ fn parse_args() -> Result<Args, String> {
 
 fn next_val(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     it.next().ok_or_else(|| format!("{flag} requires a value"))
+}
+
+/// Parse an SLO rate as a fraction in `[0.0, 1.0]`; anything outside is refused
+/// so a fat-fingered `--slo-max-5xx-rate 50` (meaning 50%) can't silently become
+/// an unreachable 5000% threshold that never fails.
+fn parse_rate(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<f64, String> {
+    let raw = next_val(it, flag)?;
+    let v: f64 = raw.parse().map_err(|_| format!("invalid {flag}: {raw}"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("{flag} must be a fraction 0.0–1.0 (got {raw})"));
+    }
+    Ok(v)
 }

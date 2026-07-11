@@ -53,6 +53,10 @@ not an expressible program state; it fails to compile.
 - **Phase 2** — `l7` async engine ✅
 - **Phase 3** — `l34` in isolated-lab mode ✅
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
+- **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
+- **Phase 6** *(next)* — load profiles (ramp / spike / soak) + breaking-point discovery
+- **Phase 7** — protocol coverage (HTTP/2 rapid-reset, TLS slow modes, ICMP/L3, TCP-flag floods)
+- **Phase 8** — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
 
@@ -102,6 +106,29 @@ jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
 jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
        --url http://api.staging.internal/ --slow-connections 200 \
        --drip-ms 10000 --rate 50 --duration 60
+```
+
+**SLO verdict & health-watchdog (l7 fast methods).** Every response is classified
+by status class, so the tool can tell a healthy target from one that is answering
+but failing. Declare an SLO and the run prints a `PASS`/`FAIL` verdict and exits
+non-zero when the target misses it — a `500`/`429` flood no longer reports a
+hollow "success":
+
+```sh
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/health --rate 500 --duration 60 \
+       --slo-max-5xx-rate 0.01 --slo-max-p99-ms 250
+```
+
+Add `--watchdog` to auto-abort (kill-switch) once a *rate* SLO is breached for
+`--watchdog-breaches` consecutive `--watchdog-window`s — the watchdog can only
+ever stop traffic, never generate it:
+
+```sh
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/ --rate 1000 --duration 300 \
+       --slo-max-error-rate 0.05 --slo-max-5xx-rate 0.02 \
+       --watchdog --watchdog-window 5 --watchdog-breaches 3
 ```
 
 **L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,

@@ -50,8 +50,8 @@ use reqwest::Url;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
-use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
-use jinrai_safety::{AuthorizedTarget, Authorization, SafetyError};
+use jinrai_core::{Layer, RunPlan, RunReport, SloSpec, StressModule};
+use jinrai_safety::{AuthorizedTarget, Authorization, KillSwitch, SafetyError};
 
 pub mod slow;
 pub use slow::{L7SlowEngine, SlowConfig, SlowMode};
@@ -213,17 +213,56 @@ pub(crate) fn resolve_addrs(datum: &Datum) -> Result<Vec<SocketAddr>, L7Error> {
     Ok(addrs)
 }
 
+/// Inline health-watchdog configuration. When present *and* the [`SloSpec`] has
+/// at least one rate threshold, the engine runs a background task that evaluates
+/// the trailing `window` of traffic and trips the kill-switch after
+/// `max_breaches` consecutive breaching windows. It can only ever **stop**
+/// traffic (via the shared [`KillSwitch`]) — never generate it — so it does not
+/// touch the authorization invariant. Worst-case time to abort is
+/// `window * max_breaches` of sustained breach, which keeps a transient spike
+/// from aborting a run.
+#[derive(Debug, Clone, Copy)]
+pub struct WatchdogConfig {
+    /// Trailing sample window evaluated on each tick.
+    pub window: Duration,
+    /// Consecutive breaching windows before the kill-switch is tripped.
+    pub max_breaches: u32,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self { window: Duration::from_secs(5), max_breaches: 3 }
+    }
+}
+
 /// The L7 HTTP load engine. Holds the request spec and a clone of the safety
 /// gate so it is the one deciding — via the gate — which datum it may touch.
 #[derive(Debug, Clone)]
 pub struct L7Engine {
     gate: Authorization,
     spec: RequestSpec,
+    /// The SLO evaluated at end-of-run (verdict) and, if a watchdog is set, live.
+    slo: SloSpec,
+    /// When set, the inline health-watchdog that can abort a breaching run.
+    watchdog: Option<WatchdogConfig>,
 }
 
 impl L7Engine {
     pub fn new(gate: Authorization, spec: RequestSpec) -> Self {
-        Self { gate, spec }
+        Self { gate, spec, slo: SloSpec::default(), watchdog: None }
+    }
+
+    /// Attach an SLO. On its own this only produces an end-of-run verdict; pair
+    /// it with [`with_watchdog`](Self::with_watchdog) to also abort live.
+    pub fn with_slo(mut self, slo: SloSpec) -> Self {
+        self.slo = slo;
+        self
+    }
+
+    /// Enable the inline health-watchdog (auto-abort on sustained SLO breach).
+    pub fn with_watchdog(mut self, cfg: WatchdogConfig) -> Self {
+        self.watchdog = Some(cfg);
+        self
     }
 
     /// Authorize the URL's host as a datum: IP literal against IP/CIDR rules, or
@@ -318,6 +357,15 @@ impl StressModule for L7Engine {
 
         let sent = Arc::new(AtomicU64::new(0));
         let errors = Arc::new(AtomicU64::new(0));
+        // Response classification (Phase 5): every completed response is bucketed
+        // by status class so the report can tell a healthy target from one that is
+        // answering but failing. `timeouts` is the subset of `errors` that were
+        // read/connect timeouts.
+        let s2xx = Arc::new(AtomicU64::new(0));
+        let s3xx = Arc::new(AtomicU64::new(0));
+        let s4xx = Arc::new(AtomicU64::new(0));
+        let s5xx = Arc::new(AtomicU64::new(0));
+        let timeouts = Arc::new(AtomicU64::new(0));
         // Bounds: 1 microsecond .. 60 seconds (well above the 10 s request
         // timeout), 3 significant figures. Explicit bounds so `saturating_record`
         // clamps only pathological values rather than a fresh histogram's tiny
@@ -328,6 +376,11 @@ impl StressModule for L7Engine {
 
         let kill = plan.kill.clone();
         let duration = plan.duration;
+        // The watchdog runs only when there is both a config and a rate threshold
+        // for it to evaluate (it does not look at latency).
+        let watchdog = self.watchdog.filter(|_| self.slo.has_rate_thresholds());
+        let slo = self.slo;
+        let aborted_by_watchdog = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Per-request shape, captured once and shared across dispatched tasks.
         let method = self.spec.method;
@@ -338,13 +391,34 @@ impl StressModule for L7Engine {
         // Clones move into the runtime; the originals are read back afterwards.
         let sent_w = sent.clone();
         let errors_w = errors.clone();
+        let s2xx_w = s2xx.clone();
+        let s3xx_w = s3xx.clone();
+        let s4xx_w = s4xx.clone();
+        let s5xx_w = s5xx.clone();
+        let timeouts_w = timeouts.clone();
         let hist_w = hist.clone();
+        let wd_flag = aborted_by_watchdog.clone();
 
         let aborted = rt.block_on(async move {
             let deadline = Instant::now() + duration;
             let mut interval = tokio::time::interval(interval_dur);
             // Never exceed the cap: on a missed tick, delay rather than burst.
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            // Inline health-watchdog: a background task that trips the shared
+            // kill-switch on sustained SLO breach. It only STOPS traffic.
+            let watchdog_task = watchdog.map(|cfg| {
+                tokio::spawn(run_watchdog(
+                    slo,
+                    cfg,
+                    kill.clone(),
+                    wd_flag.clone(),
+                    sent_w.clone(),
+                    errors_w.clone(),
+                    s5xx_w.clone(),
+                    s4xx_w.clone(),
+                ))
+            });
 
             let mut tasks: JoinSet<()> = JoinSet::new();
             let mut aborted = false;
@@ -366,6 +440,11 @@ impl StressModule for L7Engine {
                 let url = url.clone();
                 let sent = sent_w.clone();
                 let errors = errors_w.clone();
+                let s2xx = s2xx_w.clone();
+                let s3xx = s3xx_w.clone();
+                let s4xx = s4xx_w.clone();
+                let s5xx = s5xx_w.clone();
+                let timeouts = timeouts_w.clone();
                 let hist = hist_w.clone();
                 let body = body.clone();
                 let cb_counter = cb_counter.clone();
@@ -390,15 +469,27 @@ impl StressModule for L7Engine {
                     };
                     let started = Instant::now();
                     match req.send().await {
-                        Ok(_resp) => {
+                        Ok(resp) => {
                             let micros = started.elapsed().as_micros() as u64;
+                            // A response of ANY status is a completed unit; the
+                            // status class is what tells health from failure.
                             sent.fetch_add(1, Ordering::Relaxed);
+                            let counter = match resp.status().as_u16() {
+                                s if s >= 500 => &s5xx,
+                                400..=499 => &s4xx,
+                                300..=399 => &s3xx,
+                                _ => &s2xx,
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
                             hist.lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .saturating_record(micros);
                         }
-                        Err(_) => {
+                        Err(e) => {
                             errors.fetch_add(1, Ordering::Relaxed);
+                            if e.is_timeout() {
+                                timeouts.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 });
@@ -409,19 +500,93 @@ impl StressModule for L7Engine {
                 tasks.abort_all();
             }
             while tasks.join_next().await.is_some() {}
+            if let Some(handle) = watchdog_task {
+                handle.abort();
+            }
             aborted
         });
 
         let hist = hist.lock().unwrap_or_else(|p| p.into_inner());
+        let by_watchdog = aborted_by_watchdog.load(Ordering::Relaxed);
+        let label = if by_watchdog {
+            format!("L7 {} {} (SLO watchdog abort)", self.spec.method.label(), self.spec.url)
+        } else {
+            format!("L7 {} {}", self.spec.method.label(), self.spec.url)
+        };
         RunReport {
-            layer_label: format!("L7 {} {}", self.spec.method.label(), self.spec.url),
+            layer_label: label,
             units_sent: sent.load(Ordering::Relaxed),
             errors: errors.load(Ordering::Relaxed),
             aborted_early: aborted,
+            status_2xx: s2xx.load(Ordering::Relaxed),
+            status_3xx: s3xx.load(Ordering::Relaxed),
+            status_4xx: s4xx.load(Ordering::Relaxed),
+            status_5xx: s5xx.load(Ordering::Relaxed),
+            timeouts: timeouts.load(Ordering::Relaxed),
+            aborted_by_watchdog: by_watchdog,
             p50_micros: hist.value_at_quantile(0.5),
             p90_micros: hist.value_at_quantile(0.9),
             p99_micros: hist.value_at_quantile(0.99),
             max_micros: hist.max(),
+        }
+    }
+}
+
+/// The inline health-watchdog. Every `window` it diffs the cumulative counters
+/// to get the traffic in that trailing window, evaluates the SLO's *rate*
+/// thresholds over it, and counts consecutive breaching windows. After
+/// `max_breaches` in a row it trips the kill-switch (and records that the abort
+/// was watchdog-driven). A window with no attempts resets the streak — a lull
+/// is not a breach. This task can only ever STOP traffic; it never emits any.
+#[allow(clippy::too_many_arguments)]
+async fn run_watchdog(
+    slo: SloSpec,
+    cfg: WatchdogConfig,
+    kill: KillSwitch,
+    aborted_by_watchdog: Arc<std::sync::atomic::AtomicBool>,
+    sent: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+    s5xx: Arc<AtomicU64>,
+    s4xx: Arc<AtomicU64>,
+) {
+    let snapshot = |s: &AtomicU64, e: &AtomicU64, f: &AtomicU64, t: &AtomicU64| {
+        (
+            s.load(Ordering::Relaxed),
+            e.load(Ordering::Relaxed),
+            f.load(Ordering::Relaxed),
+            t.load(Ordering::Relaxed),
+        )
+    };
+    let mut prev = snapshot(&sent, &errors, &s5xx, &s4xx);
+    let mut consecutive = 0u32;
+
+    loop {
+        // Wake on the window OR promptly if the run is already ending.
+        tokio::select! {
+            _ = tokio::time::sleep(cfg.window) => {}
+            _ = wait_for_kill(kill.clone()) => return,
+        }
+        let now = snapshot(&sent, &errors, &s5xx, &s4xx);
+        let d_sent = now.0.saturating_sub(prev.0);
+        let d_err = now.1.saturating_sub(prev.1);
+        let d_5xx = now.2.saturating_sub(prev.2);
+        let d_4xx = now.3.saturating_sub(prev.3);
+        prev = now;
+
+        let attempts = d_sent + d_err;
+        if attempts == 0 {
+            consecutive = 0;
+            continue;
+        }
+        if slo.breaches_rates(attempts, d_err, d_5xx, d_4xx).is_empty() {
+            consecutive = 0;
+        } else {
+            consecutive += 1;
+            if consecutive >= cfg.max_breaches {
+                aborted_by_watchdog.store(true, Ordering::Relaxed);
+                kill.trip();
+                return;
+            }
         }
     }
 }
@@ -440,10 +605,122 @@ pub(crate) async fn wait_for_kill(kill: jinrai_safety::KillSwitch) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+
+    use jinrai_core::{RateCap, SloSpec};
     use jinrai_safety::{Allowlist, KillSwitch};
 
     fn gate_cidrs(cidrs: &[&str]) -> Authorization {
         Authorization::new(Allowlist::from_cidrs(cidrs).unwrap(), KillSwitch::new())
+    }
+
+    /// A throwaway HTTP/1.1 server that answers every connection with a fixed
+    /// status line and closes. Enough for reqwest to receive and classify a real
+    /// response without pulling in an HTTP-server dependency.
+    fn spawn_http_server(status_line: &'static str) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let handle = thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+                        let mut buf = [0u8; 1024];
+                        let _ = s.read(&mut buf); // best-effort: drain the request line/headers
+                        let resp = format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, stop, handle)
+    }
+
+    #[test]
+    fn classifies_completed_responses_by_status_class() {
+        // A target that answers 500 to everything: those are COMPLETED responses
+        // (units_sent), not transport errors, and must land in status_5xx.
+        let (port, stop, handle) = spawn_http_server("500 Internal Server Error");
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "should have completed some responses");
+        assert_eq!(report.status_5xx, report.units_sent, "every completion was a 500");
+        assert_eq!(report.status_2xx, 0);
+        assert_eq!(report.errors, 0, "a 500 is a response, not a transport error");
+    }
+
+    #[test]
+    fn watchdog_aborts_on_sustained_slo_breach() {
+        // All-5xx traffic against a 0% 5xx SLO must trip the watchdog well before
+        // the (deliberately long) deadline.
+        let (port, stop, handle) = spawn_http_server("500 Internal Server Error");
+        let url = format!("http://127.0.0.1:{port}/");
+        let slo = SloSpec { max_5xx_rate: Some(0.0), ..Default::default() };
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_slo(slo)
+            .with_watchdog(WatchdogConfig { window: Duration::from_millis(100), max_breaches: 2 });
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(100),
+            duration: Duration::from_secs(10),
+            kill: KillSwitch::new(),
+        };
+        let start = Instant::now();
+        let report = engine.execute(&plan);
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.aborted_by_watchdog, "watchdog should trip on all-5xx traffic");
+        assert!(report.aborted_early, "a watchdog trip is also an early abort");
+        assert!(elapsed < Duration::from_secs(5), "should abort early, took {elapsed:?}");
+        assert!(report.layer_label.contains("watchdog"), "label: {}", report.layer_label);
+    }
+
+    #[test]
+    fn watchdog_leaves_a_healthy_run_untouched() {
+        // A 2xx target against the same 0% 5xx SLO must run to completion.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let slo = SloSpec { max_5xx_rate: Some(0.0), ..Default::default() };
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_slo(slo)
+            .with_watchdog(WatchdogConfig { window: Duration::from_millis(100), max_breaches: 2 });
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(100),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(!report.aborted_by_watchdog, "healthy run must not be aborted");
+        assert_eq!(report.status_2xx, report.units_sent);
+        assert!(slo.evaluate(&report).passed(), "healthy run should meet the SLO");
     }
 
     fn gate_patterns(entries: &[&str]) -> Authorization {
