@@ -43,6 +43,13 @@ pub fn render(report: &RunReport) -> String {
             report.p50_micros, report.p90_micros, report.p99_micros, report.max_micros
         ));
     }
+    // Breaking-point discovery result, when a ramp found the capacity knee.
+    if let Some(k) = report.knee {
+        line.push_str(&format!(
+            " knee(sustained={}/s broke_at={}/s)",
+            k.sustained_per_sec, k.breached_at_per_sec
+        ));
+    }
     line
 }
 
@@ -85,6 +92,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render(&r), "[L4 (stub)] sent=0 errors=0 aborted_early=false");
+    }
+
+    #[test]
+    fn renders_knee_when_present() {
+        use jinrai_core::Knee;
+        let r = RunReport {
+            layer_label: "L7 knee".into(),
+            units_sent: 30,
+            status_2xx: 20,
+            status_5xx: 10,
+            knee: Some(Knee { sustained_per_sec: 40, breached_at_per_sec: 60 }),
+            ..Default::default()
+        };
+        assert!(
+            render(&r).contains("knee(sustained=40/s broke_at=60/s)"),
+            "rendered: {}",
+            render(&r)
+        );
     }
 
     #[test]

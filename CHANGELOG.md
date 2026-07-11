@@ -12,6 +12,22 @@ the safety gate, authorization, or auditability are called out under
 
 ### Added
 
+- **Load profiles (Phase 6)** — the L7 fast engine no longer only runs a flat
+  rate. `--profile` shapes the load over time: `constant` (default), `soak` (a
+  long flat hold), `ramp` (step the rate up from `--ramp-start` to the ceiling in
+  `--ramp-steps` stages), and `spike` (hold `--spike-base`, jump to the ceiling
+  for `--spike-secs`, fall back). Internally a profile compiles to a sequence of
+  constant-rate stages the engine runs back-to-back, so one dispatch mechanism
+  executes every shape. Runs with no `--profile` behave exactly as before.
+- **Breaking-point discovery (Phase 6)** — `--discover-knee` ramps toward the
+  ceiling and, evaluating the SLO's rate thresholds over each stage, **stops at
+  the first stage that breaches** rather than pushing further, reporting the
+  capacity *knee*: the highest rate the target held within SLO and the rate at
+  which it broke (`knee(sustained=N/s broke_at=M/s)`). Finding the knee is the
+  goal, so a discovery run exits `0` whether or not a knee is found; it needs a
+  `--slo-max-*-rate` to detect the breach and refuses fail-closed without one.
+  The live watchdog is suppressed during discovery (the run is meant to reach a
+  breach and stop cleanly, not abort).
 - **Response classification & SLO verdict (Phase 5)** — the L7 fast engine now
   classifies every completed response by status class (`status_2xx/3xx/4xx/5xx`)
   and separates *completed-but-failing* responses (a `500` is a completion, not a
@@ -31,6 +47,12 @@ the safety gate, authorization, or auditability are called out under
 
 ### Security
 
+- **Load profiles cannot escape the rate ceiling (Phase 6)** — `--rate` remains a
+  hard safety cap, not just a knob. Every stage a profile compiles to is clamped
+  to it (`RateCap::clamped_to`), so a ramp, spike, or a fat-fingered profile can
+  only ever shape traffic *up to* `--rate`, never above it. `--discover-knee`
+  ramps only toward the same ceiling and stops at the first SLO breach, so it does
+  not blindly escalate load past the breaking point.
 - The watchdog is **fail-safe by construction**: it can only ever *stop* traffic
   (via the existing `KillSwitch` that every engine already polls) and has no path
   to generate any. It does not touch the `AuthorizedTarget` invariant, so the

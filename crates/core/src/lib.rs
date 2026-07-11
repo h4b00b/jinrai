@@ -44,6 +44,112 @@ impl RateCap {
             Some(Duration::from_secs_f64(1.0 / self.per_second as f64))
         }
     }
+
+    /// This cap clamped so it never exceeds `ceiling`. The load-profile machinery
+    /// runs every stage through this so a profile can only ever shape traffic
+    /// *up to* the operator's `--rate` safety ceiling, never above it.
+    pub fn clamped_to(self, ceiling: RateCap) -> RateCap {
+        RateCap::new(self.per_second.min(ceiling.per_second))
+    }
+}
+
+/// One constant-rate segment of a run. A [`LoadProfile`] compiles to a sequence
+/// of these; the engine runs them back-to-back, re-pacing at each boundary, so
+/// it needs exactly one mechanism (emit at a fixed rate for a fixed time) to
+/// execute every profile shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadStage {
+    pub rate: RateCap,
+    pub duration: Duration,
+}
+
+/// How a run's emission rate varies over time. Each variant compiles to a
+/// `Vec<LoadStage>` via [`LoadProfile::stages`]. The rates a profile carries are
+/// the *shape*; the engine additionally clamps every stage to the run's
+/// [`RateCap`] ceiling (see [`RateCap::clamped_to`]), so a profile can never
+/// breach the operator's `--rate` safety cap.
+///
+/// A [`Ramp`](LoadProfile::Ramp) is also the vehicle for breaking-point
+/// discovery: run its stages in order, evaluate the [`SloSpec`] over each, and
+/// the first stage that breaches names the capacity knee (see [`Knee`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadProfile {
+    /// Flat rate for the whole duration — the historical constant-rate load. A
+    /// long hold at a modest rate is the endurance/"soak" case; no separate
+    /// mechanism is needed for it.
+    Constant { rate: RateCap, duration: Duration },
+    /// Step the rate linearly from `start` to `end` over `duration`, in `steps`
+    /// equal-length stages (the last stage sits exactly at `end`).
+    Ramp { start: RateCap, end: RateCap, duration: Duration, steps: u32 },
+    /// Hold `base`, jump to `peak` for `spike`, then fall back to `base`. `base`
+    /// fills the two halves of `base_total` around the central `spike`.
+    Spike { base: RateCap, peak: RateCap, base_total: Duration, spike: Duration },
+}
+
+impl LoadProfile {
+    /// Expand the profile into the concrete constant-rate stages the engine runs.
+    /// Rates are the profile's raw shape — clamp each to the run ceiling with
+    /// [`RateCap::clamped_to`] before pacing.
+    pub fn stages(&self) -> Vec<LoadStage> {
+        match *self {
+            LoadProfile::Constant { rate, duration } => vec![LoadStage { rate, duration }],
+            LoadProfile::Ramp { start, end, duration, steps } => {
+                let steps = steps.max(1);
+                let total_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+                let base = total_ns / steps as u64;
+                let rem = total_ns % steps as u64;
+                (0..steps)
+                    .map(|i| {
+                        // Rate reached after completing step (i+1) of `steps`, so
+                        // the final stage lands exactly on `end`.
+                        let per_second =
+                            lerp(start.per_second, end.per_second, i, steps);
+                        // Push the division remainder into the last stage so the
+                        // stages sum to exactly `duration`.
+                        let ns = base + if i == steps - 1 { rem } else { 0 };
+                        LoadStage {
+                            rate: RateCap::new(per_second),
+                            duration: Duration::from_nanos(ns),
+                        }
+                    })
+                    .collect()
+            }
+            LoadProfile::Spike { base, peak, base_total, spike } => {
+                let half = base_total / 2;
+                let mut v = Vec::with_capacity(3);
+                if !half.is_zero() {
+                    v.push(LoadStage { rate: base, duration: half });
+                }
+                v.push(LoadStage { rate: peak, duration: spike });
+                if !half.is_zero() {
+                    v.push(LoadStage { rate: base, duration: half });
+                }
+                v
+            }
+        }
+    }
+}
+
+/// Linear interpolation of an emission rate: the value reached after completing
+/// step `i+1` of `steps`, moving from `start` to `end`. Done in `i128` so a
+/// ramp-down (`end < start`) and large rates are both handled without overflow.
+fn lerp(start: u64, end: u64, i: u32, steps: u32) -> u64 {
+    let s = start as i128;
+    let e = end as i128;
+    let v = s + (e - s) * (i as i128 + 1) / steps as i128;
+    v.max(0) as u64
+}
+
+/// The capacity knee found by a breaking-point (ramp) discovery run: the highest
+/// stage rate the target held *within* its SLO, and the stage rate at which the
+/// SLO first breached. A discovery run stops as soon as it finds this rather than
+/// keep pushing past the breaking point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Knee {
+    /// Highest ramp-stage rate (units/sec) that stayed within the SLO.
+    pub sustained_per_sec: u64,
+    /// The ramp-stage rate (units/sec) at which the SLO first breached.
+    pub breached_at_per_sec: u64,
 }
 
 /// Everything a module needs to execute one run, already validated.
@@ -103,6 +209,10 @@ pub struct RunReport {
     pub p99_micros: u64,
     /// Worst observed latency, in microseconds.
     pub max_micros: u64,
+    /// Set by a breaking-point (ramp) discovery run when a load stage first
+    /// breached the SLO: the capacity knee. `None` for every non-discovery run
+    /// and for a discovery run that never breached (target held the whole ramp).
+    pub knee: Option<Knee>,
 }
 
 impl RunReport {
@@ -348,5 +458,70 @@ mod tests {
         // The watchdog passes zero-attempt windows; they must breach nothing.
         let spec = SloSpec { max_error_rate: Some(0.0), ..Default::default() };
         assert!(spec.breaches_rates(0, 0, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn constant_profile_is_one_stage() {
+        let p = LoadProfile::Constant { rate: RateCap::new(100), duration: Duration::from_secs(10) };
+        let stages = p.stages();
+        assert_eq!(stages, vec![LoadStage { rate: RateCap::new(100), duration: Duration::from_secs(10) }]);
+    }
+
+    #[test]
+    fn ramp_steps_reach_end_and_sum_to_duration() {
+        let p = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(1000),
+            duration: Duration::from_secs(10),
+            steps: 10,
+        };
+        let stages = p.stages();
+        assert_eq!(stages.len(), 10);
+        // Linear, last stage sits exactly on `end`, first is one step above start.
+        assert_eq!(stages[0].rate, RateCap::new(100));
+        assert_eq!(stages[9].rate, RateCap::new(1000));
+        // Monotonically non-decreasing.
+        assert!(stages.windows(2).all(|w| w[0].rate.per_second <= w[1].rate.per_second));
+        // Stages sum to exactly the requested duration (remainder folded in).
+        let total: Duration = stages.iter().map(|s| s.duration).sum();
+        assert_eq!(total, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn ramp_with_zero_steps_is_treated_as_one() {
+        let p = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(500),
+            duration: Duration::from_secs(4),
+            steps: 0,
+        };
+        let stages = p.stages();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].rate, RateCap::new(500));
+        assert_eq!(stages[0].duration, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn spike_is_base_peak_base() {
+        let p = LoadProfile::Spike {
+            base: RateCap::new(50),
+            peak: RateCap::new(500),
+            base_total: Duration::from_secs(8),
+            spike: Duration::from_secs(4),
+        };
+        let stages = p.stages();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].rate, RateCap::new(50));
+        assert_eq!(stages[1].rate, RateCap::new(500));
+        assert_eq!(stages[2].rate, RateCap::new(50));
+        assert_eq!(stages[0].duration, Duration::from_secs(4));
+        assert_eq!(stages[1].duration, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn clamp_holds_the_rate_ceiling() {
+        // A profile can shape traffic only up to the run's --rate safety ceiling.
+        assert_eq!(RateCap::new(5000).clamped_to(RateCap::new(1000)), RateCap::new(1000));
+        assert_eq!(RateCap::new(200).clamped_to(RateCap::new(1000)), RateCap::new(200));
     }
 }
