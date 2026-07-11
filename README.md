@@ -55,7 +55,7 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** *(in progress)* — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TLS slow modes ✅; ICMP/L3, HTTP/2 rapid-reset next
+- **Phase 7** *(in progress)* — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TLS slow modes ✅, ICMP/L3 ✅; HTTP/2 rapid-reset next
 - **Phase 8** — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
