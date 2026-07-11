@@ -16,6 +16,31 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.6.0] — 2026-07-11
+
+Phase 7 (part 2): slow-connection primitives over TLS.
+
+### Added
+
+- **Slow-TLS (Phase 7)** — the slow-connection engine (`slowloris` / `slowbody`)
+  now accepts `https` targets, which were previously refused. An https run
+  completes a real rustls (ring) TLS handshake over the pinned TCP connection and
+  then dribbles the same partial-request bytes *inside* the TLS session. No new
+  flag: `--l7-method slowloris`/`slowbody` with an `https://` URL just works. The
+  `L7Error::SlowHttpsUnsupported` variant is removed.
+
+### Security
+
+- **Slow-TLS accepts any server certificate — deliberately and in scope.** The
+  safety boundary for these primitives is *which host we connect to*, already
+  enforced by datum authorization + the single pinned connect address; the peer's
+  certificate identity is not used for any decision, and the primitive sends no
+  secrets and never reads a response. Verifying against a public trust chain would
+  make it useless against the self-signed / internal-CA certs typical of lab
+  targets. The relaxed verifier is confined to `l7::slow`; the fast
+  `L7Engine` keeps reqwest's normal certificate verification. rustls is pinned to
+  the `ring` provider already in the tree, so no second TLS stack is added.
+
 ## [0.5.0] — 2026-07-11
 
 Phase 7 (part 1): TCP flag floods.
@@ -215,7 +240,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/h4b00b/jinrai/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/h4b00b/jinrai/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/h4b00b/jinrai/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/h4b00b/jinrai/compare/v0.2.0...v0.3.0

@@ -58,7 +58,9 @@ OPTIONS:
                             get | post | head   fast request flood
                             slowloris            slow partial headers (Slowloris)
                             slowbody             slow trickled POST body (RUDY)
-                          For slow modes the rate cap is connections-opened/sec.
+                          For slow modes the rate cap is connections-opened/sec,
+                          and https targets are supported (slow-TLS; the handshake
+                          accepts any server certificate — see README).
     --body <STRING>       Request body sent with each POST (l7-method post)
     --cache-bust          Append a unique _cb=<n> query to every l7 request so
                           caches/CDNs cannot serve a stored response (query only;
