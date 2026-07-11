@@ -8,7 +8,17 @@ Because jinrai is an internal, dual-use resilience tester, changes that affect
 the safety gate, authorization, or auditability are called out under
 **Security** even when they are additive.
 
+While the tool is pre-1.0, each additive feature increment gets its own minor
+release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
+1.0.
+
 ## [Unreleased]
+
+Nothing yet.
+
+## [0.5.0] — 2026-07-11
+
+Phase 7 (part 1): TCP flag floods.
 
 ### Added
 
@@ -20,6 +30,21 @@ the safety gate, authorization, or auditability are called out under
   packets that match no established connection. Like SYN they are IPv4-only,
   require `CAP_NET_RAW`/root, and are gated behind `--ack-l34-lab` + the
   allowlist.
+
+### Security
+
+- **The no-spoofing guarantee extends to every TCP flag flood (Phase 7)** — the
+  new `ack`/`fin`/`rst` modes go through the same `source_ipv4_for` route lookup
+  as SYN: the source address is always the host's real, OS-routed outbound
+  address. There is still no API anywhere to set, randomise, or spoof it, and no
+  reflection/amplification path — these remain direct self-tests, not weapons.
+
+## [0.4.0] — 2026-07-11
+
+Phase 6: load profiles and breaking-point discovery.
+
+### Added
+
 - **Load profiles (Phase 6)** — the L7 fast engine no longer only runs a flat
   rate. `--profile` shapes the load over time: `constant` (default), `soak` (a
   long flat hold), `ramp` (step the rate up from `--ramp-start` to the ceiling in
@@ -36,6 +61,22 @@ the safety gate, authorization, or auditability are called out under
   `--slo-max-*-rate` to detect the breach and refuses fail-closed without one.
   The live watchdog is suppressed during discovery (the run is meant to reach a
   breach and stop cleanly, not abort).
+
+### Security
+
+- **Load profiles cannot escape the rate ceiling (Phase 6)** — `--rate` remains a
+  hard safety cap, not just a knob. Every stage a profile compiles to is clamped
+  to it (`RateCap::clamped_to`), so a ramp, spike, or a fat-fingered profile can
+  only ever shape traffic *up to* `--rate`, never above it. `--discover-knee`
+  ramps only toward the same ceiling and stops at the first SLO breach, so it does
+  not blindly escalate load past the breaking point.
+
+## [0.3.0] — 2026-07-11
+
+Phase 5: response classification, SLO verdict, and the inline health-watchdog.
+
+### Added
+
 - **Response classification & SLO verdict (Phase 5)** — the L7 fast engine now
   classifies every completed response by status class (`status_2xx/3xx/4xx/5xx`)
   and separates *completed-but-failing* responses (a `500` is a completion, not a
@@ -55,17 +96,6 @@ the safety gate, authorization, or auditability are called out under
 
 ### Security
 
-- **The no-spoofing guarantee extends to every TCP flag flood (Phase 7)** — the
-  new `ack`/`fin`/`rst` modes go through the same `source_ipv4_for` route lookup
-  as SYN: the source address is always the host's real, OS-routed outbound
-  address. There is still no API anywhere to set, randomise, or spoof it, and no
-  reflection/amplification path — these remain direct self-tests, not weapons.
-- **Load profiles cannot escape the rate ceiling (Phase 6)** — `--rate` remains a
-  hard safety cap, not just a knob. Every stage a profile compiles to is clamped
-  to it (`RateCap::clamped_to`), so a ramp, spike, or a fat-fingered profile can
-  only ever shape traffic *up to* `--rate`, never above it. `--discover-knee`
-  ramps only toward the same ceiling and stops at the first SLO breach, so it does
-  not blindly escalate load past the breaking point.
 - The watchdog is **fail-safe by construction**: it can only ever *stop* traffic
   (via the existing `KillSwitch` that every engine already polls) and has no path
   to generate any. It does not touch the `AuthorizedTarget` invariant, so the
@@ -73,6 +103,12 @@ the safety gate, authorization, or auditability are called out under
   the breach streak rather than counting as a breach, and the worst-case
   time-to-abort is bounded by `window * breaches` of *sustained* breach so a
   transient spike cannot abort a legitimate run.
+
+## [0.2.0] — 2026-07-09
+
+Phase 2 (continued): non-GET request primitives and slow-connection engines.
+
+### Added
 
 - **L7 request primitives** — the L7 engine is no longer GET-only. `--l7-method`
   selects `get` | `post` | `head` (fast, reqwest-based, constant-rate) plus two
@@ -94,8 +130,8 @@ the safety gate, authorization, or auditability are called out under
   address, so every request/connection only ever reaches the gate-authorized
   target. The cache-buster mutates only the query string — never the host — so
   the datum authorization and the pinned resolution still hold for every request.
-- Slow mode is **http-only** for now: an `https` URL is refused fail-closed
-  (dribbling raw bytes through a TLS session is not implemented).
+- Slow mode is **http-only** in this release: an `https` URL is refused
+  fail-closed (dribbling raw bytes through a TLS session is not implemented yet).
 
 ## [0.1.0] — 2026-07-08
 
@@ -179,5 +215,9 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/h4b00b/jinrai/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/h4b00b/jinrai/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/h4b00b/jinrai/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/h4b00b/jinrai/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/h4b00b/jinrai/releases/tag/v0.1.0
