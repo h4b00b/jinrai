@@ -61,6 +61,11 @@ use jinrai_safety::{AuthorizedTarget, Authorization, KillSwitch, SafetyError};
 pub mod slow;
 pub use slow::{L7SlowEngine, SlowConfig, SlowMode};
 
+pub mod rapid_reset;
+pub use rapid_reset::H2RapidResetEngine;
+
+mod tls;
+
 /// Which HTTP request shape to generate. Every variant reuses the *same*
 /// constant-rate dispatch, rate-cap, kill-switch and latency histogram — they
 /// differ only in how each individual request is built. This is the L7 analogue

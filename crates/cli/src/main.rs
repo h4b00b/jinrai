@@ -18,7 +18,10 @@ use jinrai_core::{
     Layer, LoadProfile, RateCap, RunPlan, RunReport, SloSpec, SloVerdict, StressModule,
 };
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
-use jinrai_l7::{L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode, WatchdogConfig};
+use jinrai_l7::{
+    H2RapidResetEngine, L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode,
+    WatchdogConfig,
+};
 use jinrai_metrics::{AuditEvent, AuditLog};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
 
@@ -61,9 +64,13 @@ OPTIONS:
                             get | post | head   fast request flood
                             slowloris            slow partial headers (Slowloris)
                             slowbody             slow trickled POST body (RUDY)
+                            h2-rapid-reset       HTTP/2 rapid-reset (CVE-2023-44487):
+                                                 open a stream, immediately
+                                                 RST_STREAM; rate cap = resets/sec
                           For slow modes the rate cap is connections-opened/sec,
                           and https targets are supported (slow-TLS; the handshake
-                          accepts any server certificate — see README).
+                          accepts any server certificate — see README). h2-rapid-reset
+                          uses ALPN h2 for https and prior-knowledge h2c for http.
     --body <STRING>       Request body sent with each POST (l7-method post)
     --cache-bust          Append a unique _cb=<n> query to every l7 request so
                           caches/CDNs cannot serve a stored response (query only;
@@ -129,6 +136,8 @@ fn main() -> ExitCode {
 enum L7Kind {
     Fast(L7Method),
     Slow(SlowMode),
+    /// HTTP/2 rapid-reset (open stream, immediate RST_STREAM).
+    RapidReset,
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -347,6 +356,10 @@ fn run_l7(
             let engine = L7SlowEngine::new(gate, url.clone(), cfg);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
+        L7Kind::RapidReset => {
+            let engine = H2RapidResetEngine::new(gate, url.clone());
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
     };
     let (mut engine, targets) = match built {
         Ok(pair) => pair,
@@ -385,17 +398,16 @@ fn run_l7(
     )?;
 
     // SLO/watchdog apply to the fast request-flood methods only: the slow modes
-    // never receive a response to classify. Warn rather than silently ignore.
-    if matches!(args.l7_kind, L7Kind::Slow(_)) && !args.slo.is_empty() {
-        eprintln!("warning: --slo-* / --watchdog are ignored for slow-connection methods (no response to classify)");
+    // and rapid-reset never receive a response to classify. Warn, don't ignore.
+    let is_fast = matches!(args.l7_kind, L7Kind::Fast(_));
+    if !is_fast && !args.slo.is_empty() {
+        eprintln!("warning: --slo-* / --watchdog are ignored for slow-connection / h2-rapid-reset methods (no response to classify)");
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
     }
     // Load profiles / knee discovery only shape the fast request-flood dispatch.
-    if matches!(args.l7_kind, L7Kind::Slow(_))
-        && (args.discover_knee || args.profile != ProfileKind::Constant)
-    {
-        eprintln!("warning: load profiles / --discover-knee apply to fast l7 methods only; ignored for slow-connection modes");
+    if !is_fast && (args.discover_knee || args.profile != ProfileKind::Constant) {
+        eprintln!("warning: load profiles / --discover-knee apply to fast l7 methods only; ignored here");
     }
 
     let plan = RunPlan { targets, rate_cap, duration, kill };
@@ -615,9 +627,11 @@ fn parse_args() -> Result<Args, String> {
                     "head" => L7Kind::Fast(L7Method::Head),
                     "slowloris" => L7Kind::Slow(SlowMode::Headers),
                     "slowbody" => L7Kind::Slow(SlowMode::Body),
+                    "h2-rapid-reset" => L7Kind::RapidReset,
                     other => {
                         return Err(format!(
-                            "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody)"
+                            "unknown --l7-method: {other} \
+                             (want get|post|head|slowloris|slowbody|h2-rapid-reset)"
                         ))
                     }
                 }

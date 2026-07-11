@@ -119,15 +119,10 @@ impl L7SlowEngine {
             None => datum.host.clone(),
         };
 
-        // TLS only for https. SNI is the datum's host — an IP literal target
-        // yields an IP-based ServerName, a name target a DNS ServerName.
+        // TLS only for https (no ALPN — plain HTTP/1.1 dribble inside the session).
         let tls = if datum.url.scheme() == "https" {
-            let connector = TlsConnector::from(tls_client_config()?);
-            let server_name = match datum.ip {
-                Some(ip) => ServerName::IpAddress(ip.into()),
-                None => ServerName::try_from(datum.host.clone())
-                    .map_err(|e| L7Error::Client(format!("bad TLS server name: {e}")))?,
-            };
+            let connector = TlsConnector::from(crate::tls::client_config(vec![])?);
+            let server_name = crate::tls::server_name(&datum)?;
             Some(TlsSetup { connector, server_name })
         } else {
             None
@@ -154,80 +149,12 @@ struct Prepared {
 }
 
 /// TLS bits shared across every connection of an https slow run. Cheaply
-/// cloneable (`TlsConnector` is an `Arc` inside).
+/// cloneable (`TlsConnector` is an `Arc` inside). The accept-any-certificate
+/// config comes from [`crate::tls`] (see there for why that is safe here).
 #[derive(Clone)]
 struct TlsSetup {
     connector: TlsConnector,
     server_name: ServerName<'static>,
-}
-
-/// Build a rustls (ring) client config for the slow-TLS path. It accepts **any**
-/// server certificate — see the module docs: the safety boundary here is the
-/// gate-authorized, address-pinned host, not the peer's identity, and the
-/// primitive sends no secrets and reads no response. Scoped to the slow engine.
-fn tls_client_config() -> Result<Arc<tokio_rustls::rustls::ClientConfig>, L7Error> {
-    use tokio_rustls::rustls::ClientConfig;
-
-    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(AcceptAnyServerCert::new(&provider));
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| L7Error::Client(format!("TLS config: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
-}
-
-/// A rustls certificate verifier that accepts everything. Deliberate and scoped —
-/// see [`tls_client_config`] and the module docs for why this is safe here.
-#[derive(Debug)]
-struct AcceptAnyServerCert {
-    schemes: Vec<tokio_rustls::rustls::SignatureScheme>,
-}
-
-impl AcceptAnyServerCert {
-    fn new(provider: &tokio_rustls::rustls::crypto::CryptoProvider) -> Self {
-        Self { schemes: provider.signature_verification_algorithms.supported_schemes() }
-    }
-}
-
-impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
-    {
-        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
-    {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
-    {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        self.schemes.clone()
-    }
 }
 
 impl StressModule for L7SlowEngine {
@@ -463,14 +390,6 @@ mod tests {
         let engine =
             L7SlowEngine::new(gate_cidrs(&["127.0.0.0/8"]), "https://127.0.0.1/", cfg(SlowMode::Headers));
         assert!(engine.authorize_target().is_ok());
-    }
-
-    #[test]
-    fn tls_client_config_builds() {
-        // The accept-any-cert rustls config must build (provider + verifier wire up).
-        let cfg = tls_client_config().expect("TLS config should build");
-        // A verifier with a non-empty scheme list, else handshakes would fail.
-        let _ = cfg; // built successfully is the assertion
     }
 
     #[test]

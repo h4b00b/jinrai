@@ -16,6 +16,36 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.8.0] — 2026-07-11
+
+Phase 7 (part 4, completes Phase 7): HTTP/2 rapid-reset.
+
+### Added
+
+- **HTTP/2 rapid-reset (Phase 7, CVE-2023-44487)** — `--l7-method h2-rapid-reset`
+  opens HTTP/2 streams and **immediately cancels each with `RST_STREAM`** before
+  the server responds. Because a reset frees its concurrency slot instantly, the
+  client creates server-side work far faster than it spends — the resource
+  asymmetry that makes this a DoS class. Exposed as a resilience self-test so an
+  operator can measure whether their own stack is patched / rate-limited. The
+  rate cap is reinterpreted as *streams-reset per second*. `https` negotiates
+  HTTP/2 via ALPN; `http` uses prior-knowledge h2c. Uses the `h2`/`http` crates
+  already in the tree (via reqwest/hyper), so no new TLS or HTTP stack.
+- **Shared TLS module (`l7::tls`)** — the accept-any-certificate rustls config
+  and SNI helper are factored out of `l7::slow` so both the slow-connection and
+  rapid-reset engines share one verifier (rapid-reset adds ALPN `h2`).
+
+### Security
+
+- The rapid-reset engine keeps the **identical trust boundary** as the other L7
+  primitives: the URL host is authorized as a datum and pinned to a single
+  connect address, so the HTTP/2 connection only ever reaches the gate-authorized
+  target. As a denial-of-service technique it is only meaningful against
+  infrastructure the operator is authorized to test — the allowlist enforces that
+  by construction. The accept-any-cert TLS stance is the same scoped choice
+  documented for slow-TLS (transport to an authorized host, no secrets sent, no
+  response trusted).
+
 ## [0.7.0] — 2026-07-11
 
 Phase 7 (part 3): ICMP / L3 echo flood.
@@ -261,7 +291,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/h4b00b/jinrai/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/h4b00b/jinrai/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/h4b00b/jinrai/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/h4b00b/jinrai/compare/v0.4.0...v0.5.0
