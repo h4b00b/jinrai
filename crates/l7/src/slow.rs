@@ -21,18 +21,30 @@
 //! rate cap (reinterpreted as *connections opened per second*) and by
 //! `max_conns` (concurrent ceiling), and aborts promptly on the kill switch.
 //!
-//! `https` is refused for now (dribbling raw bytes through a TLS session is not
-//! implemented); slow mode is http-only and fails closed.
+//! ## `https` targets (slow-TLS)
+//!
+//! An `https` URL performs a real rustls (ring) handshake over the pinned TCP
+//! connection, then dribbles the same slow HTTP bytes *inside* the TLS session.
+//! The slow-TLS path **accepts any server certificate**: the safety boundary is
+//! *which host we connect to* (already enforced by datum authorization + the
+//! pinned connect address), not the peer's identity — and the primitive sends no
+//! secrets and reads no response. Requiring a publicly-trusted chain would make
+//! it useless against the self-signed / internal-CA certs typical of lab targets.
+//! This deliberate choice is scoped to the slow engine; the fast [`crate::L7Engine`]
+//! keeps reqwest's normal certificate verification.
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::TlsConnector;
 
 use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
 use jinrai_safety::Authorization;
@@ -83,22 +95,15 @@ impl L7SlowEngine {
     }
 
     /// Authorize the datum (public so the CLI can fail-closed before any run).
-    /// Also enforces the http-only rule so an `https` URL is refused up front.
     pub fn authorize_target(&self) -> Result<Vec<jinrai_safety::AuthorizedTarget>, L7Error> {
-        let datum = authorize_datum(&self.gate, &self.url)?;
-        if datum.url.scheme() == "https" {
-            return Err(L7Error::SlowHttpsUnsupported);
-        }
-        Ok(vec![datum.target])
+        Ok(vec![authorize_datum(&self.gate, &self.url)?.target])
     }
 
     /// Authorize + resolve-once into the pinned connect address and the request
-    /// line / Host header used for every connection.
+    /// line / Host header used for every connection. For an `https` datum, also
+    /// build the TLS connector + SNI server name used for every connection.
     fn prepare(&self) -> Result<Prepared, L7Error> {
         let datum = authorize_datum(&self.gate, &self.url)?;
-        if datum.url.scheme() == "https" {
-            return Err(L7Error::SlowHttpsUnsupported);
-        }
         let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
 
         let mut target = datum.url.path().to_string();
@@ -114,7 +119,21 @@ impl L7SlowEngine {
             None => datum.host.clone(),
         };
 
-        Ok(Prepared { addr, target, host_header })
+        // TLS only for https. SNI is the datum's host — an IP literal target
+        // yields an IP-based ServerName, a name target a DNS ServerName.
+        let tls = if datum.url.scheme() == "https" {
+            let connector = TlsConnector::from(tls_client_config()?);
+            let server_name = match datum.ip {
+                Some(ip) => ServerName::IpAddress(ip.into()),
+                None => ServerName::try_from(datum.host.clone())
+                    .map_err(|e| L7Error::Client(format!("bad TLS server name: {e}")))?,
+            };
+            Some(TlsSetup { connector, server_name })
+        } else {
+            None
+        };
+
+        Ok(Prepared { addr, target, host_header, tls })
     }
 
     fn refusal_report(&self, e: L7Error) -> RunReport {
@@ -130,6 +149,85 @@ struct Prepared {
     addr: SocketAddr,
     target: String,
     host_header: String,
+    /// `Some` for an https target: the TLS connector + SNI name for every conn.
+    tls: Option<TlsSetup>,
+}
+
+/// TLS bits shared across every connection of an https slow run. Cheaply
+/// cloneable (`TlsConnector` is an `Arc` inside).
+#[derive(Clone)]
+struct TlsSetup {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+/// Build a rustls (ring) client config for the slow-TLS path. It accepts **any**
+/// server certificate — see the module docs: the safety boundary here is the
+/// gate-authorized, address-pinned host, not the peer's identity, and the
+/// primitive sends no secrets and reads no response. Scoped to the slow engine.
+fn tls_client_config() -> Result<Arc<tokio_rustls::rustls::ClientConfig>, L7Error> {
+    use tokio_rustls::rustls::ClientConfig;
+
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(AcceptAnyServerCert::new(&provider));
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| L7Error::Client(format!("TLS config: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// A rustls certificate verifier that accepts everything. Deliberate and scoped —
+/// see [`tls_client_config`] and the module docs for why this is safe here.
+#[derive(Debug)]
+struct AcceptAnyServerCert {
+    schemes: Vec<tokio_rustls::rustls::SignatureScheme>,
+}
+
+impl AcceptAnyServerCert {
+    fn new(provider: &tokio_rustls::rustls::crypto::CryptoProvider) -> Self {
+        Self { schemes: provider.signature_verification_algorithms.supported_schemes() }
+    }
+}
+
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        self.schemes.clone()
+    }
 }
 
 impl StressModule for L7SlowEngine {
@@ -142,7 +240,7 @@ impl StressModule for L7SlowEngine {
     }
 
     fn execute(&mut self, plan: &RunPlan) -> RunReport {
-        let Prepared { addr, target, host_header } = match self.prepare() {
+        let Prepared { addr, target, host_header, tls } = match self.prepare() {
             Ok(p) => p,
             Err(e) => return self.refusal_report(e),
         };
@@ -203,6 +301,7 @@ impl StressModule for L7SlowEngine {
                 opened += 1;
                 tasks.spawn(hold_connection(
                     addr,
+                    tls.clone(),
                     target.clone(),
                     host_header.clone(),
                     mode,
@@ -251,6 +350,7 @@ impl StressModule for L7SlowEngine {
 #[allow(clippy::too_many_arguments)]
 async fn hold_connection(
     addr: SocketAddr,
+    tls: Option<TlsSetup>,
     target: Arc<String>,
     host_header: Arc<String>,
     mode: SlowMode,
@@ -261,11 +361,30 @@ async fn hold_connection(
     errors: Arc<AtomicU64>,
 ) {
     let connect = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr));
-    let mut stream = match connect.await {
+    let tcp = match connect.await {
         Ok(Ok(s)) => s,
         _ => {
             errors.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+    };
+
+    // For https, complete the TLS handshake and dribble inside the session; for
+    // http, write plaintext. Both are write-only sinks (slow modes never read a
+    // response), so we box either as one `AsyncWrite`. A failed handshake counts
+    // as a connect error, same as a failed TCP connect.
+    let mut stream: Pin<Box<dyn AsyncWrite + Send>> = match tls {
+        None => Box::pin(tcp),
+        Some(t) => {
+            let handshake =
+                tokio::time::timeout(Duration::from_secs(10), t.connector.connect(t.server_name, tcp));
+            match handshake.await {
+                Ok(Ok(s)) => Box::pin(s),
+                _ => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
         }
     };
 
@@ -339,10 +458,19 @@ mod tests {
     }
 
     #[test]
-    fn https_url_refused_http_only() {
+    fn https_url_now_authorized() {
+        // https is supported (slow-TLS); the datum still authorizes normally.
         let engine =
             L7SlowEngine::new(gate_cidrs(&["127.0.0.0/8"]), "https://127.0.0.1/", cfg(SlowMode::Headers));
-        assert!(matches!(engine.authorize_target(), Err(L7Error::SlowHttpsUnsupported)));
+        assert!(engine.authorize_target().is_ok());
+    }
+
+    #[test]
+    fn tls_client_config_builds() {
+        // The accept-any-cert rustls config must build (provider + verifier wire up).
+        let cfg = tls_client_config().expect("TLS config should build");
+        // A verifier with a non-empty scheme list, else handshakes would fail.
+        let _ = cfg; // built successfully is the assertion
     }
 
     #[test]

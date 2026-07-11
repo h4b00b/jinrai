@@ -141,9 +141,6 @@ pub enum L7Error {
     BadHeader(String),
     /// Building the HTTP client failed.
     Client(String),
-    /// A slow-connection run was asked for an `https` URL. Dribbling raw bytes
-    /// through a TLS session is not implemented yet; slow mode is http-only.
-    SlowHttpsUnsupported,
 }
 
 impl std::fmt::Display for L7Error {
@@ -157,9 +154,6 @@ impl std::fmt::Display for L7Error {
             L7Error::Refused(e) => write!(f, "datum refused by safety gate: {e}"),
             L7Error::BadHeader(s) => write!(f, "invalid header: {s}"),
             L7Error::Client(s) => write!(f, "failed to build HTTP client: {s}"),
-            L7Error::SlowHttpsUnsupported => {
-                write!(f, "slow mode is http-only for now; refusing https URL (TLS dribble not implemented)")
-            }
         }
     }
 }
