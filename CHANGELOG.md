@@ -16,6 +16,27 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.7.0] — 2026-07-11
+
+Phase 7 (part 3): ICMP / L3 echo flood.
+
+### Added
+
+- **ICMP echo flood (Phase 7)** — `--l4-mode icmp` adds a true **L3** primitive:
+  ICMPv4 echo-request packets on a raw socket. It reuses the L3/L4 engine's rate
+  cap, kill-switch, and preflight, reports as `Layer::L3`, and needs no `--port`
+  (`--port` is now optional for `icmp`, still required for the other modes). Like
+  the raw-TCP modes it is IPv4-only, requires `CAP_NET_RAW`/root, and is gated
+  behind `--ack-l34-lab` + the allowlist. The ICMP message (type 8 + Internet
+  checksum) is crafted std-only; no new dependency.
+
+### Security
+
+- **ICMP keeps the no-spoofing guarantee.** The echo flood uses an `IPPROTO_ICMP`
+  raw socket, so the **kernel** writes the IPv4 header and the source is the
+  host's real routed address — there is, as everywhere else in `l34`, no path to
+  set, forge, or randomise it, and no reflection/amplification.
+
 ## [0.6.0] — 2026-07-11
 
 Phase 7 (part 2): slow-connection primitives over TLS.
@@ -240,7 +261,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/h4b00b/jinrai/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/h4b00b/jinrai/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/h4b00b/jinrai/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/h4b00b/jinrai/compare/v0.3.0...v0.4.0

@@ -42,7 +42,7 @@ REQUIRED:
 
     For --layer l3/l4:
     --target <IP>      Target address (repeatable). Must match an IP/CIDR --allow.
-    --port <N>         Target port (required for l3/l4).
+    --port <N>         Target port (required for l3/l4, except --l4-mode icmp).
     --ack-l34-lab      REQUIRED acknowledgement that this L3/L4 run targets an
                        authorized, isolated-lab network. No traffic without it.
 
@@ -54,6 +54,9 @@ OPTIONS:
                                                  one flag, needs CAP_NET_RAW/root,
                                                  IPv4-only, real source IP (never
                                                  spoofed)
+                            icmp                 L3 ICMPv4 echo-request flood;
+                                                 needs CAP_NET_RAW/root, IPv4-only,
+                                                 real source IP, no --port needed
     --l7-method <METHOD>  L7 primitive (default: get). One of:
                             get | post | head   fast request flood
                             slowloris            slow partial headers (Slowloris)
@@ -472,9 +475,12 @@ fn run_l4(
     if args.targets.is_empty() {
         return Err("--layer l3/l4 requires at least one --target <IP>".into());
     }
-    let port = args
-        .port
-        .ok_or("--layer l3/l4 requires --port <N>")?;
+    // ICMP is portless; every other mode targets a port.
+    let port = if args.l4_mode == L4Mode::Icmp {
+        args.port.unwrap_or(0)
+    } else {
+        args.port.ok_or("--layer l3/l4 requires --port <N> (except --l4-mode icmp)")?
+    };
 
     let authorized = match gate.authorize_all(args.targets.iter().copied()) {
         Ok(t) => t,
@@ -636,9 +642,10 @@ fn parse_args() -> Result<Args, String> {
                     "ack" => L4Mode::Ack,
                     "fin" => L4Mode::Fin,
                     "rst" => L4Mode::Rst,
+                    "icmp" => L4Mode::Icmp,
                     other => {
                         return Err(format!(
-                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst)"
+                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst|icmp)"
                         ))
                     }
                 }

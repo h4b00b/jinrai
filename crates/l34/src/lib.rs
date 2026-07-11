@@ -9,6 +9,9 @@
 //!     SYN exercises the accept backlog; ACK/FIN/RST exercise the target's
 //!     connection-tracking / stateful-firewall state for packets outside an
 //!     established connection.
+//!   - **ICMP echo flood** — L3 ICMPv4 echo-request packets via a raw socket
+//!     (requires `CAP_NET_RAW`/root). The kernel writes the IPv4 header, so the
+//!     source is the real address — the same no-spoofing property as the rest.
 //!
 //! ## Non-negotiable guardrail: no source spoofing
 //!
@@ -47,6 +50,9 @@ pub enum L4Mode {
     Fin,
     /// TCP RST flood (raw socket, RST flag) — reset packets.
     Rst,
+    /// ICMP echo-request flood (raw socket, L3). IPv4-only; source is the
+    /// kernel-assigned real address (the kernel builds the IP header).
+    Icmp,
 }
 
 /// The single TCP control flag a raw-TCP flood sets. All raw-TCP modes share the
@@ -69,25 +75,49 @@ impl L4Mode {
             L4Mode::Ack => "tcp-ack-flood",
             L4Mode::Fin => "tcp-fin-flood",
             L4Mode::Rst => "tcp-rst-flood",
+            L4Mode::Icmp => "icmp-echo-flood",
         }
     }
 
-    /// The TCP flag for a raw-TCP flood mode, or `None` for the socket-based
-    /// (UDP / TCP-connect) modes that need no raw socket.
+    /// The TCP flag for a raw-TCP flood mode, or `None` for every other mode
+    /// (UDP / TCP-connect need no raw socket; ICMP is not TCP).
     fn raw_tcp_flag(self) -> Option<TcpFlag> {
         match self {
             L4Mode::Syn => Some(TcpFlag::Syn),
             L4Mode::Ack => Some(TcpFlag::Ack),
             L4Mode::Fin => Some(TcpFlag::Fin),
             L4Mode::Rst => Some(TcpFlag::Rst),
-            L4Mode::Udp | L4Mode::TcpConnect => None,
+            L4Mode::Udp | L4Mode::TcpConnect | L4Mode::Icmp => None,
         }
     }
 
-    /// Raw-TCP flood modes craft IPv4 packets on a raw socket (needs CAP_NET_RAW)
-    /// and are IPv4-only.
+    /// Raw-socket modes craft packets on a raw socket (need CAP_NET_RAW) and are
+    /// IPv4-only: the four TCP flag floods plus the ICMP echo flood.
     fn needs_raw_socket(self) -> bool {
-        self.raw_tcp_flag().is_some()
+        self.raw_socket_protocol().is_some()
+    }
+
+    /// The IP protocol for this mode's raw socket, or `None` for the socket-based
+    /// (UDP / TCP-connect) modes. Raw TCP uses `IPPROTO_RAW` (we supply the whole
+    /// IPv4 header); ICMP uses `IPPROTO_ICMP` (the kernel supplies the IP header,
+    /// so the source address is the real one — no spoofing path).
+    fn raw_socket_protocol(self) -> Option<Protocol> {
+        if self.raw_tcp_flag().is_some() {
+            Some(Protocol::from(IPPROTO_RAW))
+        } else if self == L4Mode::Icmp {
+            Some(Protocol::ICMPV4)
+        } else {
+            None
+        }
+    }
+
+    /// Which OSI layer this mode drives: ICMP is L3, everything else L4.
+    fn layer(self) -> Layer {
+        if self == L4Mode::Icmp {
+            Layer::L3
+        } else {
+            Layer::L4
+        }
     }
 }
 
@@ -137,7 +167,7 @@ impl std::fmt::Display for L34Error {
             }
             L34Error::RawSocket(e) => write!(
                 f,
-                "cannot open raw socket for a TCP flag flood ({e}); needs CAP_NET_RAW/root \
+                "cannot open raw socket ({e}); needs CAP_NET_RAW/root \
                  (grant with: sudo setcap cap_net_raw+ep <binary>, or run as root)"
             ),
             L34Error::Setup(e) => write!(f, "socket setup failed: {e}"),
@@ -166,10 +196,10 @@ impl L34Engine {
     /// be present. `Ok(())` means the run can proceed. Fail-closed.
     pub fn preflight(&self, plan: &RunPlan) -> Result<(), L34Error> {
         self.check_targets(plan)?;
-        if self.config.mode.needs_raw_socket() {
+        if let Some(proto) = self.config.mode.raw_socket_protocol() {
             // Opening (and immediately dropping) the raw socket surfaces a missing
             // CAP_NET_RAW now rather than mid-run with a zero-sent report.
-            Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
+            Socket::new(Domain::IPV4, Type::RAW, Some(proto))
                 .map_err(|e| L34Error::RawSocket(e.to_string()))?;
         }
         Ok(())
@@ -198,7 +228,7 @@ impl L34Engine {
 
 impl StressModule for L34Engine {
     fn layer(&self) -> Layer {
-        Layer::L4
+        self.config.mode.layer()
     }
 
     fn name(&self) -> &str {
@@ -209,11 +239,19 @@ impl StressModule for L34Engine {
         match self.run(plan) {
             Ok(report) => report,
             Err(e) => RunReport {
-                layer_label: format!("L4 {} ERROR: {e}", self.config.mode.label()),
+                layer_label: format!("{} {} ERROR: {e}", layer_tag(self.config.mode), self.config.mode.label()),
                 aborted_early: true,
                 ..Default::default()
             },
         }
+    }
+}
+
+/// Short OSI tag for a mode's run/error labels: `L3` for ICMP, else `L4`.
+fn layer_tag(mode: L4Mode) -> &'static str {
+    match mode.layer() {
+        Layer::L3 => "L3",
+        _ => "L4",
     }
 }
 
@@ -225,13 +263,13 @@ impl L34Engine {
         self.check_targets(plan)?;
         let ips: Vec<IpAddr> = plan.targets.iter().filter_map(|t| t.as_ip()).collect();
 
-        let label = format!(
-            "L4 {} -> port {} ({} target{})",
-            self.config.mode.label(),
-            self.config.port,
-            ips.len(),
-            if ips.len() == 1 { "" } else { "s" }
-        );
+        let targets_suffix = format!("({} target{})", ips.len(), if ips.len() == 1 { "" } else { "s" });
+        // ICMP has no port; every other mode targets a port.
+        let label = if self.config.mode == L4Mode::Icmp {
+            format!("L3 {} {targets_suffix}", self.config.mode.label())
+        } else {
+            format!("L4 {} -> port {} {targets_suffix}", self.config.mode.label(), self.config.port)
+        };
 
         // Rate 0 => send nothing (this is a safety control, honoured before we
         // even open a socket, so it is deterministic).
@@ -293,6 +331,10 @@ enum Sender {
     /// Raw IPv4+TCP flag flood (SYN/ACK/FIN/RST). `flag` selects which one control
     /// flag is set; everything else is shared.
     RawTcp { flag: TcpFlag, raw: Socket, srcs: HashMap<IpAddr, Ipv4Addr>, counter: u32 },
+    /// Raw ICMPv4 echo-request flood. The kernel supplies the IP header (real
+    /// source address); we craft the ICMP echo message + checksum. `id` tags this
+    /// run; `counter` is the per-packet sequence number. `payload` is a fixed body.
+    Icmp { raw: Socket, id: u16, counter: u16, payload: Vec<u8> },
 }
 
 /// UDP payloads above this are rejected to avoid accidental fragmentation.
@@ -311,6 +353,15 @@ impl Sender {
                 held: Vec::new(),
                 timeout: Duration::from_millis(500),
             }),
+            L4Mode::Icmp => {
+                let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
+                    .map_err(|e| L34Error::RawSocket(e.to_string()))?;
+                // Payload capped like UDP to avoid accidental fragmentation.
+                let payload = vec![0u8; payload_size.min(MAX_UDP_PAYLOAD)];
+                // Identifier from the PID, so replies (if any) are attributable.
+                let id = std::process::id() as u16;
+                Ok(Sender::Icmp { raw, id, counter: 0, payload })
+            }
             other => {
                 // SYN / ACK / FIN / RST: all raw-TCP flag floods share one setup.
                 let flag = other
@@ -356,6 +407,22 @@ impl Sender {
                 *counter = counter.wrapping_add(1);
                 let src_port = 20_000u16.wrapping_add((*counter % 40_000) as u16);
                 let packet = build_tcp_flag(src, dst, src_port, port, *counter, *flag)?;
+                let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
+                raw.send_to(&packet, &dest)
+                    .map(|_| ())
+                    .map_err(|e| L34Error::Setup(e.to_string()))
+            }
+
+            Sender::Icmp { raw, id, counter, payload } => {
+                let dst = match ip {
+                    IpAddr::V4(v4) => v4,
+                    // check_targets refuses IPv6 for ICMP up front; this is defensive.
+                    IpAddr::V6(_) => return Err(L34Error::Ipv6RawTcpUnsupported(ip)),
+                };
+                *counter = counter.wrapping_add(1);
+                let packet = build_icmp_echo(*id, *counter, payload);
+                // Port is irrelevant for ICMP; the kernel builds the IP header from
+                // the real source address (IPPROTO_ICMP), so there is no spoof path.
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
                 raw.send_to(&packet, &dest)
                     .map(|_| ())
@@ -411,6 +478,39 @@ fn build_tcp_flag(
         .write(&mut out, &[])
         .map_err(|e| L34Error::Build(e.to_string()))?;
     Ok(out)
+}
+
+/// Build an ICMPv4 echo-request message (type 8, code 0) with its checksum. The
+/// kernel prepends the IPv4 header (real source address), so we only craft the
+/// ICMP message itself: header + `payload`.
+fn build_icmp_echo(id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(8 + payload.len());
+    pkt.push(8); // type: echo request
+    pkt.push(0); // code
+    pkt.extend_from_slice(&[0, 0]); // checksum placeholder
+    pkt.extend_from_slice(&id.to_be_bytes());
+    pkt.extend_from_slice(&seq.to_be_bytes());
+    pkt.extend_from_slice(payload);
+    let ck = icmp_checksum(&pkt);
+    pkt[2..4].copy_from_slice(&ck.to_be_bytes());
+    pkt
+}
+
+/// The standard Internet checksum (one's-complement sum of 16-bit words) over an
+/// ICMP message whose checksum field is currently zero.
+fn icmp_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = data.chunks_exact(2);
+    for c in chunks.by_ref() {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    }
+    if let [last] = chunks.remainder() {
+        sum += (*last as u32) << 8; // odd length: pad with a zero low byte
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Sleep for `dur` but wake early (and return `true`) if the kill switch trips,
@@ -507,6 +607,37 @@ mod tests {
     }
 
     #[test]
+    fn icmp_echo_is_well_formed_with_valid_checksum() {
+        let pkt = build_icmp_echo(0x1234, 7, b"ping");
+        assert_eq!(pkt[0], 8, "type must be echo request");
+        assert_eq!(pkt[1], 0, "code must be 0");
+        assert_eq!(&pkt[4..6], &0x1234u16.to_be_bytes(), "identifier");
+        assert_eq!(&pkt[6..8], &7u16.to_be_bytes(), "sequence");
+        assert_eq!(&pkt[8..], b"ping", "payload");
+        // A correct Internet checksum makes the one's-complement sum of the whole
+        // message equal 0xFFFF (i.e. the checksum verifies).
+        let mut sum = 0u32;
+        for c in pkt.chunks(2) {
+            let word = if c.len() == 2 { u16::from_be_bytes([c[0], c[1]]) } else { (c[0] as u16) << 8 };
+            sum += word as u32;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF, "checksum must verify");
+    }
+
+    #[test]
+    fn icmp_is_layer_l3_and_needs_a_raw_socket() {
+        let engine = L34Engine::new(L34Config { mode: L4Mode::Icmp, port: 0, payload_size: 32 });
+        assert_eq!(engine.layer(), Layer::L3);
+        assert_eq!(engine.name(), "icmp-echo-flood");
+        assert!(L4Mode::Icmp.needs_raw_socket());
+        assert_eq!(L4Mode::Icmp.raw_tcp_flag(), None);
+        assert_eq!(L4Mode::Udp.layer(), Layer::L4);
+    }
+
+    #[test]
     fn raw_tcp_modes_map_to_their_flag_and_labels() {
         assert_eq!(L4Mode::Syn.raw_tcp_flag(), Some(TcpFlag::Syn));
         assert_eq!(L4Mode::Ack.raw_tcp_flag(), Some(TcpFlag::Ack));
@@ -556,7 +687,7 @@ mod tests {
     fn ipv6_target_refused_fail_closed_for_udp_and_syn() {
         // An allowlisted IPv6 target must NOT produce a hollow all-errors run that
         // still reports success: UDP/SYN are IPv4-only, so refuse up front.
-        for mode in [L4Mode::Udp, L4Mode::Syn, L4Mode::Ack, L4Mode::Fin, L4Mode::Rst] {
+        for mode in [L4Mode::Udp, L4Mode::Syn, L4Mode::Ack, L4Mode::Fin, L4Mode::Rst, L4Mode::Icmp] {
             let t = authorized_ip("::1/128", "::1");
             let engine = L34Engine::new(L34Config { mode, port: 9, payload_size: 16 });
             let p = plan(vec![t], 50, 1);
