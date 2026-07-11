@@ -1,11 +1,14 @@
 //! # jinrai-l34 — L3/L4 traffic generation (isolated-lab use only)
 //!
-//! Three direct stress primitives against **allowlisted** targets:
+//! Direct stress primitives against **allowlisted** targets:
 //!   - **UDP flood** — datagrams to `target:port` (no privilege needed);
 //!   - **TCP connect flood** — full-handshake connections held open to exercise
 //!     the connection table / backlog (no privilege needed);
-//!   - **TCP SYN flood** — crafted IPv4+TCP SYN packets via a raw socket
-//!     (requires `CAP_NET_RAW`/root).
+//!   - **TCP flag floods** — crafted IPv4+TCP packets with a single control flag
+//!     set (SYN / ACK / FIN / RST) via a raw socket (requires `CAP_NET_RAW`/root).
+//!     SYN exercises the accept backlog; ACK/FIN/RST exercise the target's
+//!     connection-tracking / stateful-firewall state for packets outside an
+//!     established connection.
 //!
 //! ## Non-negotiable guardrail: no source spoofing
 //!
@@ -36,8 +39,25 @@ pub enum L4Mode {
     Udp,
     /// TCP full-handshake connect flood (connections held open).
     TcpConnect,
-    /// TCP SYN flood (raw socket, SYN only).
+    /// TCP SYN flood (raw socket, SYN flag).
     Syn,
+    /// TCP ACK flood (raw socket, ACK flag) — packets with no matching connection.
+    Ack,
+    /// TCP FIN flood (raw socket, FIN flag) — connection-teardown packets.
+    Fin,
+    /// TCP RST flood (raw socket, RST flag) — reset packets.
+    Rst,
+}
+
+/// The single TCP control flag a raw-TCP flood sets. All raw-TCP modes share the
+/// same packet-crafting, socket, and no-spoofing machinery; they differ only in
+/// which one flag is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpFlag {
+    Syn,
+    Ack,
+    Fin,
+    Rst,
 }
 
 impl L4Mode {
@@ -46,7 +66,28 @@ impl L4Mode {
             L4Mode::Udp => "udp-flood",
             L4Mode::TcpConnect => "tcp-connect-flood",
             L4Mode::Syn => "tcp-syn-flood",
+            L4Mode::Ack => "tcp-ack-flood",
+            L4Mode::Fin => "tcp-fin-flood",
+            L4Mode::Rst => "tcp-rst-flood",
         }
+    }
+
+    /// The TCP flag for a raw-TCP flood mode, or `None` for the socket-based
+    /// (UDP / TCP-connect) modes that need no raw socket.
+    fn raw_tcp_flag(self) -> Option<TcpFlag> {
+        match self {
+            L4Mode::Syn => Some(TcpFlag::Syn),
+            L4Mode::Ack => Some(TcpFlag::Ack),
+            L4Mode::Fin => Some(TcpFlag::Fin),
+            L4Mode::Rst => Some(TcpFlag::Rst),
+            L4Mode::Udp | L4Mode::TcpConnect => None,
+        }
+    }
+
+    /// Raw-TCP flood modes craft IPv4 packets on a raw socket (needs CAP_NET_RAW)
+    /// and are IPv4-only.
+    fn needs_raw_socket(self) -> bool {
+        self.raw_tcp_flag().is_some()
     }
 }
 
@@ -69,13 +110,13 @@ pub enum L34Error {
     /// binds an IPv4 socket; the SYN builder is IPv4-only). Fail-closed rather than
     /// spin a full run emitting only errors: [`L4Mode::TcpConnect`] handles IPv6.
     Ipv6Unsupported { mode: L4Mode, ip: IpAddr },
-    /// SYN mode was asked for an IPv6 target; only IPv4 is implemented so far.
-    Ipv6SynUnsupported(IpAddr),
+    /// A raw-TCP flood mode was asked for an IPv6 target; only IPv4 is implemented.
+    Ipv6RawTcpUnsupported(IpAddr),
     /// The raw socket could not be created (usually missing CAP_NET_RAW/root).
     RawSocket(String),
     /// A socket setup step failed.
     Setup(String),
-    /// Building the SYN packet failed.
+    /// Building the raw TCP packet failed.
     Build(String),
 }
 
@@ -91,16 +132,16 @@ impl std::fmt::Display for L34Error {
                  (use --l4-mode tcp for IPv6, or give an IPv4 target)",
                 mode.label()
             ),
-            L34Error::Ipv6SynUnsupported(ip) => {
-                write!(f, "SYN flood is IPv4-only for now; refusing IPv6 target {ip}")
+            L34Error::Ipv6RawTcpUnsupported(ip) => {
+                write!(f, "TCP flag floods are IPv4-only for now; refusing IPv6 target {ip}")
             }
             L34Error::RawSocket(e) => write!(
                 f,
-                "cannot open raw socket for SYN flood ({e}); needs CAP_NET_RAW/root \
+                "cannot open raw socket for a TCP flag flood ({e}); needs CAP_NET_RAW/root \
                  (grant with: sudo setcap cap_net_raw+ep <binary>, or run as root)"
             ),
             L34Error::Setup(e) => write!(f, "socket setup failed: {e}"),
-            L34Error::Build(e) => write!(f, "failed to build SYN packet: {e}"),
+            L34Error::Build(e) => write!(f, "failed to build TCP packet: {e}"),
         }
     }
 }
@@ -125,7 +166,7 @@ impl L34Engine {
     /// be present. `Ok(())` means the run can proceed. Fail-closed.
     pub fn preflight(&self, plan: &RunPlan) -> Result<(), L34Error> {
         self.check_targets(plan)?;
-        if self.config.mode == L4Mode::Syn {
+        if self.config.mode.needs_raw_socket() {
             // Opening (and immediately dropping) the raw socket surfaces a missing
             // CAP_NET_RAW now rather than mid-run with a zero-sent report.
             Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
@@ -143,10 +184,10 @@ impl L34Engine {
         if ips.is_empty() {
             return Err(L34Error::NoIpTargets);
         }
-        // UDP binds an IPv4 socket and the SYN builder is IPv4-only, so an IPv6
-        // target would send nothing but errors. Refuse it instead of reporting a
-        // hollow "success". TCP connect handles IPv6 natively, so it is exempt.
-        if matches!(self.config.mode, L4Mode::Udp | L4Mode::Syn) {
+        // UDP binds an IPv4 socket and the raw-TCP builders are IPv4-only, so an
+        // IPv6 target would send nothing but errors. Refuse it instead of reporting
+        // a hollow "success". TCP connect handles IPv6 natively, so it is exempt.
+        if self.config.mode == L4Mode::Udp || self.config.mode.needs_raw_socket() {
             if let Some(&ip) = ips.iter().find(|ip| ip.is_ipv6()) {
                 return Err(L34Error::Ipv6Unsupported { mode: self.config.mode, ip });
             }
@@ -249,7 +290,9 @@ impl L34Engine {
 enum Sender {
     Udp { sock: UdpSocket, payload: Vec<u8> },
     Tcp { held: Vec<TcpStream>, timeout: Duration },
-    Syn { raw: Socket, srcs: HashMap<IpAddr, Ipv4Addr>, counter: u32 },
+    /// Raw IPv4+TCP flag flood (SYN/ACK/FIN/RST). `flag` selects which one control
+    /// flag is set; everything else is shared.
+    RawTcp { flag: TcpFlag, raw: Socket, srcs: HashMap<IpAddr, Ipv4Addr>, counter: u32 },
 }
 
 /// UDP payloads above this are rejected to avoid accidental fragmentation.
@@ -268,10 +311,14 @@ impl Sender {
                 held: Vec::new(),
                 timeout: Duration::from_millis(500),
             }),
-            L4Mode::Syn => {
+            other => {
+                // SYN / ACK / FIN / RST: all raw-TCP flag floods share one setup.
+                let flag = other
+                    .raw_tcp_flag()
+                    .expect("setup reached with a non-raw-TCP mode");
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
                     .map_err(|e| L34Error::RawSocket(e.to_string()))?;
-                Ok(Sender::Syn { raw, srcs: HashMap::new(), counter: 0 })
+                Ok(Sender::RawTcp { flag, raw, srcs: HashMap::new(), counter: 0 })
             }
         }
     }
@@ -292,10 +339,10 @@ impl Sender {
                 Ok(())
             }
 
-            Sender::Syn { raw, srcs, counter } => {
+            Sender::RawTcp { flag, raw, srcs, counter } => {
                 let dst = match ip {
                     IpAddr::V4(v4) => v4,
-                    IpAddr::V6(_) => return Err(L34Error::Ipv6SynUnsupported(ip)),
+                    IpAddr::V6(_) => return Err(L34Error::Ipv6RawTcpUnsupported(ip)),
                 };
                 // Real source address for the route to this target — never spoofed.
                 let src = match srcs.get(&ip) {
@@ -308,7 +355,7 @@ impl Sender {
                 };
                 *counter = counter.wrapping_add(1);
                 let src_port = 20_000u16.wrapping_add((*counter % 40_000) as u16);
-                let packet = build_syn(src, dst, src_port, port, *counter)?;
+                let packet = build_tcp_flag(src, dst, src_port, port, *counter, *flag)?;
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
                 raw.send_to(&packet, &dest)
                     .map(|_| ())
@@ -338,18 +385,27 @@ fn source_ipv4_for(dst: Ipv4Addr, port: u16) -> Result<Ipv4Addr, L34Error> {
     }
 }
 
-/// Build a complete IPv4 + TCP SYN packet (no payload) with correct checksums.
-fn build_syn(
+/// Build a complete IPv4 + TCP packet (no payload) with correct checksums and a
+/// single control flag set. The source address is the caller-supplied real
+/// route-local address — there is no spoofing path.
+fn build_tcp_flag(
     src: Ipv4Addr,
     dst: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
     seq: u32,
+    flag: TcpFlag,
 ) -> Result<Vec<u8>, L34Error> {
     use etherparse::PacketBuilder;
-    let builder = PacketBuilder::ipv4(src.octets(), dst.octets(), 64)
-        .tcp(src_port, dst_port, seq, 64_240)
-        .syn();
+    let base = PacketBuilder::ipv4(src.octets(), dst.octets(), 64).tcp(src_port, dst_port, seq, 64_240);
+    // Each mode sets exactly one control flag. ACK carries an acknowledgement
+    // number (the flag is meaningless without one); the rest are bare flags.
+    let builder = match flag {
+        TcpFlag::Syn => base.syn(),
+        TcpFlag::Ack => base.ack(seq.wrapping_add(1)),
+        TcpFlag::Fin => base.fin(),
+        TcpFlag::Rst => base.rst(),
+    };
     let mut out = Vec::with_capacity(builder.size(0));
     builder
         .write(&mut out, &[])
@@ -397,30 +453,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn syn_packet_is_well_formed() {
-        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
-        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
-        let pkt = build_syn(src, dst, 40000, 80, 12345).unwrap();
-
-        let headers = etherparse::PacketHeaders::from_ip_slice(&pkt).expect("parse IP packet");
+    /// Parse a raw IPv4+TCP packet back into headers for assertions.
+    fn parse_tcp(pkt: &[u8]) -> (etherparse::Ipv4Header, etherparse::TcpHeader) {
+        let headers = etherparse::PacketHeaders::from_ip_slice(pkt).expect("parse IP packet");
         let ipv4 = match headers.net.expect("net header") {
             etherparse::NetHeaders::Ipv4(h, _) => h,
             other => panic!("expected IPv4, got {other:?}"),
         };
-        assert_eq!(ipv4.source, src.octets());
-        assert_eq!(ipv4.destination, dst.octets());
-
         let tcp = match headers.transport.expect("transport header") {
             etherparse::TransportHeader::Tcp(t) => t,
             other => panic!("expected TCP, got {other:?}"),
         };
+        (ipv4, tcp)
+    }
+
+    #[test]
+    fn syn_packet_is_well_formed() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let pkt = build_tcp_flag(src, dst, 40000, 80, 12345, TcpFlag::Syn).unwrap();
+
+        let (ipv4, tcp) = parse_tcp(&pkt);
+        assert_eq!(ipv4.source, src.octets());
+        assert_eq!(ipv4.destination, dst.octets());
         assert!(tcp.syn, "SYN flag must be set");
         assert!(!tcp.ack, "ACK must not be set on a SYN");
         assert_eq!(tcp.source_port, 40000);
         assert_eq!(tcp.destination_port, 80);
         assert_eq!(tcp.sequence_number, 12345);
         assert_ne!(tcp.checksum, 0, "checksum must be computed");
+    }
+
+    #[test]
+    fn each_flag_flood_sets_exactly_its_own_flag() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        // (flag, is_syn, is_ack, is_fin, is_rst)
+        let cases = [
+            (TcpFlag::Syn, true, false, false, false),
+            (TcpFlag::Ack, false, true, false, false),
+            (TcpFlag::Fin, false, false, true, false),
+            (TcpFlag::Rst, false, false, false, true),
+        ];
+        for (flag, syn, ack, fin, rst) in cases {
+            let pkt = build_tcp_flag(src, dst, 40000, 80, 999, flag).unwrap();
+            let (_, tcp) = parse_tcp(&pkt);
+            assert_eq!(tcp.syn, syn, "{flag:?} syn");
+            assert_eq!(tcp.ack, ack, "{flag:?} ack");
+            assert_eq!(tcp.fin, fin, "{flag:?} fin");
+            assert_eq!(tcp.rst, rst, "{flag:?} rst");
+            assert_ne!(tcp.checksum, 0, "{flag:?} checksum must be computed");
+        }
+    }
+
+    #[test]
+    fn raw_tcp_modes_map_to_their_flag_and_labels() {
+        assert_eq!(L4Mode::Syn.raw_tcp_flag(), Some(TcpFlag::Syn));
+        assert_eq!(L4Mode::Ack.raw_tcp_flag(), Some(TcpFlag::Ack));
+        assert_eq!(L4Mode::Fin.raw_tcp_flag(), Some(TcpFlag::Fin));
+        assert_eq!(L4Mode::Rst.raw_tcp_flag(), Some(TcpFlag::Rst));
+        assert_eq!(L4Mode::Udp.raw_tcp_flag(), None);
+        assert_eq!(L4Mode::TcpConnect.raw_tcp_flag(), None);
+        assert!(L4Mode::Ack.needs_raw_socket() && !L4Mode::Udp.needs_raw_socket());
+        assert_eq!(L4Mode::Rst.label(), "tcp-rst-flood");
     }
 
     #[test]
@@ -461,7 +556,7 @@ mod tests {
     fn ipv6_target_refused_fail_closed_for_udp_and_syn() {
         // An allowlisted IPv6 target must NOT produce a hollow all-errors run that
         // still reports success: UDP/SYN are IPv4-only, so refuse up front.
-        for mode in [L4Mode::Udp, L4Mode::Syn] {
+        for mode in [L4Mode::Udp, L4Mode::Syn, L4Mode::Ack, L4Mode::Fin, L4Mode::Rst] {
             let t = authorized_ip("::1/128", "::1");
             let engine = L34Engine::new(L34Config { mode, port: 9, payload_size: 16 });
             let p = plan(vec![t], 50, 1);
