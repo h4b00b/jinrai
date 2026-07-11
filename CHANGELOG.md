@@ -12,6 +12,14 @@ the safety gate, authorization, or auditability are called out under
 
 ### Added
 
+- **TCP flag floods (Phase 7)** — `--l4-mode` gains `ack`, `fin`, and `rst`
+  alongside the existing `syn`. Each crafts an IPv4+TCP packet with exactly one
+  control flag set and reuses the SYN primitive's raw socket, packet-crafting,
+  and real-source-address machinery. SYN exercises the accept backlog; ACK / FIN
+  / RST exercise a target's connection-tracking / stateful-firewall handling of
+  packets that match no established connection. Like SYN they are IPv4-only,
+  require `CAP_NET_RAW`/root, and are gated behind `--ack-l34-lab` + the
+  allowlist.
 - **Load profiles (Phase 6)** — the L7 fast engine no longer only runs a flat
   rate. `--profile` shapes the load over time: `constant` (default), `soak` (a
   long flat hold), `ramp` (step the rate up from `--ramp-start` to the ceiling in
@@ -47,6 +55,11 @@ the safety gate, authorization, or auditability are called out under
 
 ### Security
 
+- **The no-spoofing guarantee extends to every TCP flag flood (Phase 7)** — the
+  new `ack`/`fin`/`rst` modes go through the same `source_ipv4_for` route lookup
+  as SYN: the source address is always the host's real, OS-routed outbound
+  address. There is still no API anywhere to set, randomise, or spoof it, and no
+  reflection/amplification path — these remain direct self-tests, not weapons.
 - **Load profiles cannot escape the rate ceiling (Phase 6)** — `--rate` remains a
   hard safety cap, not just a knob. Every stage a profile compiles to is clamped
   to it (`RateCap::clamped_to`), so a ramp, spike, or a fat-fingered profile can

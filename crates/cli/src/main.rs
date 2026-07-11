@@ -48,7 +48,12 @@ REQUIRED:
 
 OPTIONS:
     --layer <l4|l7>       Module to run (default: l7)
-    --l4-mode <udp|tcp|syn>  L3/L4 primitive (default: udp). 'syn' needs CAP_NET_RAW/root.
+    --l4-mode <MODE>      L3/L4 primitive (default: udp). One of:
+                            udp | tcp            no privilege needed
+                            syn | ack | fin | rst  raw TCP flag floods; each sets
+                                                 one flag, needs CAP_NET_RAW/root,
+                                                 IPv4-only, real source IP (never
+                                                 spoofed)
     --l7-method <METHOD>  L7 primitive (default: get). One of:
                             get | post | head   fast request flood
                             slowloris            slow partial headers (Slowloris)
@@ -626,7 +631,14 @@ fn parse_args() -> Result<Args, String> {
                     "udp" => L4Mode::Udp,
                     "tcp" => L4Mode::TcpConnect,
                     "syn" => L4Mode::Syn,
-                    other => return Err(format!("unknown --l4-mode: {other} (want udp|tcp|syn)")),
+                    "ack" => L4Mode::Ack,
+                    "fin" => L4Mode::Fin,
+                    "rst" => L4Mode::Rst,
+                    other => {
+                        return Err(format!(
+                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst)"
+                        ))
+                    }
                 }
             }
             "--port" => {
