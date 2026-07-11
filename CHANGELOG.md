@@ -12,6 +12,33 @@ the safety gate, authorization, or auditability are called out under
 
 ### Added
 
+- **Response classification & SLO verdict (Phase 5)** — the L7 fast engine now
+  classifies every completed response by status class (`status_2xx/3xx/4xx/5xx`)
+  and separates *completed-but-failing* responses (a `500` is a completion, not a
+  transport error) from real transport failures (`errors`, with `timeouts` as a
+  named subset). Operators can declare a Service-Level Objective with
+  `--slo-max-error-rate`, `--slo-max-5xx-rate`, `--slo-max-4xx-rate` (off by
+  default) and `--slo-max-p99-ms`; the run prints a `SLO: PASS/FAIL(...)` verdict
+  and **exits non-zero when the target misses the SLO**, so automation can tell
+  "the target held" from "the target buckled". Runs with no `--slo-*` flag behave
+  exactly as before. The verdict and the status breakdown are recorded in the
+  audit log's `run_completed` event.
+- **Inline health-watchdog (Phase 5)** — `--watchdog` runs a background task that
+  evaluates the trailing window of traffic against the SLO's *rate* thresholds
+  and trips the shared kill-switch after `--watchdog-breaches` consecutive
+  breaching `--watchdog-window`s, auto-aborting a run that is hurting the target.
+  A watchdog abort is reported (`aborted_by_watchdog`) and exits non-zero.
+
+### Security
+
+- The watchdog is **fail-safe by construction**: it can only ever *stop* traffic
+  (via the existing `KillSwitch` that every engine already polls) and has no path
+  to generate any. It does not touch the `AuthorizedTarget` invariant, so the
+  authorization gate is unchanged. A lull (a window with zero attempts) resets
+  the breach streak rather than counting as a breach, and the worst-case
+  time-to-abort is bounded by `window * breaches` of *sustained* breach so a
+  transient spike cannot abort a legitimate run.
+
 - **L7 request primitives** — the L7 engine is no longer GET-only. `--l7-method`
   selects `get` | `post` | `head` (fast, reqwest-based, constant-rate) plus two
   slow-connection primitives, `slowloris` and `slowbody`. `--body` supplies a

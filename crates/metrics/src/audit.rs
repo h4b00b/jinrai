@@ -28,7 +28,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jinrai_core::RunReport;
+use jinrai_core::{RunReport, SloVerdict};
 use sha2::{Digest, Sha256};
 
 /// The `prev` value of the very first record — a chain "genesis" anchor.
@@ -50,16 +50,25 @@ pub enum AuditEvent {
         /// The operator-supplied allowlist rules in effect for this run.
         allow_rules: Vec<String>,
     },
-    /// A run finished; carries the outcome metrics.
+    /// A run finished; carries the outcome metrics and the SLO verdict.
     RunCompleted {
         layer_label: String,
         units_sent: u64,
         errors: u64,
         aborted_early: bool,
+        aborted_by_watchdog: bool,
+        status_2xx: u64,
+        status_3xx: u64,
+        status_4xx: u64,
+        status_5xx: u64,
+        timeouts: u64,
         p50_micros: u64,
         p90_micros: u64,
         p99_micros: u64,
         max_micros: u64,
+        /// SLO verdict rendered as `PASS` / `FAIL (...)`, or `n/a` when no SLO
+        /// was declared for the run.
+        slo: String,
     },
     /// A run was refused (fail-closed) before or during execution.
     RunRefused {
@@ -70,17 +79,28 @@ pub enum AuditEvent {
 }
 
 impl AuditEvent {
-    /// Build a `RunCompleted` event straight from a [`RunReport`].
-    pub fn completed(report: &RunReport) -> Self {
+    /// Build a `RunCompleted` event from a [`RunReport`] and the run's SLO
+    /// verdict (`None` when no SLO was declared).
+    pub fn completed(report: &RunReport, verdict: Option<&SloVerdict>) -> Self {
         AuditEvent::RunCompleted {
             layer_label: report.layer_label.clone(),
             units_sent: report.units_sent,
             errors: report.errors,
             aborted_early: report.aborted_early,
+            aborted_by_watchdog: report.aborted_by_watchdog,
+            status_2xx: report.status_2xx,
+            status_3xx: report.status_3xx,
+            status_4xx: report.status_4xx,
+            status_5xx: report.status_5xx,
+            timeouts: report.timeouts,
             p50_micros: report.p50_micros,
             p90_micros: report.p90_micros,
             p99_micros: report.p99_micros,
             max_micros: report.max_micros,
+            slo: match verdict {
+                Some(v) => v.to_string(),
+                None => "n/a".to_string(),
+            },
         }
     }
 
@@ -109,21 +129,37 @@ impl AuditEvent {
                 units_sent,
                 errors,
                 aborted_early,
+                aborted_by_watchdog,
+                status_2xx,
+                status_3xx,
+                status_4xx,
+                status_5xx,
+                timeouts,
                 p50_micros,
                 p90_micros,
                 p99_micros,
                 max_micros,
+                slo,
             } => format!(
                 "\"event\":\"run_completed\",\"layer\":\"{}\",\"units_sent\":{},\"errors\":{},\
-                 \"aborted_early\":{},\"latency_us\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}}",
+                 \"aborted_early\":{},\"aborted_by_watchdog\":{},\
+                 \"status\":{{\"c2xx\":{},\"c3xx\":{},\"c4xx\":{},\"c5xx\":{},\"timeout\":{}}},\
+                 \"latency_us\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},\"slo\":\"{}\"",
                 json_escape(layer_label),
                 units_sent,
                 errors,
                 aborted_early,
+                aborted_by_watchdog,
+                status_2xx,
+                status_3xx,
+                status_4xx,
+                status_5xx,
+                timeouts,
                 p50_micros,
                 p90_micros,
                 p99_micros,
                 max_micros,
+                json_escape(slo),
             ),
             AuditEvent::RunRefused { stage, reason } => format!(
                 "\"event\":\"run_refused\",\"stage\":\"{}\",\"reason\":\"{}\"",
@@ -507,7 +543,7 @@ mod tests {
                 units_sent: 42,
                 ..Default::default()
             };
-            log.record(&AuditEvent::completed(&r)).unwrap();
+            log.record(&AuditEvent::completed(&r, None)).unwrap();
         }
         assert_eq!(verify(&path).unwrap(), 2);
         std::fs::remove_file(&path).ok();
@@ -565,7 +601,7 @@ mod tests {
                 reason: "no CAP_NET_RAW".into(),
             })
             .unwrap();
-            log.record(&AuditEvent::completed(&RunReport::default())).unwrap();
+            log.record(&AuditEvent::completed(&RunReport::default(), None)).unwrap();
         }
         // Remove the middle record; the third's prev now dangles.
         let lines: Vec<String> = std::fs::read_to_string(&path)
