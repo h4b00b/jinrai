@@ -14,7 +14,9 @@ use std::net::IpAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use jinrai_core::{Layer, RateCap, RunPlan, RunReport, SloSpec, SloVerdict, StressModule};
+use jinrai_core::{
+    Layer, LoadProfile, RateCap, RunPlan, RunReport, SloSpec, SloVerdict, StressModule,
+};
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode, WatchdogConfig};
 use jinrai_metrics::{AuditEvent, AuditLog};
@@ -59,10 +61,26 @@ OPTIONS:
     --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
     --drip-ms <MS>        Keep-alive write interval for slow modes (default: 10000)
     --payload-size <N>    UDP payload bytes (default: 64, l4-mode udp)
-    --rate <N>            Rate cap, units/sec (default: 100)
+    --rate <N>            Rate cap, units/sec (default: 100). This is a hard
+                          SAFETY CEILING: every load profile shapes traffic only
+                          UP TO this rate, never above it.
     --duration <SECS>     Run duration (default: 10)
     --header <K: V>       Extra request header for l7 (repeatable). Also the hook
                           for header-profile tests (User-Agent, Cookie, Referer…)
+
+    Load profiles (l7 fast methods; --rate is the peak/ceiling for every shape):
+    --profile <SHAPE>     constant  flat at the ceiling (default)
+                          soak      long flat hold — set a long --duration
+                          ramp      step up from --ramp-start to the ceiling
+                          spike     hold --spike-base, jump to the ceiling, fall
+    --ramp-start <N>      Ramp starting rate, units/sec (default: 0)
+    --ramp-steps <N>      Number of equal-length ramp stages (default: 10)
+    --spike-base <N>      Spike baseline rate (default: ceiling/5)
+    --spike-secs <SECS>   Spike peak duration (default: 10)
+    --discover-knee       Breaking-point discovery: ramp to the ceiling and stop
+                          at the first stage that breaches the SLO, reporting the
+                          capacity knee. Requires a --slo-max-*-rate to detect the
+                          knee. Finding the knee is a success (exit 0).
 
     SLO / health-watchdog (l7 fast methods; classifies each response):
     --slo-max-error-rate <F>  FAIL if transport-error rate exceeds F (0.0–1.0)
@@ -103,6 +121,20 @@ enum L7Kind {
     Slow(SlowMode),
 }
 
+/// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
+/// for every shape; the profile only varies the rate *up to* it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProfileKind {
+    /// Flat rate at the ceiling for the whole duration (the default).
+    Constant,
+    /// Endurance hold: mechanically a long constant run — set a long --duration.
+    Soak,
+    /// Step the rate up from --ramp-start to the ceiling over --duration.
+    Ramp,
+    /// Hold --spike-base, jump to the ceiling for --spike-secs, fall back.
+    Spike,
+}
+
 struct Args {
     allow: Vec<String>,
     targets: Vec<IpAddr>,
@@ -120,6 +152,12 @@ struct Args {
     ack_l34_lab: bool,
     rate: u64,
     duration_secs: u64,
+    profile: ProfileKind,
+    ramp_start: u64,
+    ramp_steps: u32,
+    spike_base: Option<u64>,
+    spike_secs: u64,
+    discover_knee: bool,
     slo: SloSpec,
     watchdog: bool,
     watchdog_window_secs: u64,
@@ -207,6 +245,37 @@ fn audit_record(audit: &mut Option<&mut AuditLog>, event: AuditEvent) -> Result<
     Ok(())
 }
 
+/// Build the fast-L7 load profile from the operator's flags, or `None` for a
+/// flat constant run at the ceiling (the engine default). `--rate` is the
+/// peak/ceiling for every shape. `--discover-knee` always ramps to the ceiling
+/// regardless of `--profile`, since a knee is found by ramping until it breaks.
+fn l7_profile(args: &Args, rate_cap: RateCap, duration: Duration) -> Option<LoadProfile> {
+    if args.discover_knee || args.profile == ProfileKind::Ramp {
+        return Some(LoadProfile::Ramp {
+            start: RateCap::new(args.ramp_start),
+            end: rate_cap,
+            duration,
+            steps: args.ramp_steps,
+        });
+    }
+    match args.profile {
+        ProfileKind::Spike => {
+            // Base defaults to a fifth of the peak (>=1) when unspecified.
+            let base = args.spike_base.unwrap_or((rate_cap.per_second / 5).max(1));
+            Some(LoadProfile::Spike {
+                base: RateCap::new(base),
+                peak: rate_cap,
+                base_total: duration,
+                spike: Duration::from_secs(args.spike_secs),
+            })
+        }
+        // Constant / Soak: flat at the ceiling — use the engine default.
+        ProfileKind::Constant | ProfileKind::Soak => None,
+        // Ramp handled above.
+        ProfileKind::Ramp => unreachable!("ramp handled above"),
+    }
+}
+
 /// L7: the operator supplies a URL. The engine validates the URL's host as a
 /// *datum* — an IP literal against the CIDR rules, a DNS name against the DNS
 /// rules — and only then (for a name) resolves once to connect.
@@ -223,6 +292,14 @@ fn run_l7(
         .clone()
         .ok_or("--layer l7 requires --url <URL>")?;
 
+    // Phase-6 profile validation, fail-closed before any traffic: knee discovery
+    // is meaningless without a rate SLO to detect the breaking point against.
+    if args.discover_knee && !args.slo.has_rate_thresholds() {
+        return Err("--discover-knee needs a rate SLO to detect the knee \
+                    (add e.g. --slo-max-5xx-rate or --slo-max-error-rate)"
+            .into());
+    }
+
     // Build the selected engine and authorize its datum up front. Both engines
     // authorize identically (datum + resolve-once); we box to a trait object so
     // the audit/plan/execute flow below is shared. Fail-closed with a clear
@@ -237,6 +314,12 @@ fn run_l7(
                 cache_bust: args.cache_bust,
             };
             let mut engine = L7Engine::new(gate, spec).with_slo(args.slo);
+            if let Some(p) = l7_profile(args, rate_cap, duration) {
+                engine = engine.with_profile(p);
+            }
+            if args.discover_knee {
+                engine = engine.discover_knee(true);
+            }
             if args.watchdog {
                 engine = engine.with_watchdog(WatchdogConfig {
                     window: Duration::from_secs(args.watchdog_window_secs.max(1)),
@@ -298,11 +381,36 @@ fn run_l7(
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
     }
+    // Load profiles / knee discovery only shape the fast request-flood dispatch.
+    if matches!(args.l7_kind, L7Kind::Slow(_))
+        && (args.discover_knee || args.profile != ProfileKind::Constant)
+    {
+        eprintln!("warning: load profiles / --discover-knee apply to fast l7 methods only; ignored for slow-connection modes");
+    }
 
     let plan = RunPlan { targets, rate_cap, duration, kill };
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let report = engine.execute(&plan);
     println!("{}", jinrai_metrics::render(&report));
+
+    // A knee-discovery run reports the breaking point, not a pass/fail verdict:
+    // reaching a breach is the goal, so the SLO here is the probe, not a target.
+    if args.discover_knee {
+        match report.knee {
+            Some(k) => println!(
+                "breaking point: sustained {} req/s within SLO, breached at {} req/s",
+                k.sustained_per_sec, k.breached_at_per_sec
+            ),
+            None => println!(
+                "no breaking point found: target held the full ramp up to {} req/s within SLO",
+                args.rate
+            ),
+        }
+        audit_record(&mut audit, AuditEvent::completed(&report, None))?;
+        // Discovery succeeds whether or not a knee was found (an operator Ctrl-C
+        // still aborts); it is not a pass/fail run.
+        return Ok(());
+    }
 
     // Evaluate the SLO verdict (only when the operator declared one, and only for
     // fast methods that produced a classification).
@@ -458,6 +566,12 @@ fn parse_args() -> Result<Args, String> {
     let mut ack_l34_lab = false;
     let mut rate = 100u64;
     let mut duration_secs = 10u64;
+    let mut profile = ProfileKind::Constant;
+    let mut ramp_start = 0u64;
+    let mut ramp_steps = 10u32;
+    let mut spike_base = None;
+    let mut spike_secs = 10u64;
+    let mut discover_knee = false;
     let mut slo = SloSpec::default();
     let mut watchdog = false;
     let mut watchdog_window_secs = 5u64;
@@ -553,6 +667,42 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "invalid --duration".to_string())?;
             }
+            "--profile" => {
+                profile = match next_val(&mut it, "--profile")?.as_str() {
+                    "constant" => ProfileKind::Constant,
+                    "soak" => ProfileKind::Soak,
+                    "ramp" => ProfileKind::Ramp,
+                    "spike" => ProfileKind::Spike,
+                    other => {
+                        return Err(format!(
+                            "unknown --profile: {other} (want constant|soak|ramp|spike)"
+                        ))
+                    }
+                }
+            }
+            "--ramp-start" => {
+                ramp_start = next_val(&mut it, "--ramp-start")?
+                    .parse()
+                    .map_err(|_| "invalid --ramp-start".to_string())?;
+            }
+            "--ramp-steps" => {
+                ramp_steps = next_val(&mut it, "--ramp-steps")?
+                    .parse()
+                    .map_err(|_| "invalid --ramp-steps".to_string())?;
+            }
+            "--spike-base" => {
+                spike_base = Some(
+                    next_val(&mut it, "--spike-base")?
+                        .parse()
+                        .map_err(|_| "invalid --spike-base".to_string())?,
+                );
+            }
+            "--spike-secs" => {
+                spike_secs = next_val(&mut it, "--spike-secs")?
+                    .parse()
+                    .map_err(|_| "invalid --spike-secs".to_string())?;
+            }
+            "--discover-knee" => discover_knee = true,
             "--slo-max-error-rate" => slo.max_error_rate = Some(parse_rate(&mut it, "--slo-max-error-rate")?),
             "--slo-max-5xx-rate" => slo.max_5xx_rate = Some(parse_rate(&mut it, "--slo-max-5xx-rate")?),
             "--slo-max-4xx-rate" => slo.max_4xx_rate = Some(parse_rate(&mut it, "--slo-max-4xx-rate")?),
@@ -596,6 +746,12 @@ fn parse_args() -> Result<Args, String> {
         ack_l34_lab,
         rate,
         duration_secs,
+        profile,
+        ramp_start,
+        ramp_steps,
+        spike_base,
+        spike_secs,
+        discover_knee,
         slo,
         watchdog,
         watchdog_window_secs,

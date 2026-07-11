@@ -32,10 +32,15 @@
 //! [`L7Engine::execute`], which re-authorizes the datum (defense in depth) and
 //! runs. An authorized host target is a perfectly good plan target.
 //!
-//! ## Deferred (later phases)
+//! ## Load profiles & breaking-point discovery (Phase 6)
 //!
-//! MVP is a single **constant-rate** GET load. TODO(phase-later): ramp-up / soak
-//! / spike load profiles, non-GET methods and request bodies. Not built now.
+//! Beyond a flat constant rate, the engine runs a [`LoadProfile`] — a `ramp`,
+//! `spike`, or `constant` shape — by compiling it to a sequence of constant-rate
+//! stages and re-pacing at each boundary. Every stage is clamped to the plan's
+//! [`RateCap`], so a profile can only ever shape traffic *up to* the operator's
+//! `--rate` ceiling. A ramp can also drive breaking-point discovery
+//! ([`L7Engine::discover_knee`]): evaluate the SLO over each stage and stop at
+//! the first breach, reporting the capacity [`Knee`].
 
 #![forbid(unsafe_code)]
 
@@ -50,7 +55,7 @@ use reqwest::Url;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
-use jinrai_core::{Layer, RunPlan, RunReport, SloSpec, StressModule};
+use jinrai_core::{Knee, Layer, LoadProfile, LoadStage, RunPlan, RunReport, SloSpec, StressModule};
 use jinrai_safety::{AuthorizedTarget, Authorization, KillSwitch, SafetyError};
 
 pub mod slow;
@@ -245,11 +250,24 @@ pub struct L7Engine {
     slo: SloSpec,
     /// When set, the inline health-watchdog that can abort a breaching run.
     watchdog: Option<WatchdogConfig>,
+    /// The load shape over time. `None` => a single constant-rate stage at the
+    /// plan's rate cap for the whole duration (the historical behaviour).
+    profile: Option<LoadProfile>,
+    /// When true (ramp profiles only), stop as soon as a stage breaches the SLO
+    /// and report the capacity knee instead of running the whole ramp.
+    discover_knee: bool,
 }
 
 impl L7Engine {
     pub fn new(gate: Authorization, spec: RequestSpec) -> Self {
-        Self { gate, spec, slo: SloSpec::default(), watchdog: None }
+        Self {
+            gate,
+            spec,
+            slo: SloSpec::default(),
+            watchdog: None,
+            profile: None,
+            discover_knee: false,
+        }
     }
 
     /// Attach an SLO. On its own this only produces an end-of-run verdict; pair
@@ -262,6 +280,24 @@ impl L7Engine {
     /// Enable the inline health-watchdog (auto-abort on sustained SLO breach).
     pub fn with_watchdog(mut self, cfg: WatchdogConfig) -> Self {
         self.watchdog = Some(cfg);
+        self
+    }
+
+    /// Shape the load over time (ramp / spike / constant). Every stage rate is
+    /// clamped to the plan's rate cap, so a profile can only ever emit *up to*
+    /// the operator's `--rate` ceiling.
+    pub fn with_profile(mut self, profile: LoadProfile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Turn a ramp profile into a breaking-point discovery run: evaluate the SLO
+    /// over each stage and stop at the first breach, reporting the capacity knee.
+    /// Inert without a ramp profile and a rate-threshold SLO (nothing breaches).
+    /// The live watchdog is suppressed during discovery — the run is *meant* to
+    /// reach a breach and stop cleanly, not abort.
+    pub fn discover_knee(mut self, on: bool) -> Self {
+        self.discover_knee = on;
         self
     }
 
@@ -336,8 +372,8 @@ impl StressModule for L7Engine {
             Err(e) => return self.refusal_report(e),
         };
 
-        // Rate cap: min spacing between dispatches. `None` => refuse to send.
-        let Some(interval_dur) = plan.rate_cap.min_interval() else {
+        // Rate cap 0 => refuse to send, whatever the profile asks for.
+        if plan.rate_cap.min_interval().is_none() {
             return RunReport {
                 layer_label: format!(
                     "L7 {} {} (rate cap 0 — sent nothing)",
@@ -347,7 +383,22 @@ impl StressModule for L7Engine {
                 aborted_early: false,
                 ..Default::default()
             };
-        };
+        }
+
+        // Compile the load profile into constant-rate stages (default: one flat
+        // stage at the rate cap for the whole duration — the historical load).
+        // Every stage is clamped to the plan's rate cap: a profile shapes traffic
+        // only *up to* the operator's `--rate` ceiling, never above it. Stages
+        // that would emit nothing (rate 0 or zero duration) are dropped.
+        let profile = self
+            .profile
+            .unwrap_or(LoadProfile::Constant { rate: plan.rate_cap, duration: plan.duration });
+        let stages: Vec<LoadStage> = profile
+            .stages()
+            .into_iter()
+            .map(|s| LoadStage { rate: s.rate.clamped_to(plan.rate_cap), duration: s.duration })
+            .filter(|s| s.rate.per_second > 0 && !s.duration.is_zero())
+            .collect();
 
         // Build the runtime here so `core` stays runtime-agnostic.
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -375,10 +426,13 @@ impl StressModule for L7Engine {
         ));
 
         let kill = plan.kill.clone();
-        let duration = plan.duration;
-        // The watchdog runs only when there is both a config and a rate threshold
-        // for it to evaluate (it does not look at latency).
-        let watchdog = self.watchdog.filter(|_| self.slo.has_rate_thresholds());
+        let discover_knee = self.discover_knee;
+        // The watchdog runs only when there is a config, a rate threshold for it
+        // to evaluate (it ignores latency), AND we are not in knee-discovery — a
+        // discovery run is meant to reach a breach and stop cleanly, not abort.
+        let watchdog = self
+            .watchdog
+            .filter(|_| self.slo.has_rate_thresholds() && !discover_knee);
         let slo = self.slo;
         let aborted_by_watchdog = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -399,14 +453,10 @@ impl StressModule for L7Engine {
         let hist_w = hist.clone();
         let wd_flag = aborted_by_watchdog.clone();
 
-        let aborted = rt.block_on(async move {
-            let deadline = Instant::now() + duration;
-            let mut interval = tokio::time::interval(interval_dur);
-            // Never exceed the cap: on a missed tick, delay rather than burst.
-            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
+        let (aborted, knee) = rt.block_on(async move {
             // Inline health-watchdog: a background task that trips the shared
-            // kill-switch on sustained SLO breach. It only STOPS traffic.
+            // kill-switch on sustained SLO breach. It only STOPS traffic. (Off
+            // during knee discovery — see the `watchdog` filter above.)
             let watchdog_task = watchdog.map(|cfg| {
                 tokio::spawn(run_watchdog(
                     slo,
@@ -422,77 +472,126 @@ impl StressModule for L7Engine {
 
             let mut tasks: JoinSet<()> = JoinSet::new();
             let mut aborted = false;
+            let mut knee: Option<Knee> = None;
 
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = wait_for_kill(kill.clone()) => { aborted = true; break; }
-                }
-                if kill.is_tripped() {
-                    aborted = true;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
+            // Knee discovery diffs the cumulative counters across each stage
+            // boundary (like the watchdog does per window). `stage_start` holds
+            // the snapshot at the start of the current stage; `sustained` is the
+            // highest stage rate that stayed within the SLO.
+            let snapshot = |sent: &AtomicU64, err: &AtomicU64, s5: &AtomicU64, s4: &AtomicU64| {
+                (
+                    sent.load(Ordering::Relaxed),
+                    err.load(Ordering::Relaxed),
+                    s5.load(Ordering::Relaxed),
+                    s4.load(Ordering::Relaxed),
+                )
+            };
+            let mut stage_start = snapshot(&sent_w, &errors_w, &s5xx_w, &s4xx_w);
+            let mut sustained: u64 = 0;
 
-                let client = client.clone();
-                let url = url.clone();
-                let sent = sent_w.clone();
-                let errors = errors_w.clone();
-                let s2xx = s2xx_w.clone();
-                let s3xx = s3xx_w.clone();
-                let s4xx = s4xx_w.clone();
-                let s5xx = s5xx_w.clone();
-                let timeouts = timeouts_w.clone();
-                let hist = hist_w.clone();
-                let body = body.clone();
-                let cb_counter = cb_counter.clone();
-                tasks.spawn(async move {
-                    // Cache-buster touches ONLY the query string, so the host
-                    // remains the gate-authorized, DNS-pinned one.
-                    let req_url = if cache_bust {
-                        let mut u = url;
-                        let n = cb_counter.fetch_add(1, Ordering::Relaxed);
-                        u.query_pairs_mut().append_pair("_cb", &n.to_string());
-                        u
-                    } else {
-                        url
-                    };
-                    let req = match method {
-                        L7Method::Get => client.get(req_url),
-                        L7Method::Head => client.head(req_url),
-                        L7Method::Post => match &body {
-                            Some(bytes) => client.post(req_url).body(bytes.as_ref().clone()),
-                            None => client.post(req_url),
-                        },
-                    };
-                    let started = Instant::now();
-                    match req.send().await {
-                        Ok(resp) => {
-                            let micros = started.elapsed().as_micros() as u64;
-                            // A response of ANY status is a completed unit; the
-                            // status class is what tells health from failure.
-                            sent.fetch_add(1, Ordering::Relaxed);
-                            let counter = match resp.status().as_u16() {
-                                s if s >= 500 => &s5xx,
-                                400..=499 => &s4xx,
-                                300..=399 => &s3xx,
-                                _ => &s2xx,
-                            };
-                            counter.fetch_add(1, Ordering::Relaxed);
-                            hist.lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .saturating_record(micros);
-                        }
-                        Err(e) => {
-                            errors.fetch_add(1, Ordering::Relaxed);
-                            if e.is_timeout() {
-                                timeouts.fetch_add(1, Ordering::Relaxed);
+            // Run each constant-rate stage back-to-back, re-pacing at each
+            // boundary. One mechanism executes every profile shape.
+            'stages: for stage in stages {
+                let Some(interval_dur) = stage.rate.min_interval() else { continue };
+                let stage_deadline = Instant::now() + stage.duration;
+                let mut interval = tokio::time::interval(interval_dur);
+                // Never exceed the cap: on a missed tick, delay rather than burst.
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wait_for_kill(kill.clone()) => { aborted = true; break 'stages; }
+                    }
+                    if kill.is_tripped() {
+                        aborted = true;
+                        break 'stages;
+                    }
+                    if Instant::now() >= stage_deadline {
+                        break;
+                    }
+
+                    let client = client.clone();
+                    let url = url.clone();
+                    let sent = sent_w.clone();
+                    let errors = errors_w.clone();
+                    let s2xx = s2xx_w.clone();
+                    let s3xx = s3xx_w.clone();
+                    let s4xx = s4xx_w.clone();
+                    let s5xx = s5xx_w.clone();
+                    let timeouts = timeouts_w.clone();
+                    let hist = hist_w.clone();
+                    let body = body.clone();
+                    let cb_counter = cb_counter.clone();
+                    tasks.spawn(async move {
+                        // Cache-buster touches ONLY the query string, so the host
+                        // remains the gate-authorized, DNS-pinned one.
+                        let req_url = if cache_bust {
+                            let mut u = url;
+                            let n = cb_counter.fetch_add(1, Ordering::Relaxed);
+                            u.query_pairs_mut().append_pair("_cb", &n.to_string());
+                            u
+                        } else {
+                            url
+                        };
+                        let req = match method {
+                            L7Method::Get => client.get(req_url),
+                            L7Method::Head => client.head(req_url),
+                            L7Method::Post => match &body {
+                                Some(bytes) => client.post(req_url).body(bytes.as_ref().clone()),
+                                None => client.post(req_url),
+                            },
+                        };
+                        let started = Instant::now();
+                        match req.send().await {
+                            Ok(resp) => {
+                                let micros = started.elapsed().as_micros() as u64;
+                                // A response of ANY status is a completed unit; the
+                                // status class is what tells health from failure.
+                                sent.fetch_add(1, Ordering::Relaxed);
+                                let counter = match resp.status().as_u16() {
+                                    s if s >= 500 => &s5xx,
+                                    400..=499 => &s4xx,
+                                    300..=399 => &s3xx,
+                                    _ => &s2xx,
+                                };
+                                counter.fetch_add(1, Ordering::Relaxed);
+                                hist.lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .saturating_record(micros);
+                            }
+                            Err(e) => {
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                if e.is_timeout() {
+                                    timeouts.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
+                    });
+                }
+
+                // Breaking-point check at the stage boundary: did the traffic in
+                // THIS stage breach the SLO? Boundary lag is inherent — requests
+                // dispatched near a stage's end may complete into the next stage's
+                // window (the same property the watchdog has) — so the knee is a
+                // coarse capacity estimate, not an exact threshold.
+                if discover_knee {
+                    let now = snapshot(&sent_w, &errors_w, &s5xx_w, &s4xx_w);
+                    let d_sent = now.0.saturating_sub(stage_start.0);
+                    let d_err = now.1.saturating_sub(stage_start.1);
+                    let d_5xx = now.2.saturating_sub(stage_start.2);
+                    let d_4xx = now.3.saturating_sub(stage_start.3);
+                    stage_start = now;
+                    let attempts = d_sent + d_err;
+                    if attempts > 0 && !slo.breaches_rates(attempts, d_err, d_5xx, d_4xx).is_empty() {
+                        knee = Some(Knee {
+                            sustained_per_sec: sustained,
+                            breached_at_per_sec: stage.rate.per_second,
+                        });
+                        break 'stages;
                     }
-                });
+                    sustained = stage.rate.per_second;
+                }
             }
 
             // Stop promptly on kill: abort in-flight rather than waiting them out.
@@ -503,13 +602,15 @@ impl StressModule for L7Engine {
             if let Some(handle) = watchdog_task {
                 handle.abort();
             }
-            aborted
+            (aborted, knee)
         });
 
         let hist = hist.lock().unwrap_or_else(|p| p.into_inner());
         let by_watchdog = aborted_by_watchdog.load(Ordering::Relaxed);
         let label = if by_watchdog {
             format!("L7 {} {} (SLO watchdog abort)", self.spec.method.label(), self.spec.url)
+        } else if knee.is_some() {
+            format!("L7 {} {} (knee found)", self.spec.method.label(), self.spec.url)
         } else {
             format!("L7 {} {}", self.spec.method.label(), self.spec.url)
         };
@@ -528,6 +629,7 @@ impl StressModule for L7Engine {
             p90_micros: hist.value_at_quantile(0.9),
             p99_micros: hist.value_at_quantile(0.99),
             max_micros: hist.max(),
+            knee,
         }
     }
 }
@@ -872,5 +974,149 @@ mod tests {
             engine.authorize_target(),
             Err(L7Error::UnsupportedScheme(_))
         ));
+    }
+
+    use jinrai_core::LoadProfile;
+
+    /// Build a plan against a loopback server on `port` at the given ceiling.
+    fn loopback_plan(engine: &L7Engine, rate: u64, ms: u64) -> RunPlan {
+        RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(rate),
+            duration: Duration::from_millis(ms),
+            kill: KillSwitch::new(),
+        }
+    }
+
+    #[test]
+    fn ramp_profile_healthy_runs_every_stage() {
+        // A 200 target with a ramp profile: no discovery, so it runs the whole
+        // ramp and never records a knee.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let profile = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(60),
+            duration: Duration::from_millis(600),
+            steps: 3,
+        };
+        let mut engine =
+            L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
+        let plan = loopback_plan(&engine, 1000, 600);
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "ramp should have sent something");
+        assert!(report.knee.is_none(), "no discovery => no knee");
+        assert!(!report.aborted_early);
+    }
+
+    #[test]
+    fn discover_knee_stops_at_first_breaching_stage() {
+        // A target that answers 500 to everything, ramped under a 0% 5xx SLO with
+        // knee discovery on: the very first stage breaches, so the knee is that
+        // stage's rate with a sustained rate of 0. The run stops CLEANLY (not an
+        // abort) — discovery is meant to find the breaking point, not fail.
+        let (port, stop, handle) = spawn_http_server("500 Internal Server Error");
+        let url = format!("http://127.0.0.1:{port}/");
+        let slo = SloSpec { max_5xx_rate: Some(0.0), ..Default::default() };
+        // start=0,end=60,steps=3 => stage rates 20, 40, 60; first stage = 20/s.
+        let profile = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(60),
+            duration: Duration::from_millis(900),
+            steps: 3,
+        };
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_slo(slo)
+            .with_profile(profile)
+            .discover_knee(true);
+        let plan = loopback_plan(&engine, 1000, 900);
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let knee = report.knee.expect("all-5xx traffic should trip the knee");
+        assert_eq!(knee.breached_at_per_sec, 20, "first ramp stage rate");
+        assert_eq!(knee.sustained_per_sec, 0, "nothing held the SLO");
+        assert!(!report.aborted_early, "a knee stop is clean, not an abort");
+        assert_eq!(report.status_5xx, report.units_sent);
+        assert!(report.layer_label.contains("knee"), "label: {}", report.layer_label);
+    }
+
+    #[test]
+    fn discover_knee_healthy_target_finds_no_knee() {
+        // A 200 target under a 0% 5xx SLO: no stage breaches, so discovery runs
+        // the full ramp and reports no knee (the target held the whole way up).
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let slo = SloSpec { max_5xx_rate: Some(0.0), ..Default::default() };
+        let profile = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(60),
+            duration: Duration::from_millis(600),
+            steps: 3,
+        };
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_slo(slo)
+            .with_profile(profile)
+            .discover_knee(true);
+        let plan = loopback_plan(&engine, 1000, 600);
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.knee.is_none(), "healthy target has no knee");
+        assert_eq!(report.status_2xx, report.units_sent);
+        assert!(!report.aborted_early);
+    }
+
+    #[test]
+    fn spike_profile_executes_all_three_stages() {
+        // Sanity: a spike (base→peak→base) runs to completion against a 200 target.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let profile = LoadProfile::Spike {
+            base: RateCap::new(20),
+            peak: RateCap::new(100),
+            base_total: Duration::from_millis(200),
+            spike: Duration::from_millis(200),
+        };
+        let mut engine =
+            L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
+        let plan = loopback_plan(&engine, 1000, 400);
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "spike should have sent something");
+        assert!(report.knee.is_none());
+        assert!(!report.aborted_early);
+    }
+
+    #[test]
+    fn profile_stage_rates_are_clamped_to_the_ceiling() {
+        // A profile asking for 10_000/s under a --rate 50 ceiling must never pace
+        // faster than 50/s: the ceiling is a safety cap, not a suggestion. Over a
+        // 300ms constant stage at <=50/s we can send at most ~16 units; assert we
+        // stayed well under the profile's unclamped demand.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let profile = LoadProfile::Constant {
+            rate: RateCap::new(10_000),
+            duration: Duration::from_millis(300),
+        };
+        let mut engine =
+            L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
+        let plan = loopback_plan(&engine, 50, 300);
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // At 50/s for 300ms the cap allows ~16 dispatches; 10_000/s would be
+        // thousands. A generous bound proves the clamp held without being flaky.
+        assert!(report.units_sent > 0);
+        assert!(report.attempts() < 100, "clamp failed: {} attempts", report.attempts());
     }
 }

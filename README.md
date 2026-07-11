@@ -54,8 +54,8 @@ not an expressible program state; it fails to compile.
 - **Phase 3** — `l34` in isolated-lab mode ✅
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
-- **Phase 6** *(next)* — load profiles (ramp / spike / soak) + breaking-point discovery
-- **Phase 7** — protocol coverage (HTTP/2 rapid-reset, TLS slow modes, ICMP/L3, TCP-flag floods)
+- **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
+- **Phase 7** *(next)* — protocol coverage (HTTP/2 rapid-reset, TLS slow modes, ICMP/L3, TCP-flag floods)
 - **Phase 8** — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
