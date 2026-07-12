@@ -57,6 +57,11 @@ pub enum L4Mode {
     /// TCP NULL flood (raw socket, no flags set) — the other anomalous extreme:
     /// a segment with an empty control field.
     Null,
+    /// TCP data flood (PSH-ACK) — establishes real connections through the OS
+    /// stack and writes application data into them, filling the target's receive
+    /// / application buffers rather than just its accept backlog or conn-track
+    /// state. No raw socket (the OS sets PSH on each flushed write); IPv4 + IPv6.
+    Data,
     /// ICMP echo-request flood (raw socket, L3). IPv4-only; source is the
     /// kernel-assigned real address (the kernel builds the IP header).
     Icmp,
@@ -94,6 +99,7 @@ impl L4Mode {
             L4Mode::Rst => "tcp-rst-flood",
             L4Mode::Xmas => "tcp-xmas-flood",
             L4Mode::Null => "tcp-null-flood",
+            L4Mode::Data => "tcp-data-flood",
             L4Mode::Icmp => "icmp-echo-flood",
         }
     }
@@ -109,7 +115,8 @@ impl L4Mode {
             // Xmas lights FIN+PSH+URG at once; NULL sets nothing at all.
             L4Mode::Xmas => Some(TcpFlags { fin: true, psh: true, urg: true, ..TcpFlags::NONE }),
             L4Mode::Null => Some(TcpFlags::NONE),
-            L4Mode::Udp | L4Mode::TcpConnect | L4Mode::Icmp => None,
+            // Data flood uses the OS TCP stack (no crafted packet), like TcpConnect.
+            L4Mode::Udp | L4Mode::TcpConnect | L4Mode::Data | L4Mode::Icmp => None,
         }
     }
 
@@ -350,6 +357,12 @@ impl L34Engine {
 enum Sender {
     Udp { sock: UdpSocket, payload: Vec<u8> },
     Tcp { held: Vec<TcpStream>, timeout: Duration },
+    /// TCP data (PSH-ACK) flood: a bounded pool of established connections that we
+    /// write application data into. `idx` round-robins writes across the pool;
+    /// dead connections are dropped and replaced. `timeout` bounds both connect
+    /// and each write (a write that blocks on a full buffer is *pressure applied*,
+    /// not a failure).
+    TcpData { conns: Vec<TcpStream>, payload: Vec<u8>, timeout: Duration, idx: usize },
     /// Raw IPv4+TCP flag flood (SYN/ACK/FIN/RST/Xmas/NULL). `flags` selects which
     /// control flags are set; everything else is shared.
     RawTcp { flags: TcpFlags, raw: Socket, srcs: HashMap<IpAddr, Ipv4Addr>, counter: u32 },
@@ -361,6 +374,13 @@ enum Sender {
 
 /// UDP payloads above this are rejected to avoid accidental fragmentation.
 const MAX_UDP_PAYLOAD: usize = 1472;
+
+/// TCP-data-flood tunables. The pool is bounded so the flood establishes a fixed
+/// number of connections and then sustains data on them (rather than growing
+/// unboundedly like the connect flood). The per-write payload is capped well
+/// above a single segment — TCP handles segmentation — to push more per write.
+const MAX_DATA_CONNS: usize = 128;
+const MAX_DATA_PAYLOAD: usize = 65_536;
 
 impl Sender {
     fn setup(mode: L4Mode, payload_size: usize, _ips: &[IpAddr]) -> Result<Self, L34Error> {
@@ -374,6 +394,13 @@ impl Sender {
             L4Mode::TcpConnect => Ok(Sender::Tcp {
                 held: Vec::new(),
                 timeout: Duration::from_millis(500),
+            }),
+            L4Mode::Data => Ok(Sender::TcpData {
+                conns: Vec::new(),
+                // Non-zero, bounded payload for each PSH-ACK write.
+                payload: vec![0u8; payload_size.clamp(1, MAX_DATA_PAYLOAD)],
+                timeout: Duration::from_millis(500),
+                idx: 0,
             }),
             L4Mode::Icmp => {
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
@@ -410,6 +437,40 @@ impl Sender {
                 // table / backlog; dropped when the run ends.
                 held.push(stream);
                 Ok(())
+            }
+
+            Sender::TcpData { conns, payload, timeout, idx } => {
+                // Below the pool cap, each send opens a new connection and primes
+                // it with a write — this ramps the pool up. Once full, we sustain
+                // data by round-robining a write onto an existing connection.
+                if conns.len() < MAX_DATA_CONNS {
+                    let mut stream =
+                        TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout)
+                            .map_err(|e| L34Error::Setup(e.to_string()))?;
+                    let _ = stream.set_write_timeout(Some(*timeout));
+                    write_pshack(&mut stream, payload);
+                    conns.push(stream);
+                    return Ok(());
+                }
+                // Round-robin one connection; a full send buffer is pressure
+                // applied (counts as sent), a real error retires the connection
+                // and we open a fresh one to replace it.
+                let n = conns.len();
+                *idx = (*idx + 1) % n;
+                let i = *idx;
+                match write_pshack(&mut conns[i], payload) {
+                    WriteOutcome::Sent => Ok(()),
+                    WriteOutcome::Dead => {
+                        conns.swap_remove(i);
+                        let mut stream =
+                            TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout)
+                                .map_err(|e| L34Error::Setup(e.to_string()))?;
+                        let _ = stream.set_write_timeout(Some(*timeout));
+                        write_pshack(&mut stream, payload);
+                        conns.push(stream);
+                        Ok(())
+                    }
+                }
             }
 
             Sender::RawTcp { flags, raw, srcs, counter } => {
@@ -451,6 +512,30 @@ impl Sender {
                     .map_err(|e| L34Error::Setup(e.to_string()))
             }
         }
+    }
+}
+
+/// The result of a single PSH-ACK write in the data flood.
+enum WriteOutcome {
+    /// Data was written, OR the send buffer was full (a blocked/timed-out write) —
+    /// both mean pressure was applied to the target, so both count as a unit sent.
+    Sent,
+    /// The connection failed (reset / broken pipe): retire and replace it.
+    Dead,
+}
+
+/// Write `payload` to an established connection, flushing so the OS emits a
+/// PSH-ACK segment. A full send buffer (`WouldBlock`/`TimedOut`) is *pressure
+/// applied*, not a failure — the target simply is not draining fast enough, which
+/// is the point — so it counts as sent. Any other error retires the connection.
+fn write_pshack(stream: &mut TcpStream, payload: &[u8]) -> WriteOutcome {
+    use std::io::{ErrorKind, Write};
+    match stream.write(payload) {
+        Ok(_) => WriteOutcome::Sent,
+        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+            WriteOutcome::Sent
+        }
+        Err(_) => WriteOutcome::Dead,
     }
 }
 
@@ -795,6 +880,61 @@ mod tests {
             port: 9,
             payload_size: 16,
         });
+        assert!(engine.preflight(&plan(vec![t], 50, 1)).is_ok());
+    }
+
+    #[test]
+    fn data_flood_delivers_bytes_to_a_local_listener() {
+        // A TCP listener that accepts and drains: the data flood must establish a
+        // real connection and deliver application bytes (PSH-ACK), i.e. exercise
+        // the app buffers, not just the accept backlog.
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let got_srv = got.clone();
+        let acceptor = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut streams = Vec::new();
+            while Instant::now() < deadline {
+                if let Ok((s, _)) = listener.accept() {
+                    s.set_nonblocking(true).ok();
+                    streams.push(s);
+                }
+                let mut buf = [0u8; 4096];
+                for s in &mut streams {
+                    if let Ok(n) = s.read(&mut buf) {
+                        got_srv.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(L34Config {
+            mode: L4Mode::Data,
+            port,
+            payload_size: 512,
+        });
+        let report = engine.execute(&plan(vec![t], 200, 1));
+        acceptor.join().unwrap();
+
+        assert!(report.units_sent > 0, "data flood should have sent writes");
+        assert!(got.load(std::sync::atomic::Ordering::Relaxed) > 0, "listener should have received application bytes");
+    }
+
+    #[test]
+    fn data_flood_is_l4_needs_no_raw_socket_and_allows_ipv6() {
+        assert_eq!(L4Mode::Data.layer(), Layer::L4);
+        assert_eq!(L4Mode::Data.label(), "tcp-data-flood");
+        assert!(!L4Mode::Data.needs_raw_socket(), "data flood uses the OS stack");
+        assert_eq!(L4Mode::Data.raw_tcp_flags(), None);
+        // Like TcpConnect, the OS stack handles IPv6, so it must not be refused.
+        let t = authorized_ip("::1/128", "::1");
+        let engine = L34Engine::new(L34Config { mode: L4Mode::Data, port: 9, payload_size: 16 });
         assert!(engine.preflight(&plan(vec![t], 50, 1)).is_ok());
     }
 

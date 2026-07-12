@@ -53,7 +53,10 @@ REQUIRED:
 OPTIONS:
     --layer <l4|l7>       Module to run (default: l7)
     --l4-mode <MODE>      L3/L4 primitive (default: udp). One of:
-                            udp | tcp            no privilege needed
+                            udp | tcp | data     no privilege needed (data =
+                                                 PSH-ACK data flood: real OS
+                                                 connections filled with app data;
+                                                 --payload-size sets the write size)
                             syn | ack | fin | rst  raw TCP flag floods; each sets
                                                  one flag, needs CAP_NET_RAW/root,
                                                  IPv4-only, real source IP (never
@@ -98,7 +101,8 @@ OPTIONS:
                           the host is never altered)
     --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
     --drip-ms <MS>        Keep-alive write interval for slow modes (default: 10000)
-    --payload-size <N>    UDP payload bytes (default: 64, l4-mode udp)
+    --payload-size <N>    Payload bytes per unit (default: 64) — UDP datagram size
+                          (l4-mode udp) or PSH-ACK write size (l4-mode data)
     --rate <N>            Rate cap, units/sec (default: 100). This is a hard
                           SAFETY CEILING: every load profile shapes traffic only
                           UP TO this rate, never above it.
@@ -701,10 +705,11 @@ fn parse_args() -> Result<Args, String> {
                     "rst" => L4Mode::Rst,
                     "xmas" => L4Mode::Xmas,
                     "null" => L4Mode::Null,
+                    "data" => L4Mode::Data,
                     "icmp" => L4Mode::Icmp,
                     other => {
                         return Err(format!(
-                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst|xmas|null|icmp)"
+                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst|xmas|null|data|icmp)"
                         ))
                     }
                 }

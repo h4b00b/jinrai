@@ -22,7 +22,7 @@ conversation log / `docs/` for the full rationale vs Go.
 jinrai/  (Cargo workspace)
 ├── crates/core     # engine vocabulary + StressModule contract
 ├── crates/safety   # ⚠ THE GATE: allowlist, kill-switch, authorization (std-only, zero deps)
-├── crates/l34      # L3/L4 packet generation — lab/isolated nets only  (UDP / TCP-connect / SYN / flag & anomaly floods / ICMP)
+├── crates/l34      # L3/L4 packet generation — lab/isolated nets only  (UDP / TCP-connect / SYN / flag & anomaly floods / data / ICMP)
 ├── crates/l7       # L7 HTTP load: GET/POST/HEAD + Slowloris/slow-body  (tokio + reqwest/rustls)
 ├── crates/metrics  # reporting + tamper-evident audit log             (SHA-256 hash chain)
 └── crates/cli      # `jinrai` binary — orchestration + operator gate
@@ -55,7 +55,7 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TCP anomaly floods (Xmas/NULL) ✅, TLS slow modes ✅, TLS handshake flood ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅, HTTP/2 SETTINGS/PING floods ✅
+- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TCP anomaly floods (Xmas/NULL) ✅, TCP data/PSH-ACK flood ✅, TLS slow modes ✅, TLS handshake flood ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅, HTTP/2 SETTINGS/PING floods ✅
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
@@ -149,9 +149,10 @@ jinrai --layer l7 --allow '*.staging.internal' \
 ```
 
 **L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,
-an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp` need no
-privilege; the raw-socket modes (`syn`/`ack`/`fin`/`rst`/`xmas`/`null`/`icmp`)
-need `CAP_NET_RAW`/root and are IPv4-only:
+an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp`/`data`
+need no privilege (and `tcp`/`data` work over IPv4 **and** IPv6); the raw-socket
+modes (`syn`/`ack`/`fin`/`rst`/`xmas`/`null`/`icmp`) need `CAP_NET_RAW`/root and
+are IPv4-only:
 
 ```sh
 jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 \
@@ -167,6 +168,16 @@ connection-tracker / TCP stack handles segments that match no RFC-legal state:
 # Xmas flood against a lab host (raw socket; needs CAP_NET_RAW/root)
 jinrai --layer l4 --l4-mode xmas --allow 10.0.0.0/8 \
        --target 10.1.2.3 --port 80 --ack-l34-lab --rate 1000 --duration 10
+```
+
+The `data` mode is a **PSH-ACK data flood**: it opens a bounded pool of real OS
+connections and writes `--payload-size` bytes into each, filling the target's
+application buffers rather than just its accept backlog. No privilege needed:
+
+```sh
+jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --port 80 --ack-l34-lab \
+       --payload-size 4096 --rate 500 --duration 30
 ```
 
 A target outside every `--allow` block aborts the whole run. There is **no
