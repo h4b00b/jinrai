@@ -22,7 +22,7 @@ conversation log / `docs/` for the full rationale vs Go.
 jinrai/  (Cargo workspace)
 ├── crates/core     # engine vocabulary + StressModule contract
 ├── crates/safety   # ⚠ THE GATE: allowlist, kill-switch, authorization (std-only, zero deps)
-├── crates/l34      # L3/L4 packet generation — lab/isolated nets only  (UDP / TCP-connect / SYN)
+├── crates/l34      # L3/L4 packet generation — lab/isolated nets only  (UDP / TCP-connect / SYN / flag & anomaly floods / ICMP)
 ├── crates/l7       # L7 HTTP load: GET/POST/HEAD + Slowloris/slow-body  (tokio + reqwest/rustls)
 ├── crates/metrics  # reporting + tamper-evident audit log             (SHA-256 hash chain)
 └── crates/cli      # `jinrai` binary — orchestration + operator gate
@@ -55,7 +55,7 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TLS slow modes ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅
+- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TCP anomaly floods (Xmas/NULL) ✅, TLS slow modes ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
@@ -146,16 +146,28 @@ jinrai --layer l7 --allow '*.staging.internal' \
 ```
 
 **L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,
-an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `syn` mode needs
-`CAP_NET_RAW`/root:
+an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp` need no
+privilege; the raw-socket modes (`syn`/`ack`/`fin`/`rst`/`xmas`/`null`/`icmp`)
+need `CAP_NET_RAW`/root and are IPv4-only:
 
 ```sh
 jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 \
        --target 10.1.2.3 --port 9 --ack-l34-lab --rate 1000 --duration 10
 ```
 
+The raw-TCP flag floods set control flags directly: `syn`/`ack`/`fin`/`rst` set
+exactly one, while the **anomaly floods** set illegal combinations — `xmas` sets
+`FIN+PSH+URG` at once and `null` sets none — to probe how a stateful firewall /
+connection-tracker / TCP stack handles segments that match no RFC-legal state:
+
+```sh
+# Xmas flood against a lab host (raw socket; needs CAP_NET_RAW/root)
+jinrai --layer l4 --l4-mode xmas --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --port 80 --ack-l34-lab --rate 1000 --duration 10
+```
+
 A target outside every `--allow` block aborts the whole run. There is **no
-source-IP spoofing** anywhere: SYN packets always carry the host's real
+source-IP spoofing** anywhere: every crafted packet carries the host's real
 OS-routed source address.
 
 ### Audit log (tamper-evident)
