@@ -16,6 +16,35 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.11.0] — 2026-07-12
+
+Phase 7 (extension): TLS handshake flood (THC-SSL-DoS class).
+
+### Added
+
+- **TLS handshake flood** — `--l7-method tls-handshake` repeatedly opens a TCP
+  connection, completes a **full** TLS handshake, and immediately drops it —
+  concurrently, so a slow server does not throttle the dispatch rate. A handshake
+  is deeply asymmetric (the server spends far more CPU on key exchange + signing
+  than the client spends requesting it), so flooding fresh handshakes drives the
+  server's CPU at little client cost — the THC-SSL-DoS resource asymmetry, exposed
+  as a self-test. `https`-only (a plaintext target has no handshake and is refused
+  fail-closed). The rate cap is reinterpreted as *handshakes per second*.
+- **Session resumption is now disabled** in the shared `l7::tls` client config, so
+  every connection is a full handshake. This is a no-op for the single-connection
+  slow / rapid-reset / continuation engines but is what makes the handshake flood
+  meaningful — a resumed handshake is cheap for the server and would defeat the
+  test. No new dependency (reuses the rustls/ring stack already in the tree).
+
+### Security
+
+- The handshake flood keeps the **identical trust boundary** as the other L7
+  primitives: the URL host is authorized as a datum and pinned to a single connect
+  address, so every connection only ever reaches the gate-authorized target. It is
+  a **direct** self-test — no source-IP spoofing and no reflection/amplification.
+  The accept-any-certificate stance is the same scoped choice documented for
+  slow-TLS (transport to an authorized host; no secrets sent, no response trusted).
+
 ## [0.10.0] — 2026-07-12
 
 Phase 7 (extension): TCP anomalous-flag floods (Xmas / NULL).
@@ -353,7 +382,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/h4b00b/jinrai/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/h4b00b/jinrai/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/h4b00b/jinrai/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/h4b00b/jinrai/compare/v0.7.0...v0.8.0
