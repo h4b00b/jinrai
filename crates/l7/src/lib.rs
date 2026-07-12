@@ -67,6 +67,9 @@ pub use rapid_reset::H2RapidResetEngine;
 pub mod h2_continuation;
 pub use h2_continuation::H2ContinuationEngine;
 
+pub mod tls_flood;
+pub use tls_flood::TlsHandshakeEngine;
+
 mod tls;
 
 /// Which HTTP request shape to generate. Every variant reuses the *same*

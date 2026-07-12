@@ -20,7 +20,7 @@ use jinrai_core::{
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
     H2ContinuationEngine, H2RapidResetEngine, L7Engine, L7Method, L7SlowEngine, RequestSpec,
-    SlowConfig, SlowMode,
+    SlowConfig, SlowMode, TlsHandshakeEngine,
     WatchdogConfig,
 };
 use jinrai_metrics::{AuditEvent, AuditLog};
@@ -78,6 +78,9 @@ OPTIONS:
                                                  (CVE-2024-27316): HEADERS without
                                                  END_HEADERS + endless CONTINUATION
                                                  frames; rate cap = frames/sec
+                            tls-handshake        TLS handshake flood (THC-SSL-DoS):
+                                                 full handshake then drop, repeat;
+                                                 https-only; rate cap = handshakes/sec
                           For slow modes the rate cap is connections-opened/sec,
                           and https targets are supported (slow-TLS; the handshake
                           accepts any server certificate — see README). h2-rapid-reset
@@ -152,6 +155,8 @@ enum L7Kind {
     RapidReset,
     /// HTTP/2 CONTINUATION flood (HEADERS + endless CONTINUATION, never END_HEADERS).
     Continuation,
+    /// TLS handshake flood (THC-SSL-DoS: full handshake, immediate drop, repeat).
+    TlsHandshake,
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -378,6 +383,10 @@ fn run_l7(
             let engine = H2ContinuationEngine::new(gate, url.clone());
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
+        L7Kind::TlsHandshake => {
+            let engine = TlsHandshakeEngine::new(gate, url.clone());
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
     };
     let (mut engine, targets) = match built {
         Ok(pair) => pair,
@@ -419,7 +428,7 @@ fn run_l7(
     // and rapid-reset never receive a response to classify. Warn, don't ignore.
     let is_fast = matches!(args.l7_kind, L7Kind::Fast(_));
     if !is_fast && !args.slo.is_empty() {
-        eprintln!("warning: --slo-* / --watchdog are ignored for slow-connection / h2 (rapid-reset, continuation) methods (no response to classify)");
+        eprintln!("warning: --slo-* / --watchdog are ignored for slow-connection / h2 / tls-handshake methods (no response to classify)");
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
     }
@@ -647,10 +656,11 @@ fn parse_args() -> Result<Args, String> {
                     "slowbody" => L7Kind::Slow(SlowMode::Body),
                     "h2-rapid-reset" => L7Kind::RapidReset,
                     "h2-continuation" => L7Kind::Continuation,
+                    "tls-handshake" => L7Kind::TlsHandshake,
                     other => {
                         return Err(format!(
-                            "unknown --l7-method: {other} \
-                             (want get|post|head|slowloris|slowbody|h2-rapid-reset|h2-continuation)"
+                            "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
+                             h2-rapid-reset|h2-continuation|tls-handshake)"
                         ))
                     }
                 }

@@ -29,6 +29,11 @@ pub(crate) fn client_config(alpn: Vec<Vec<u8>>) -> Result<Arc<ClientConfig>, L7E
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     config.alpn_protocols = alpn;
+    // Disable client-side session resumption: every connection must complete a
+    // FULL handshake. This is a no-op for the single-connection slow / rapid-reset
+    // engines, but it is what makes the tls-handshake flood meaningful — a resumed
+    // handshake is cheap for the server, defeating the CPU-asymmetry self-test.
+    config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     Ok(Arc::new(config))
 }
 
