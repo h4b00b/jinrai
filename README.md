@@ -55,7 +55,7 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TLS slow modes ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅
+- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TLS slow modes ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
@@ -90,6 +90,8 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host) |
 | `slowloris` | slow connection | partial request headers, never terminated |
 | `slowbody` | slow connection | oversized `Content-Length`, body trickled a byte at a time (RUDY) |
+| `h2-rapid-reset` | HTTP/2 | open a stream, immediately `RST_STREAM` (CVE-2023-44487); rate cap = resets/sec |
+| `h2-continuation` | HTTP/2 | HEADERS without `END_HEADERS` + endless `CONTINUATION` frames (CVE-2024-27316); rate cap = frames/sec |
 
 For slow modes the rate cap means *connections opened per second*; `--slow-connections`
 is the concurrent ceiling and `--drip-ms` the keep-alive write interval. Slow mode is
@@ -106,6 +108,18 @@ jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
 jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
        --url http://api.staging.internal/ --slow-connections 200 \
        --drip-ms 10000 --rate 50 --duration 60
+```
+
+The two HTTP/2 primitives (`h2-rapid-reset`, `h2-continuation`) negotiate h2 via
+ALPN for `https` and prior-knowledge h2c for `http`; the rate cap is
+reinterpreted per primitive (resets/sec, frames/sec). They send no application
+data and read no response, so `--slo-*` / `--watchdog` don't apply.
+
+```sh
+# HTTP/2 CONTINUATION flood: HEADERS without END_HEADERS, then endless
+# (non-flow-controlled) CONTINUATION frames the server must buffer forever
+jinrai --layer l7 --allow '*.staging.internal' --l7-method h2-continuation \
+       --url https://api.staging.internal/ --rate 200 --duration 30
 ```
 
 **SLO verdict & health-watchdog (l7 fast methods).** Every response is classified
