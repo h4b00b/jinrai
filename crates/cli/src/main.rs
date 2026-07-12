@@ -19,8 +19,8 @@ use jinrai_core::{
 };
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
-    H2ContinuationEngine, H2RapidResetEngine, L7Engine, L7Method, L7SlowEngine, RequestSpec,
-    SlowConfig, SlowMode, TlsHandshakeEngine,
+    H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, L7Engine, L7Method,
+    L7SlowEngine, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine,
     WatchdogConfig,
 };
 use jinrai_metrics::{AuditEvent, AuditLog};
@@ -81,6 +81,12 @@ OPTIONS:
                             tls-handshake        TLS handshake flood (THC-SSL-DoS):
                                                  full handshake then drop, repeat;
                                                  https-only; rate cap = handshakes/sec
+                            h2-settings          HTTP/2 SETTINGS flood
+                                                 (CVE-2019-9515): empty SETTINGS
+                                                 frames the server must ACK
+                            h2-ping              HTTP/2 PING flood (CVE-2019-9512):
+                                                 PING frames the server must PONG;
+                                                 both rate cap = frames/sec
                           For slow modes the rate cap is connections-opened/sec,
                           and https targets are supported (slow-TLS; the handshake
                           accepts any server certificate — see README). h2-rapid-reset
@@ -157,6 +163,8 @@ enum L7Kind {
     Continuation,
     /// TLS handshake flood (THC-SSL-DoS: full handshake, immediate drop, repeat).
     TlsHandshake,
+    /// HTTP/2 control-frame flood (SETTINGS / PING).
+    H2Frame(H2FrameKind),
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -385,6 +393,10 @@ fn run_l7(
         }
         L7Kind::TlsHandshake => {
             let engine = TlsHandshakeEngine::new(gate, url.clone());
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
+        L7Kind::H2Frame(kind) => {
+            let engine = H2FrameFloodEngine::new(gate, url.clone(), kind);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
     };
@@ -657,10 +669,12 @@ fn parse_args() -> Result<Args, String> {
                     "h2-rapid-reset" => L7Kind::RapidReset,
                     "h2-continuation" => L7Kind::Continuation,
                     "tls-handshake" => L7Kind::TlsHandshake,
+                    "h2-settings" => L7Kind::H2Frame(H2FrameKind::Settings),
+                    "h2-ping" => L7Kind::H2Frame(H2FrameKind::Ping),
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
-                             h2-rapid-reset|h2-continuation|tls-handshake)"
+                             h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|h2-ping)"
                         ))
                     }
                 }

@@ -16,6 +16,33 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.12.0] — 2026-07-12
+
+Phase 7 (extension): HTTP/2 control-frame floods (SETTINGS / PING).
+
+### Added
+
+- **HTTP/2 SETTINGS & PING floods** — `--l7-method h2-settings` (CVE-2019-9515)
+  floods empty `SETTINGS` frames, each of which the server must apply and answer
+  with a `SETTINGS` ACK; `--l7-method h2-ping` (CVE-2019-9512) floods `PING`
+  frames, each of which the server must answer with a `PING` ACK (PONG). Both turn
+  one cheap client frame into guaranteed server work + egress, on stream 0, with
+  no request stream — so there is no flow-control credit to exhaust and no stream
+  state to manage. The rate cap is reinterpreted as *frames per second*. `https`
+  negotiates HTTP/2 via ALPN; `http` uses prior-knowledge h2c.
+- **Shared raw-framing module (`l7::h2_frames`)** — the HTTP/2 connection preface,
+  frame type/flag constants, and the frame encoder are factored out of
+  `l7::h2_continuation` so both it and the new frame-flood engine share one
+  implementation. No new dependency (still std-only hand-crafted frames).
+
+### Security
+
+- The frame floods keep the **identical trust boundary** as the other L7
+  primitives: the URL host is authorized as a datum and pinned to a single connect
+  address, so the connection only ever reaches the gate-authorized target. Direct
+  self-tests — no source-IP spoofing, no reflection/amplification. Accept-any-cert
+  TLS is the same scoped choice documented for the other h2 primitives.
+
 ## [0.11.0] — 2026-07-12
 
 Phase 7 (extension): TLS handshake flood (THC-SSL-DoS class).
@@ -382,7 +409,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/h4b00b/jinrai/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/h4b00b/jinrai/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/h4b00b/jinrai/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/h4b00b/jinrai/compare/v0.8.0...v0.9.0

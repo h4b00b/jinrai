@@ -55,7 +55,7 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TCP anomaly floods (Xmas/NULL) ✅, TLS slow modes ✅, TLS handshake flood ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅
+- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TCP anomaly floods (Xmas/NULL) ✅, TLS slow modes ✅, TLS handshake flood ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅, HTTP/2 SETTINGS/PING floods ✅
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
@@ -93,6 +93,8 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `h2-rapid-reset` | HTTP/2 | open a stream, immediately `RST_STREAM` (CVE-2023-44487); rate cap = resets/sec |
 | `h2-continuation` | HTTP/2 | HEADERS without `END_HEADERS` + endless `CONTINUATION` frames (CVE-2024-27316); rate cap = frames/sec |
 | `tls-handshake` | TLS | full TLS handshake then drop, repeated concurrently (THC-SSL-DoS); https-only; rate cap = handshakes/sec |
+| `h2-settings` | HTTP/2 | flood empty `SETTINGS` frames the server must ACK (CVE-2019-9515); rate cap = frames/sec |
+| `h2-ping` | HTTP/2 | flood `PING` frames the server must answer with a PONG (CVE-2019-9512); rate cap = frames/sec |
 
 For slow modes the rate cap means *connections opened per second*; `--slow-connections`
 is the concurrent ceiling and `--drip-ms` the keep-alive write interval. Slow mode is
