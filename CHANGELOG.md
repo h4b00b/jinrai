@@ -16,6 +16,33 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.10.0] — 2026-07-12
+
+Phase 7 (extension): TCP anomalous-flag floods (Xmas / NULL).
+
+### Added
+
+- **TCP Xmas & NULL floods** — `--l4-mode` gains `xmas` (FIN+PSH+URG set at once)
+  and `null` (no control flags set). Where the existing SYN/ACK/FIN/RST floods
+  each set exactly one flag, these craft **illegal flag combinations** to probe
+  how a stateful firewall / connection-tracker / TCP stack handles segments that
+  match no RFC-legal state. They reuse the raw-TCP flag-flood machinery
+  end-to-end: same raw socket, packet crafting, per-target real-source-address
+  lookup, rate cap, kill-switch and preflight. Like the other raw-TCP modes they
+  are IPv4-only, require `CAP_NET_RAW`/root, and are gated behind `--ack-l34-lab`
+  + the allowlist.
+- The single-flag `TcpFlag` enum is generalised to a `TcpFlags` set and the packet
+  builder applies flags imperatively, so any combination is expressible through
+  one code path (SYN/ACK/FIN/RST/Xmas/NULL all flow through it).
+
+### Security
+
+- **The no-spoofing guarantee extends to the anomalous-flag floods** — Xmas and
+  NULL go through the same `source_ipv4_for` route lookup as the other raw-TCP
+  modes: the source address is always the host's real, OS-routed outbound
+  address. There is still no API anywhere to set, randomise, or spoof it, and no
+  reflection/amplification path — they remain direct self-tests, not weapons.
+
 ## [0.9.0] — 2026-07-12
 
 Phase 7 (extension): HTTP/2 CONTINUATION flood — completes the h2 frame-abuse pair.
@@ -326,7 +353,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/h4b00b/jinrai/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/h4b00b/jinrai/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/h4b00b/jinrai/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/h4b00b/jinrai/compare/v0.6.0...v0.7.0

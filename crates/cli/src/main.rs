@@ -58,6 +58,12 @@ OPTIONS:
                                                  one flag, needs CAP_NET_RAW/root,
                                                  IPv4-only, real source IP (never
                                                  spoofed)
+                            xmas | null          raw TCP anomalous-flag floods;
+                                                 xmas sets FIN+PSH+URG, null sets
+                                                 no flags — probe stateful firewall
+                                                 / TCP-stack handling of illegal
+                                                 flag combinations (same raw-socket
+                                                 / no-spoof constraints as above)
                             icmp                 L3 ICMPv4 echo-request flood;
                                                  needs CAP_NET_RAW/root, IPv4-only,
                                                  real source IP, no --port needed
@@ -669,10 +675,12 @@ fn parse_args() -> Result<Args, String> {
                     "ack" => L4Mode::Ack,
                     "fin" => L4Mode::Fin,
                     "rst" => L4Mode::Rst,
+                    "xmas" => L4Mode::Xmas,
+                    "null" => L4Mode::Null,
                     "icmp" => L4Mode::Icmp,
                     other => {
                         return Err(format!(
-                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst|icmp)"
+                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst|xmas|null|icmp)"
                         ))
                     }
                 }
