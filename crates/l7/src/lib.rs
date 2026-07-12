@@ -64,8 +64,13 @@ pub use slow::{L7SlowEngine, SlowConfig, SlowMode};
 pub mod rapid_reset;
 pub use rapid_reset::H2RapidResetEngine;
 
+mod h2_frames;
+
 pub mod h2_continuation;
 pub use h2_continuation::H2ContinuationEngine;
+
+pub mod h2_frame_flood;
+pub use h2_frame_flood::{H2FrameFloodEngine, H2FrameKind};
 
 pub mod tls_flood;
 pub use tls_flood::TlsHandshakeEngine;

