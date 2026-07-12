@@ -16,6 +16,31 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.13.0] — 2026-07-12
+
+Phase 7 (extension): TCP data (PSH-ACK) flood.
+
+### Added
+
+- **TCP data flood (PSH-ACK)** — `--l4-mode data` establishes a bounded pool of
+  **real** TCP connections through the OS stack and writes application data into
+  them, filling the target's receive / application buffers rather than just its
+  accept backlog (SYN) or connection-tracking state (ACK/FIN/RST). Each flushed
+  write emits a PSH-ACK segment; a write that blocks on a full send buffer is
+  *pressure applied* (the target is not draining) and counts as a unit, while a
+  reset/broken connection is retired and replaced. `--payload-size` sets the
+  per-write size. Unlike the raw-TCP floods it needs **no** `CAP_NET_RAW` and
+  works over **IPv4 and IPv6** (like the TCP-connect flood), still gated behind
+  `--ack-l34-lab` + the allowlist.
+
+### Security
+
+- The data flood is a **direct** self-test with the same guarantees as the rest of
+  `l34`: it connects only to gate-authorized targets, from the host's real OS
+  source address (the kernel owns the connection), with **no** spoofing and no
+  reflection/amplification. Because it uses the OS TCP stack it never crafts a
+  packet, so there is no source-address surface at all.
+
 ## [0.12.0] — 2026-07-12
 
 Phase 7 (extension): HTTP/2 control-frame floods (SETTINGS / PING).
@@ -409,7 +434,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/h4b00b/jinrai/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/h4b00b/jinrai/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/h4b00b/jinrai/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/h4b00b/jinrai/compare/v0.9.0...v0.10.0
