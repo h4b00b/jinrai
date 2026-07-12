@@ -16,6 +16,41 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.9.0] — 2026-07-12
+
+Phase 7 (extension): HTTP/2 CONTINUATION flood — completes the h2 frame-abuse pair.
+
+### Added
+
+- **HTTP/2 CONTINUATION flood (CVE-2024-27316)** — `--l7-method h2-continuation`
+  opens one HTTP/2 stream with a HEADERS frame that **withholds `END_HEADERS`**,
+  then streams `CONTINUATION` frames that also never set `END_HEADERS`. The server
+  must buffer the concatenated header-block fragments for a block that is never
+  completed. Because `CONTINUATION` frames are **not flow-controlled** (only
+  `DATA` is), the client forces unbounded server-side header buffering at almost
+  no cost to itself — the resource asymmetry that makes this a DoS class. Exposed
+  as a resilience self-test so an operator can measure whether their own stack
+  bounds header accumulation. The rate cap is reinterpreted as *CONTINUATION
+  frames per second*. `https` negotiates HTTP/2 via ALPN; `http` uses
+  prior-knowledge h2c.
+- Unlike the `h2`-crate-based rapid-reset, this primitive needs **frame-level
+  control** (`h2` only ever emits complete, `END_HEADERS`-terminated blocks), so
+  the HTTP/2 preface and frames are crafted by hand directly on the byte stream —
+  std-only, exactly as `l34` crafts packets. No new dependency, no new TLS/HTTP
+  stack (it reuses the shared `l7::tls` accept-any-cert config with ALPN `h2`).
+
+### Security
+
+- The CONTINUATION engine keeps the **identical trust boundary** as the other L7
+  primitives: the URL host is authorized as a datum and pinned to a single connect
+  address, so the HTTP/2 connection only ever reaches the gate-authorized target.
+  It is a **direct** self-test — no source-IP spoofing and no
+  reflection/amplification path — meaningful only against infrastructure the
+  operator is authorized to test, which the allowlist enforces by construction.
+  The accept-any-cert TLS stance is the same scoped choice documented for
+  slow-TLS and rapid-reset (transport to an authorized host, no secrets sent, no
+  response trusted).
+
 ## [0.8.0] — 2026-07-11
 
 Phase 7 (part 4, completes Phase 7): HTTP/2 rapid-reset.
@@ -291,7 +326,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/h4b00b/jinrai/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/h4b00b/jinrai/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/h4b00b/jinrai/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/h4b00b/jinrai/compare/v0.5.0...v0.6.0
