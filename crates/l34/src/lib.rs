@@ -9,6 +9,11 @@
 //!     SYN exercises the accept backlog; ACK/FIN/RST exercise the target's
 //!     connection-tracking / stateful-firewall state for packets outside an
 //!     established connection.
+//!   - **TCP-options bomb** — a SYN flood whose every packet carries the full
+//!     40-byte maximum of TCP options (MSS + SACK-permitted + timestamp + window
+//!     scale, NOP-padded to the limit), forcing the target's TCP stack to parse a
+//!     maximal option block and allocate SACK/timestamp state per SYN. Same raw
+//!     socket / real-source / IPv4-only constraints as the flag floods.
 //!   - **ICMP echo flood** — L3 ICMPv4 echo-request packets via a raw socket
 //!     (requires `CAP_NET_RAW`/root). The kernel writes the IPv4 header, so the
 //!     source is the real address — the same no-spoofing property as the rest.
@@ -62,6 +67,12 @@ pub enum L4Mode {
     /// / application buffers rather than just its accept backlog or conn-track
     /// state. No raw socket (the OS sets PSH on each flushed write); IPv4 + IPv6.
     Data,
+    /// TCP-options bomb — a raw SYN flood whose every packet carries the maximal
+    /// 40-byte TCP options block, forcing full option parsing + SACK/timestamp
+    /// state allocation per SYN. Same raw-socket / IPv4-only constraints as the
+    /// flag floods; it simply crafts a SYN with a full option field instead of a
+    /// bare one.
+    TcpOptions,
     /// ICMP echo-request flood (raw socket, L3). IPv4-only; source is the
     /// kernel-assigned real address (the kernel builds the IP header).
     Icmp,
@@ -100,6 +111,7 @@ impl L4Mode {
             L4Mode::Xmas => "tcp-xmas-flood",
             L4Mode::Null => "tcp-null-flood",
             L4Mode::Data => "tcp-data-flood",
+            L4Mode::TcpOptions => "tcp-options-flood",
             L4Mode::Icmp => "icmp-echo-flood",
         }
     }
@@ -108,7 +120,9 @@ impl L4Mode {
     /// (UDP / TCP-connect need no raw socket; ICMP is not TCP).
     fn raw_tcp_flags(self) -> Option<TcpFlags> {
         match self {
-            L4Mode::Syn => Some(TcpFlags { syn: true, ..TcpFlags::NONE }),
+            // The options bomb is a SYN too — it differs only in carrying a full
+            // option block, which the sender attaches based on the mode.
+            L4Mode::Syn | L4Mode::TcpOptions => Some(TcpFlags { syn: true, ..TcpFlags::NONE }),
             L4Mode::Ack => Some(TcpFlags { ack: true, ..TcpFlags::NONE }),
             L4Mode::Fin => Some(TcpFlags { fin: true, ..TcpFlags::NONE }),
             L4Mode::Rst => Some(TcpFlags { rst: true, ..TcpFlags::NONE }),
@@ -121,7 +135,8 @@ impl L4Mode {
     }
 
     /// Raw-socket modes craft packets on a raw socket (need CAP_NET_RAW) and are
-    /// IPv4-only: the six TCP flag floods plus the ICMP echo flood.
+    /// IPv4-only: the six TCP flag floods, the TCP-options bomb, and the ICMP
+    /// echo flood.
     fn needs_raw_socket(self) -> bool {
         self.raw_socket_protocol().is_some()
     }
@@ -363,9 +378,17 @@ enum Sender {
     /// and each write (a write that blocks on a full buffer is *pressure applied*,
     /// not a failure).
     TcpData { conns: Vec<TcpStream>, payload: Vec<u8>, timeout: Duration, idx: usize },
-    /// Raw IPv4+TCP flag flood (SYN/ACK/FIN/RST/Xmas/NULL). `flags` selects which
-    /// control flags are set; everything else is shared.
-    RawTcp { flags: TcpFlags, raw: Socket, srcs: HashMap<IpAddr, Ipv4Addr>, counter: u32 },
+    /// Raw IPv4+TCP flag flood (SYN/ACK/FIN/RST/Xmas/NULL) or TCP-options bomb.
+    /// `flags` selects which control flags are set; `with_options` attaches the
+    /// maximal 40-byte option block (the options-bomb mode); everything else is
+    /// shared.
+    RawTcp {
+        flags: TcpFlags,
+        with_options: bool,
+        raw: Socket,
+        srcs: HashMap<IpAddr, Ipv4Addr>,
+        counter: u32,
+    },
     /// Raw ICMPv4 echo-request flood. The kernel supplies the IP header (real
     /// source address); we craft the ICMP echo message + checksum. `id` tags this
     /// run; `counter` is the per-packet sequence number. `payload` is a fixed body.
@@ -418,7 +441,8 @@ impl Sender {
                     .expect("setup reached with a non-raw-TCP mode");
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
                     .map_err(|e| L34Error::RawSocket(e.to_string()))?;
-                Ok(Sender::RawTcp { flags, raw, srcs: HashMap::new(), counter: 0 })
+                let with_options = other == L4Mode::TcpOptions;
+                Ok(Sender::RawTcp { flags, with_options, raw, srcs: HashMap::new(), counter: 0 })
             }
         }
     }
@@ -473,7 +497,7 @@ impl Sender {
                 }
             }
 
-            Sender::RawTcp { flags, raw, srcs, counter } => {
+            Sender::RawTcp { flags, with_options, raw, srcs, counter } => {
                 let dst = match ip {
                     IpAddr::V4(v4) => v4,
                     IpAddr::V6(_) => return Err(L34Error::Ipv6RawTcpUnsupported(ip)),
@@ -489,7 +513,11 @@ impl Sender {
                 };
                 *counter = counter.wrapping_add(1);
                 let src_port = 20_000u16.wrapping_add((*counter % 40_000) as u16);
-                let packet = build_tcp_packet(src, dst, src_port, port, *counter, *flags)?;
+                let packet = if *with_options {
+                    build_tcp_options_syn(src, dst, src_port, port, *counter)?
+                } else {
+                    build_tcp_packet(src, dst, src_port, port, *counter, *flags)?
+                };
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
                 raw.send_to(&packet, &dest)
                     .map(|_| ())
@@ -593,6 +621,51 @@ fn build_tcp_packet(
     if flags.urg {
         b = b.urg(0);
     }
+    let mut out = Vec::with_capacity(b.size(0));
+    b.write(&mut out, &[])
+        .map_err(|e| L34Error::Build(e.to_string()))?;
+    Ok(out)
+}
+
+/// The maximal TCP option set an IPv4 SYN can carry: the four options a real SYN
+/// commonly negotiates (MSS, SACK-permitted, timestamp, window scale) followed by
+/// enough NOP padding to fill the entire 40-byte option area. The timestamp folds
+/// in `seq` so successive packets are not byte-identical. Total = 40 bytes exactly
+/// (a multiple of 4), so it maps to the maximum data offset of 15 with no further
+/// padding — every SYN forces the target to walk a full-size option block and set
+/// up SACK/timestamp state.
+fn options_bomb(seq: u32) -> Vec<etherparse::TcpOptionElement> {
+    use etherparse::TcpOptionElement::*;
+    // 4 + 2 + 10 + 3 = 19 bytes of real options...
+    let mut opts = vec![
+        MaximumSegmentSize(1460),
+        SelectiveAcknowledgementPermitted,
+        Timestamp(seq, 0),
+        WindowScale(7),
+    ];
+    // ...then 21 NOPs (1 byte each) to reach the 40-byte maximum.
+    opts.extend(std::iter::repeat_n(Noop, 21));
+    opts
+}
+
+/// Build a complete IPv4 + SYN packet carrying the maximal option block from
+/// [`options_bomb`] — the "TCP-options bomb". Same real-source, no-spoof property
+/// as [`build_tcp_packet`]; it differs only in attaching a full 40-byte option
+/// field instead of none.
+fn build_tcp_options_syn(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+) -> Result<Vec<u8>, L34Error> {
+    use etherparse::PacketBuilder;
+    let opts = options_bomb(seq);
+    let b = PacketBuilder::ipv4(src.octets(), dst.octets(), 64)
+        .tcp(src_port, dst_port, seq, 64_240)
+        .syn()
+        .options(&opts)
+        .map_err(|e| L34Error::Build(e.to_string()))?;
     let mut out = Vec::with_capacity(b.size(0));
     b.write(&mut out, &[])
         .map_err(|e| L34Error::Build(e.to_string()))?;
@@ -755,6 +828,46 @@ mod tests {
     }
 
     #[test]
+    fn tcp_options_bomb_is_a_syn_with_a_full_40_byte_option_block() {
+        use etherparse::TcpOptionElement;
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let pkt = build_tcp_options_syn(src, dst, 40000, 80, 777).unwrap();
+        let (_, tcp) = parse_tcp(&pkt);
+
+        assert!(tcp.syn, "the options bomb is a SYN");
+        assert!(!tcp.ack && !tcp.rst && !tcp.fin, "no other control flag is set");
+        assert_eq!(tcp.options.as_slice().len(), 40, "must fill the 40-byte option maximum");
+        assert_eq!(tcp.data_offset(), 15, "max data offset: 5 fixed + 40/4 option words");
+        assert_ne!(tcp.checksum, 0, "checksum must be computed");
+
+        // The negotiated options the target is forced to parse are actually there.
+        let elems: Vec<_> = tcp.options_iterator().map(|r| r.expect("valid option")).collect();
+        assert!(
+            elems.iter().any(|e| matches!(e, TcpOptionElement::MaximumSegmentSize(_))),
+            "MSS present"
+        );
+        assert!(
+            elems.iter().any(|e| matches!(e, TcpOptionElement::Timestamp(_, _))),
+            "timestamp present"
+        );
+        assert!(
+            elems.iter().any(|e| matches!(e, TcpOptionElement::SelectiveAcknowledgementPermitted)),
+            "SACK-permitted present"
+        );
+    }
+
+    #[test]
+    fn plain_syn_carries_no_options_unlike_the_bomb() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let plain = build_tcp_packet(src, dst, 40000, 80, 1, L4Mode::Syn.raw_tcp_flags().unwrap()).unwrap();
+        let (_, tcp) = parse_tcp(&plain);
+        assert_eq!(tcp.options.as_slice().len(), 0, "the flag floods carry no options");
+        assert_eq!(tcp.data_offset(), 5, "minimum data offset when there are no options");
+    }
+
+    #[test]
     fn icmp_echo_is_well_formed_with_valid_checksum() {
         let pkt = build_icmp_echo(0x1234, 7, b"ping");
         assert_eq!(pkt[0], 8, "type must be echo request");
@@ -789,7 +902,9 @@ mod tests {
     fn raw_tcp_modes_map_to_their_flags_and_labels() {
         // Every raw-TCP mode yields flags and needs a raw socket; the socket-based
         // and ICMP modes yield none.
-        for mode in [L4Mode::Syn, L4Mode::Ack, L4Mode::Fin, L4Mode::Rst, L4Mode::Xmas, L4Mode::Null] {
+        for mode in
+            [L4Mode::Syn, L4Mode::Ack, L4Mode::Fin, L4Mode::Rst, L4Mode::Xmas, L4Mode::Null, L4Mode::TcpOptions]
+        {
             assert!(mode.raw_tcp_flags().is_some(), "{mode:?} should map to flags");
             assert!(mode.needs_raw_socket(), "{mode:?} needs a raw socket");
         }
@@ -800,6 +915,7 @@ mod tests {
         assert_eq!(L4Mode::Rst.label(), "tcp-rst-flood");
         assert_eq!(L4Mode::Xmas.label(), "tcp-xmas-flood");
         assert_eq!(L4Mode::Null.label(), "tcp-null-flood");
+        assert_eq!(L4Mode::TcpOptions.label(), "tcp-options-flood");
     }
 
     #[test]

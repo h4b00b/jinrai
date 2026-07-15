@@ -67,6 +67,12 @@ OPTIONS:
                                                  / TCP-stack handling of illegal
                                                  flag combinations (same raw-socket
                                                  / no-spoof constraints as above)
+                            tcp-options          raw SYN flood carrying the maximal
+                                                 40-byte TCP option block (MSS +
+                                                 SACK + timestamp + window scale,
+                                                 NOP-padded) — stresses the target's
+                                                 option parser / SACK+timestamp
+                                                 state (same raw-socket constraints)
                             icmp                 L3 ICMPv4 echo-request flood;
                                                  needs CAP_NET_RAW/root, IPv4-only,
                                                  real source IP, no --port needed
@@ -715,10 +721,12 @@ fn parse_args() -> Result<Args, String> {
                     "xmas" => L4Mode::Xmas,
                     "null" => L4Mode::Null,
                     "data" => L4Mode::Data,
+                    "tcp-options" => L4Mode::TcpOptions,
                     "icmp" => L4Mode::Icmp,
                     other => {
                         return Err(format!(
-                            "unknown --l4-mode: {other} (want udp|tcp|syn|ack|fin|rst|xmas|null|data|icmp)"
+                            "unknown --l4-mode: {other} \
+                             (want udp|tcp|syn|ack|fin|rst|xmas|null|data|tcp-options|icmp)"
                         ))
                     }
                 }

@@ -16,6 +16,31 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.15.0] — 2026-07-15
+
+Phase 7 (extension): TCP-options bomb (L4).
+
+### Added
+
+- **TCP-options bomb** — `--l4-mode tcp-options` is a raw SYN flood whose every
+  packet carries the maximal 40-byte TCP option block (MSS + SACK-permitted +
+  timestamp + window scale, NOP-padded to the limit). Each SYN forces the target's
+  TCP stack to parse a full-size option field and allocate SACK/timestamp state,
+  amplifying the per-SYN cost over a bare SYN. It reuses the existing raw-TCP flag
+  flood machinery (same `IPPROTO_RAW` socket, real route-local source address,
+  per-packet checksum), differing only in attaching the option block; the
+  timestamp folds in the per-packet counter so successive SYNs are not
+  byte-identical. Same constraints as the flag floods: `CAP_NET_RAW`/root,
+  IPv4-only, gated behind `--ack-l34-lab` + the allowlist.
+
+### Security
+
+- The options bomb is a **direct** self-test with the same guarantees as the rest
+  of `l34`: crafted only for gate-authorized targets, from the host's real
+  OS-routed source address (obtained by asking the kernel which local address
+  routes to the target — never forged), with **no** spoofing and no
+  reflection/amplification.
+
 ## [0.14.0] — 2026-07-15
 
 Phase 7 (extension): HTTP/2 WINDOW_UPDATE & PRIORITY floods.
@@ -459,7 +484,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/h4b00b/jinrai/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/h4b00b/jinrai/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/h4b00b/jinrai/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/h4b00b/jinrai/compare/v0.11.0...v0.12.0
