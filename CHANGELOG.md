@@ -16,6 +16,30 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.19.0] — 2026-07-15
+
+L7 (extension): connection-concurrency cap for the fast request flood — the
+controlled form of keep-alive connection exhaustion.
+
+### Added
+
+- **`--max-connections <N>`** caps the number of concurrent in-flight requests
+  (≈ concurrent keep-alive connections) for the fast `get`/`post`/`head` flood.
+  A dispatch tick that would exceed the cap is **skipped, not queued**, so the
+  load holds at most `N` connections busy rather than an unbounded rate-driven
+  fan-out. This pins the connection count so an operator can probe a server's
+  connection-slot / worker-pool / keep-alive limit directly (the controlled,
+  bounded form of GoldenEye/XerXes-style keep-alive load) — reusing the existing
+  engine, connection pooling, `--cache-bust`, profiles and SLO machinery.
+  Default `0` = unbounded (the historical behaviour). `--rate` still caps the
+  request rate on top: connections are held busy *up to* that ceiling.
+
+### Notes
+
+- Implemented as a `tokio::sync::Semaphore` around the dispatched request tasks
+  (permit held for each request's lifetime); no new dependency, `forbid(unsafe_code)`
+  retained. Verified by a concurrency-peak test (peak simultaneous handlers ≤ cap).
+
 ## [0.18.0] — 2026-07-15
 
 L7 (extension): slow-read connection primitive — the read-side mirror of slowbody.

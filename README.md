@@ -87,7 +87,7 @@ jinrai --layer l7 --allow '*.staging.internal' \
 
 | Method | Kind | Notes |
 |---|---|---|
-| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host) |
+| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host); `--max-connections <N>` caps concurrent connections (see below) |
 | `slowloris` | slow connection | partial request headers, never terminated |
 | `slowbody` | slow connection | oversized `Content-Length`, body trickled a byte at a time (RUDY) |
 | `slow-read` | slow connection | send a *complete* request, then drain the response one small chunk per tick with a shrunken receive window (`SO_RCVBUF`) so the server cannot flush it — the read-side mirror of `slowbody` |
@@ -110,6 +110,12 @@ repeatable `--header` flag.
 jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
        --url http://api.staging.internal/ingest --body '{"probe":1}' \
        --cache-bust --rate 200 --duration 30
+
+# Keep-alive connection exhaustion: hold at most 50 concurrent connections busy
+# (controlled form of GoldenEye/XerXes) to probe the connection-slot / worker limit
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url http://api.staging.internal/ --max-connections 50 \
+       --cache-bust --rate 1000 --duration 60
 
 # Slowloris: hold 200 half-open connections, one header line every 10s
 jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
