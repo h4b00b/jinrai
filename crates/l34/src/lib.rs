@@ -5,10 +5,16 @@
 //!   - **TCP connect flood** — full-handshake connections held open to exercise
 //!     the connection table / backlog (no privilege needed);
 //!   - **TCP flag floods** — crafted IPv4+TCP packets with a single control flag
-//!     set (SYN / ACK / FIN / RST) via a raw socket (requires `CAP_NET_RAW`/root).
-//!     SYN exercises the accept backlog; ACK/FIN/RST exercise the target's
-//!     connection-tracking / stateful-firewall state for packets outside an
-//!     established connection.
+//!     set (SYN / ACK / FIN / RST / URG / CWR / ECE) via a raw socket (requires
+//!     `CAP_NET_RAW`/root). SYN exercises the accept backlog; ACK/FIN/RST exercise
+//!     the target's connection-tracking / stateful-firewall state for packets
+//!     outside an established connection; URG/CWR/ECE are otherwise-empty segments
+//!     carrying only an urgent or ECN congestion bit, probing how the stack and
+//!     any middlebox treat these rarely-standalone flags.
+//!   - **Anomalous flag-combination floods** — segments whose flag field matches
+//!     no RFC-legal state: `xmas` (FIN+PSH+URG), `null` (no flags), and the
+//!     mutually-contradictory `syn-fin` and `syn-rst` combinations. These probe
+//!     stateful-firewall / IDS / TCP-stack handling of illegal control fields.
 //!   - **TCP-options bomb** — a SYN flood whose every packet carries the full
 //!     40-byte maximum of TCP options (MSS + SACK-permitted + timestamp + window
 //!     scale, NOP-padded to the limit), forcing the target's TCP stack to parse a
@@ -55,6 +61,21 @@ pub enum L4Mode {
     Fin,
     /// TCP RST flood (raw socket, RST flag) — reset packets.
     Rst,
+    /// TCP URG flood (raw socket, URG flag only) — an out-of-state segment whose
+    /// only control bit is the (degenerate, zero-pointer) urgent flag.
+    Urg,
+    /// TCP CWR flood (raw socket, CWR flag only) — a lone ECN Congestion-Window-
+    /// Reduced bit with no SYN/ACK, probing ECN handling outside a connection.
+    Cwr,
+    /// TCP ECE flood (raw socket, ECE flag only) — a lone ECN-Echo bit, likewise
+    /// standalone rather than part of an established/negotiating connection.
+    Ece,
+    /// TCP SYN+FIN flood (raw socket) — a classic illegal combination (open and
+    /// close at once) long used to probe firewall/IDS flag handling.
+    SynFin,
+    /// TCP SYN+RST flood (raw socket) — the mutually-contradictory open+reset
+    /// combination; another flag field that matches no legal TCP state.
+    SynRst,
     /// TCP Xmas flood (raw socket, FIN+PSH+URG set at once) — an illegal flag
     /// combination that probes stateful-firewall / TCP-stack handling of packets
     /// that match no RFC-legal state ("lit up like a Christmas tree").
@@ -91,12 +112,24 @@ struct TcpFlags {
     rst: bool,
     psh: bool,
     urg: bool,
+    /// ECN Congestion-Window-Reduced.
+    cwr: bool,
+    /// ECN-Echo.
+    ece: bool,
 }
 
 impl TcpFlags {
     /// No flag set — the NULL segment, and the base for the named constructors.
-    const NONE: TcpFlags =
-        TcpFlags { syn: false, ack: false, fin: false, rst: false, psh: false, urg: false };
+    const NONE: TcpFlags = TcpFlags {
+        syn: false,
+        ack: false,
+        fin: false,
+        rst: false,
+        psh: false,
+        urg: false,
+        cwr: false,
+        ece: false,
+    };
 }
 
 impl L4Mode {
@@ -108,6 +141,11 @@ impl L4Mode {
             L4Mode::Ack => "tcp-ack-flood",
             L4Mode::Fin => "tcp-fin-flood",
             L4Mode::Rst => "tcp-rst-flood",
+            L4Mode::Urg => "tcp-urg-flood",
+            L4Mode::Cwr => "tcp-cwr-flood",
+            L4Mode::Ece => "tcp-ece-flood",
+            L4Mode::SynFin => "tcp-syn-fin-flood",
+            L4Mode::SynRst => "tcp-syn-rst-flood",
             L4Mode::Xmas => "tcp-xmas-flood",
             L4Mode::Null => "tcp-null-flood",
             L4Mode::Data => "tcp-data-flood",
@@ -126,6 +164,12 @@ impl L4Mode {
             L4Mode::Ack => Some(TcpFlags { ack: true, ..TcpFlags::NONE }),
             L4Mode::Fin => Some(TcpFlags { fin: true, ..TcpFlags::NONE }),
             L4Mode::Rst => Some(TcpFlags { rst: true, ..TcpFlags::NONE }),
+            L4Mode::Urg => Some(TcpFlags { urg: true, ..TcpFlags::NONE }),
+            L4Mode::Cwr => Some(TcpFlags { cwr: true, ..TcpFlags::NONE }),
+            L4Mode::Ece => Some(TcpFlags { ece: true, ..TcpFlags::NONE }),
+            // Illegal open+close / open+reset combinations.
+            L4Mode::SynFin => Some(TcpFlags { syn: true, fin: true, ..TcpFlags::NONE }),
+            L4Mode::SynRst => Some(TcpFlags { syn: true, rst: true, ..TcpFlags::NONE }),
             // Xmas lights FIN+PSH+URG at once; NULL sets nothing at all.
             L4Mode::Xmas => Some(TcpFlags { fin: true, psh: true, urg: true, ..TcpFlags::NONE }),
             L4Mode::Null => Some(TcpFlags::NONE),
@@ -621,6 +665,12 @@ fn build_tcp_packet(
     if flags.urg {
         b = b.urg(0);
     }
+    if flags.cwr {
+        b = b.cwr();
+    }
+    if flags.ece {
+        b = b.ece();
+    }
     let mut out = Vec::with_capacity(b.size(0));
     b.write(&mut out, &[])
         .map_err(|e| L34Error::Build(e.to_string()))?;
@@ -814,6 +864,49 @@ mod tests {
     }
 
     #[test]
+    fn urg_cwr_ece_floods_each_light_exactly_their_own_bit() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        // (mode, is_urg, is_cwr, is_ece)
+        let cases = [
+            (L4Mode::Urg, true, false, false),
+            (L4Mode::Cwr, false, true, false),
+            (L4Mode::Ece, false, false, true),
+        ];
+        for (mode, urg, cwr, ece) in cases {
+            let flags = mode.raw_tcp_flags().unwrap();
+            let pkt = build_tcp_packet(src, dst, 40000, 80, 7, flags).unwrap();
+            let (_, tcp) = parse_tcp(&pkt);
+            assert_eq!(tcp.urg, urg, "{mode:?} urg");
+            assert_eq!(tcp.cwr, cwr, "{mode:?} cwr");
+            assert_eq!(tcp.ece, ece, "{mode:?} ece");
+            assert!(
+                !tcp.syn && !tcp.ack && !tcp.fin && !tcp.rst && !tcp.psh,
+                "{mode:?} must light no other flag"
+            );
+            assert_ne!(tcp.checksum, 0, "{mode:?} checksum must be computed");
+        }
+    }
+
+    #[test]
+    fn illegal_syn_combinations_set_both_contradictory_bits() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+
+        let synfin = build_tcp_packet(src, dst, 40000, 80, 5, L4Mode::SynFin.raw_tcp_flags().unwrap()).unwrap();
+        let (_, tcp) = parse_tcp(&synfin);
+        assert!(tcp.syn && tcp.fin, "SYN+FIN must set both");
+        assert!(!tcp.ack && !tcp.rst && !tcp.psh && !tcp.urg, "SYN+FIN sets nothing else");
+        assert_ne!(tcp.checksum, 0, "checksum must be computed");
+
+        let synrst = build_tcp_packet(src, dst, 40000, 80, 5, L4Mode::SynRst.raw_tcp_flags().unwrap()).unwrap();
+        let (_, tcp) = parse_tcp(&synrst);
+        assert!(tcp.syn && tcp.rst, "SYN+RST must set both");
+        assert!(!tcp.ack && !tcp.fin && !tcp.psh && !tcp.urg, "SYN+RST sets nothing else");
+        assert_ne!(tcp.checksum, 0, "checksum must be computed");
+    }
+
+    #[test]
     fn null_flood_sets_no_flags_at_all() {
         let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
         let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
@@ -821,7 +914,8 @@ mod tests {
         let pkt = build_tcp_packet(src, dst, 40000, 80, 42, flags).unwrap();
         let (_, tcp) = parse_tcp(&pkt);
         assert!(
-            !tcp.syn && !tcp.ack && !tcp.fin && !tcp.rst && !tcp.psh && !tcp.urg,
+            !tcp.syn && !tcp.ack && !tcp.fin && !tcp.rst && !tcp.psh && !tcp.urg
+                && !tcp.cwr && !tcp.ece,
             "NULL must set no control flag"
         );
         assert_ne!(tcp.checksum, 0, "checksum must be computed");
@@ -902,9 +996,20 @@ mod tests {
     fn raw_tcp_modes_map_to_their_flags_and_labels() {
         // Every raw-TCP mode yields flags and needs a raw socket; the socket-based
         // and ICMP modes yield none.
-        for mode in
-            [L4Mode::Syn, L4Mode::Ack, L4Mode::Fin, L4Mode::Rst, L4Mode::Xmas, L4Mode::Null, L4Mode::TcpOptions]
-        {
+        for mode in [
+            L4Mode::Syn,
+            L4Mode::Ack,
+            L4Mode::Fin,
+            L4Mode::Rst,
+            L4Mode::Urg,
+            L4Mode::Cwr,
+            L4Mode::Ece,
+            L4Mode::SynFin,
+            L4Mode::SynRst,
+            L4Mode::Xmas,
+            L4Mode::Null,
+            L4Mode::TcpOptions,
+        ] {
             assert!(mode.raw_tcp_flags().is_some(), "{mode:?} should map to flags");
             assert!(mode.needs_raw_socket(), "{mode:?} needs a raw socket");
         }
@@ -913,6 +1018,11 @@ mod tests {
         assert_eq!(L4Mode::Icmp.raw_tcp_flags(), None);
         assert!(!L4Mode::Udp.needs_raw_socket());
         assert_eq!(L4Mode::Rst.label(), "tcp-rst-flood");
+        assert_eq!(L4Mode::Urg.label(), "tcp-urg-flood");
+        assert_eq!(L4Mode::Cwr.label(), "tcp-cwr-flood");
+        assert_eq!(L4Mode::Ece.label(), "tcp-ece-flood");
+        assert_eq!(L4Mode::SynFin.label(), "tcp-syn-fin-flood");
+        assert_eq!(L4Mode::SynRst.label(), "tcp-syn-rst-flood");
         assert_eq!(L4Mode::Xmas.label(), "tcp-xmas-flood");
         assert_eq!(L4Mode::Null.label(), "tcp-null-flood");
         assert_eq!(L4Mode::TcpOptions.label(), "tcp-options-flood");
@@ -962,6 +1072,11 @@ mod tests {
             L4Mode::Ack,
             L4Mode::Fin,
             L4Mode::Rst,
+            L4Mode::Urg,
+            L4Mode::Cwr,
+            L4Mode::Ece,
+            L4Mode::SynFin,
+            L4Mode::SynRst,
             L4Mode::Xmas,
             L4Mode::Null,
             L4Mode::Icmp,

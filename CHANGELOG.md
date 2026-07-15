@@ -16,6 +16,25 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.16.0] — 2026-07-15
+
+Phase 7 (extension): extended anomalous TCP flag floods (L4).
+
+### Added
+
+- **URG / CWR / ECE single-flag floods** — `--l4-mode urg|cwr|ece` send an
+  otherwise-empty raw TCP segment carrying only that one rarely-standalone bit
+  (the urgent flag with a zero pointer, or a lone ECN Congestion-Window-Reduced /
+  ECN-Echo bit), probing how the target stack and any middlebox treat these flags
+  outside an established connection.
+- **SYN+FIN / SYN+RST illegal-combination floods** — `--l4-mode syn-fin|syn-rst`
+  set mutually-contradictory flag fields (open+close, open+reset) that match no
+  RFC-legal TCP state — classic firewall/IDS flag-handling probes, alongside the
+  existing `xmas` and `null` anomaly floods.
+- The shared `TcpFlags` gained `cwr`/`ece` bits; all seven new/extended modes reuse
+  the existing raw-TCP flag-flood machinery (same `IPPROTO_RAW` socket, real
+  route-local source address — **never spoofed** — IPv4-only, `CAP_NET_RAW`).
+
 ## [0.15.0] — 2026-07-15
 
 Phase 7 (extension): TCP-options bomb (L4).
@@ -484,7 +503,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/h4b00b/jinrai/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/h4b00b/jinrai/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/h4b00b/jinrai/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/h4b00b/jinrai/compare/v0.12.0...v0.13.0
