@@ -27,6 +27,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # Already in the tree via reqwest/hyper; pinned to the same majors so no dup.
 h2 = "0.4"
 http = "1"
+# Socket-option control for slow-read (shrink SO_RCVBUF so the server cannot
+# flush its response). Already in the workspace tree via `l34`. SockRef borrows a
+# connected tokio stream — no unsafe, no second socket.
+socket2 = "0.5"
 
 [lints.rust]
 unsafe_code = "forbid"

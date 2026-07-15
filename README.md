@@ -90,6 +90,7 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host) |
 | `slowloris` | slow connection | partial request headers, never terminated |
 | `slowbody` | slow connection | oversized `Content-Length`, body trickled a byte at a time (RUDY) |
+| `slow-read` | slow connection | send a *complete* request, then drain the response one small chunk per tick with a shrunken receive window (`SO_RCVBUF`) so the server cannot flush it — the read-side mirror of `slowbody` |
 | `h2-rapid-reset` | HTTP/2 | open a stream, immediately `RST_STREAM` (CVE-2023-44487); rate cap = resets/sec |
 | `h2-continuation` | HTTP/2 | HEADERS without `END_HEADERS` + endless `CONTINUATION` frames (CVE-2024-27316); rate cap = frames/sec |
 | `tls-handshake` | TLS | full TLS handshake then drop, repeated concurrently (THC-SSL-DoS); https-only; rate cap = handshakes/sec |
@@ -99,9 +100,10 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `h2-priority` | HTTP/2 | flood `PRIORITY` frames that reshuffle the server's priority tree (CVE-2019-9513, "Resource Loop"); rate cap = frames/sec |
 
 For slow modes the rate cap means *connections opened per second*; `--slow-connections`
-is the concurrent ceiling and `--drip-ms` the keep-alive write interval. Slow mode is
-http-only for now (an `https` URL is refused fail-closed). Header-profile tests
-(`User-Agent`, `Cookie`, `Referer`, …) use the repeatable `--header` flag.
+is the concurrent ceiling and `--drip-ms` the per-tick interval (the keep-alive write
+interval for `slowloris`/`slowbody`, or the read interval draining one chunk for
+`slow-read`). Header-profile tests (`User-Agent`, `Cookie`, `Referer`, …) use the
+repeatable `--header` flag.
 
 ```sh
 # POST flood with a body and cache-busting
@@ -112,6 +114,11 @@ jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
 # Slowloris: hold 200 half-open connections, one header line every 10s
 jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
        --url http://api.staging.internal/ --slow-connections 200 \
+       --drip-ms 10000 --rate 50 --duration 60
+
+# Slow-read: hold 200 connections, draining the response one chunk every 10s
+jinrai --layer l7 --allow '*.staging.internal' --l7-method slow-read \
+       --url http://api.staging.internal/large-resource --slow-connections 200 \
        --drip-ms 10000 --rate 50 --duration 60
 ```
 

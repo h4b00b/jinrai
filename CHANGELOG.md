@@ -16,6 +16,34 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.18.0] — 2026-07-15
+
+L7 (extension): slow-read connection primitive — the read-side mirror of slowbody.
+
+### Added
+
+- **Slow-read** — `--l7-method slow-read` opens connections (like the other slow
+  primitives), sends a *complete* HTTP request, then drains the response one small
+  64-byte chunk per `--drip-ms` tick while advertising a shrunken receive window
+  (`SO_RCVBUF` set as small as the OS allows). The server's send buffer stays full
+  and it cannot retire the connection — exercising the response-write / send
+  timeout, the counterpart to `slowbody`'s request-body read timeout. Works over
+  http and `https` (slow-TLS), reusing the connection-holding engine.
+- The slow engine's per-connection driver is now generic over the concrete stream
+  (plaintext `TcpStream` or TLS session), so read and write slow modes share one
+  code path with no trait-object boxing.
+
+### Changed
+
+- `--drip-ms` is now documented as the general per-tick interval: the keep-alive
+  write interval for `slowloris`/`slowbody`, or the read interval for `slow-read`.
+
+### Dependencies
+
+- `jinrai-l7` gains `socket2` (already in the workspace tree via `l34`), used only
+  to shrink `SO_RCVBUF` on a connected stream for slow-read (`SockRef` borrow — no
+  `unsafe`, no second socket). `forbid(unsafe_code)` is retained.
+
 ## [0.17.0] — 2026-07-15
 
 Phase 7 (extension): ICMP timestamp + address-mask query floods (L3).

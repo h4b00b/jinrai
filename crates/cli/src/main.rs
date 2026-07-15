@@ -89,6 +89,11 @@ OPTIONS:
                             get | post | head   fast request flood
                             slowloris            slow partial headers (Slowloris)
                             slowbody             slow trickled POST body (RUDY)
+                            slow-read            complete request, then drain the
+                                                 response one small chunk per tick
+                                                 with a shrunken receive window so
+                                                 the server cannot flush it (the
+                                                 read-side mirror of slowbody)
                             h2-rapid-reset       HTTP/2 rapid-reset (CVE-2023-44487):
                                                  open a stream, immediately
                                                  RST_STREAM; rate cap = resets/sec
@@ -121,7 +126,9 @@ OPTIONS:
                           caches/CDNs cannot serve a stored response (query only;
                           the host is never altered)
     --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
-    --drip-ms <MS>        Keep-alive write interval for slow modes (default: 10000)
+    --drip-ms <MS>        Per-tick interval for slow modes (default: 10000): the
+                          keep-alive write interval for slowloris/slowbody, or the
+                          read interval draining one chunk for slow-read
     --payload-size <N>    Payload bytes per unit (default: 64) — UDP datagram size
                           (l4-mode udp) or PSH-ACK write size (l4-mode data)
     --rate <N>            Rate cap, units/sec (default: 100). This is a hard
@@ -691,6 +698,7 @@ fn parse_args() -> Result<Args, String> {
                     "head" => L7Kind::Fast(L7Method::Head),
                     "slowloris" => L7Kind::Slow(SlowMode::Headers),
                     "slowbody" => L7Kind::Slow(SlowMode::Body),
+                    "slow-read" => L7Kind::Slow(SlowMode::Read),
                     "h2-rapid-reset" => L7Kind::RapidReset,
                     "h2-continuation" => L7Kind::Continuation,
                     "tls-handshake" => L7Kind::TlsHandshake,
@@ -701,8 +709,8 @@ fn parse_args() -> Result<Args, String> {
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
-                             h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|h2-ping|\
-                             h2-window-update|h2-priority)"
+                             slow-read|h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|\
+                             h2-ping|h2-window-update|h2-priority)"
                         ))
                     }
                 }
