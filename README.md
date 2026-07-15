@@ -153,18 +153,21 @@ jinrai --layer l7 --allow '*.staging.internal' \
 **L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,
 an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp`/`data`
 need no privilege (and `tcp`/`data` work over IPv4 **and** IPv6); the raw-socket
-modes (`syn`/`ack`/`fin`/`rst`/`xmas`/`null`/`tcp-options`/`icmp`) need
-`CAP_NET_RAW`/root and are IPv4-only:
+modes (`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-fin`/`syn-rst`/`xmas`/`null`/
+`tcp-options`/`icmp`) need `CAP_NET_RAW`/root and are IPv4-only:
 
 ```sh
 jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 \
        --target 10.1.2.3 --port 9 --ack-l34-lab --rate 1000 --duration 10
 ```
 
-The raw-TCP flag floods set control flags directly: `syn`/`ack`/`fin`/`rst` set
-exactly one, while the **anomaly floods** set illegal combinations — `xmas` sets
-`FIN+PSH+URG` at once and `null` sets none — to probe how a stateful firewall /
-connection-tracker / TCP stack handles segments that match no RFC-legal state:
+The raw-TCP flag floods set control flags directly: `syn`/`ack`/`fin`/`rst`/`urg`/
+`cwr`/`ece` each set exactly one (the last three send an otherwise-empty segment
+carrying only the urgent or an ECN congestion bit), while the **anomaly floods**
+set flag fields that match no RFC-legal state — `syn-fin` and `syn-rst` set
+mutually-contradictory combinations, `xmas` sets `FIN+PSH+URG` at once, and `null`
+sets none — to probe how a stateful firewall / IDS / connection-tracker / TCP
+stack handles them:
 
 ```sh
 # Xmas flood against a lab host (raw socket; needs CAP_NET_RAW/root)

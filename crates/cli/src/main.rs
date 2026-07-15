@@ -57,16 +57,21 @@ OPTIONS:
                                                  PSH-ACK data flood: real OS
                                                  connections filled with app data;
                                                  --payload-size sets the write size)
-                            syn | ack | fin | rst  raw TCP flag floods; each sets
-                                                 one flag, needs CAP_NET_RAW/root,
+                            syn | ack | fin | rst | urg | cwr | ece
+                                                 raw TCP flag floods; each sets one
+                                                 flag, needs CAP_NET_RAW/root,
                                                  IPv4-only, real source IP (never
-                                                 spoofed)
-                            xmas | null          raw TCP anomalous-flag floods;
-                                                 xmas sets FIN+PSH+URG, null sets
-                                                 no flags — probe stateful firewall
-                                                 / TCP-stack handling of illegal
-                                                 flag combinations (same raw-socket
-                                                 / no-spoof constraints as above)
+                                                 spoofed). urg/cwr/ece send an
+                                                 otherwise-empty segment carrying
+                                                 only that (rarely-standalone) bit
+                            syn-fin | syn-rst | xmas | null
+                                                 raw TCP anomalous-flag floods:
+                                                 syn-fin/syn-rst set contradictory
+                                                 combos, xmas sets FIN+PSH+URG, null
+                                                 sets no flags — probe stateful
+                                                 firewall / IDS / TCP-stack handling
+                                                 of illegal control fields (same
+                                                 raw-socket / no-spoof constraints)
                             tcp-options          raw SYN flood carrying the maximal
                                                  40-byte TCP option block (MSS +
                                                  SACK + timestamp + window scale,
@@ -718,6 +723,11 @@ fn parse_args() -> Result<Args, String> {
                     "ack" => L4Mode::Ack,
                     "fin" => L4Mode::Fin,
                     "rst" => L4Mode::Rst,
+                    "urg" => L4Mode::Urg,
+                    "cwr" => L4Mode::Cwr,
+                    "ece" => L4Mode::Ece,
+                    "syn-fin" => L4Mode::SynFin,
+                    "syn-rst" => L4Mode::SynRst,
                     "xmas" => L4Mode::Xmas,
                     "null" => L4Mode::Null,
                     "data" => L4Mode::Data,
@@ -726,7 +736,8 @@ fn parse_args() -> Result<Args, String> {
                     other => {
                         return Err(format!(
                             "unknown --l4-mode: {other} \
-                             (want udp|tcp|syn|ack|fin|rst|xmas|null|data|tcp-options|icmp)"
+                             (want udp|tcp|syn|ack|fin|rst|urg|cwr|ece|syn-fin|syn-rst|\
+                              xmas|null|data|tcp-options|icmp)"
                         ))
                     }
                 }
