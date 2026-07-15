@@ -125,6 +125,12 @@ OPTIONS:
     --cache-bust          Append a unique _cb=<n> query to every l7 request so
                           caches/CDNs cannot serve a stored response (query only;
                           the host is never altered)
+    --max-connections <N> Cap concurrent in-flight requests (~concurrent keep-alive
+                          connections) for the fast get/post/head flood (default: 0
+                          = unbounded). Pins the load to at most N connections held
+                          busy — the controlled form of keep-alive connection
+                          exhaustion (probe a server's connection-slot / worker
+                          limit); --rate still caps the request rate on top
     --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
     --drip-ms <MS>        Per-tick interval for slow modes (default: 10000): the
                           keep-alive write interval for slowloris/slowbody, or the
@@ -223,6 +229,7 @@ struct Args {
     cache_bust: bool,
     slow_connections: usize,
     drip_ms: u64,
+    max_connections: usize,
     layer: Layer,
     l4_mode: L4Mode,
     port: Option<u16>,
@@ -391,7 +398,8 @@ fn run_l7(
                 body: args.body.clone().map(String::into_bytes),
                 cache_bust: args.cache_bust,
             };
-            let mut engine = L7Engine::new(gate, spec).with_slo(args.slo);
+            let mut engine =
+                L7Engine::new(gate, spec).with_slo(args.slo).with_max_connections(args.max_connections);
             if let Some(p) = l7_profile(args, rate_cap, duration) {
                 engine = engine.with_profile(p);
             }
@@ -655,6 +663,7 @@ fn parse_args() -> Result<Args, String> {
     let mut cache_bust = false;
     let mut slow_connections = 100usize;
     let mut drip_ms = 10_000u64;
+    let mut max_connections = 0usize;
     let mut layer = Layer::L7;
     let mut l4_mode = L4Mode::Udp;
     let mut port = None;
@@ -726,6 +735,11 @@ fn parse_args() -> Result<Args, String> {
                 drip_ms = next_val(&mut it, "--drip-ms")?
                     .parse()
                     .map_err(|_| "invalid --drip-ms".to_string())?;
+            }
+            "--max-connections" => {
+                max_connections = next_val(&mut it, "--max-connections")?
+                    .parse()
+                    .map_err(|_| "invalid --max-connections".to_string())?;
             }
             "--l4-mode" => {
                 l4_mode = match next_val(&mut it, "--l4-mode")?.as_str() {
@@ -866,6 +880,7 @@ fn parse_args() -> Result<Args, String> {
         cache_bust,
         slow_connections,
         drip_ms,
+        max_connections,
         layer,
         l4_mode,
         port,

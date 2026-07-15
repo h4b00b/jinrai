@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
@@ -266,6 +267,13 @@ pub struct L7Engine {
     /// When true (ramp profiles only), stop as soon as a stage breaches the SLO
     /// and report the capacity knee instead of running the whole ramp.
     discover_knee: bool,
+    /// Cap on concurrent in-flight requests (≈ concurrent keep-alive
+    /// connections). `None` => unbounded (the historical behaviour: a task per
+    /// dispatch tick). `Some(n)` pins the load to at most `n` simultaneous
+    /// connections, the controlled form of keep-alive connection exhaustion:
+    /// probe a server's connection-slot / worker-pool limit by holding a fixed
+    /// number of connections busy rather than an unbounded rate-driven fan-out.
+    max_conns: Option<usize>,
 }
 
 impl L7Engine {
@@ -277,6 +285,7 @@ impl L7Engine {
             watchdog: None,
             profile: None,
             discover_knee: false,
+            max_conns: None,
         }
     }
 
@@ -308,6 +317,17 @@ impl L7Engine {
     /// reach a breach and stop cleanly, not abort.
     pub fn discover_knee(mut self, on: bool) -> Self {
         self.discover_knee = on;
+        self
+    }
+
+    /// Cap the number of concurrent in-flight requests (≈ concurrent keep-alive
+    /// connections). A dispatch tick that would exceed the cap is skipped rather
+    /// than queued, so the load holds at most `n` connections busy — the
+    /// controlled form of keep-alive connection exhaustion. `n == 0` is treated
+    /// as no cap (unbounded), matching the historical behaviour. The `--rate`
+    /// ceiling still applies on top: connections are held busy *up to* that rate.
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_conns = (n > 0).then_some(n);
         self
     }
 
@@ -437,6 +457,7 @@ impl StressModule for L7Engine {
 
         let kill = plan.kill.clone();
         let discover_knee = self.discover_knee;
+        let max_conns = self.max_conns;
         // The watchdog runs only when there is a config, a rate threshold for it
         // to evaluate (it ignores latency), AND we are not in knee-discovery — a
         // discovery run is meant to reach a breach and stop cleanly, not abort.
@@ -484,6 +505,11 @@ impl StressModule for L7Engine {
             let mut aborted = false;
             let mut knee: Option<Knee> = None;
 
+            // Concurrency cap (≈ concurrent keep-alive connections). A tick that
+            // cannot get a permit is skipped, not queued, so the load holds at
+            // most `n` connections busy. `None` => unbounded (historical).
+            let sem = max_conns.map(|n| Arc::new(Semaphore::new(n)));
+
             // Knee discovery diffs the cumulative counters across each stage
             // boundary (like the watchdog does per window). `stage_start` holds
             // the snapshot at the start of the current stage; `sustained` is the
@@ -521,6 +547,18 @@ impl StressModule for L7Engine {
                         break;
                     }
 
+                    // Concurrency cap: if all `n` connection slots are busy, skip
+                    // this tick rather than pile on. The permit is held for the
+                    // request's lifetime and released when it completes, so at
+                    // most `n` requests (connections) are ever in flight.
+                    let permit = match &sem {
+                        Some(sem) => match sem.clone().try_acquire_owned() {
+                            Ok(p) => Some(p),
+                            Err(_) => continue,
+                        },
+                        None => None,
+                    };
+
                     let client = client.clone();
                     let url = url.clone();
                     let sent = sent_w.clone();
@@ -534,6 +572,9 @@ impl StressModule for L7Engine {
                     let body = body.clone();
                     let cb_counter = cb_counter.clone();
                     tasks.spawn(async move {
+                        // Hold the connection-cap permit for the whole request;
+                        // dropping it at task end frees a slot for the next tick.
+                        let _permit = permit;
                         // Cache-buster touches ONLY the query string, so the host
                         // remains the gate-authorized, DNS-pinned one.
                         let req_url = if cache_bust {
@@ -1128,5 +1169,69 @@ mod tests {
         // thousands. A generous bound proves the clamp held without being flaky.
         assert!(report.units_sent > 0);
         assert!(report.attempts() < 100, "clamp failed: {} attempts", report.attempts());
+    }
+
+    #[test]
+    fn max_connections_caps_concurrency() {
+        use std::sync::atomic::AtomicUsize;
+        // Server: each handler bumps a live counter, records the peak, holds
+        // briefly, then responds and closes. With the engine capped at N and a
+        // high rate, the peak number of simultaneous handlers must never exceed
+        // N — uncapped, the 120ms handler + 500/s rate would reach dozens.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let (stop_srv, live_srv, peak_srv) = (stop.clone(), live.clone(), peak.clone());
+        let handle = thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let (live, peak) = (live_srv.clone(), peak_srv.clone());
+                        workers.push(thread::spawn(move || {
+                            let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(n, Ordering::SeqCst);
+                            let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+                            let mut buf = [0u8; 1024];
+                            let _ = s.read(&mut buf);
+                            thread::sleep(Duration::from_millis(120));
+                            let _ = s.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                            live.fetch_sub(1, Ordering::SeqCst);
+                        }));
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for w in workers {
+                let _ = w.join();
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let cap = 3usize;
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_max_connections(cap);
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(500),
+            duration: Duration::from_millis(700),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "should complete some requests");
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(observed > 0 && observed <= cap, "peak concurrency {observed} must be <= cap {cap}");
     }
 }
