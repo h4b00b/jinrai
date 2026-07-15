@@ -16,6 +16,31 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.14.0] — 2026-07-15
+
+Phase 7 (extension): HTTP/2 WINDOW_UPDATE & PRIORITY floods.
+
+### Added
+
+- **HTTP/2 WINDOW_UPDATE & PRIORITY floods** — `--l7-method h2-window-update`
+  (CVE-2019-9514) floods connection-level `WINDOW_UPDATE` frames on stream 0, each
+  obliging the server to process a flow-control credit update; the increment is a
+  fixed, valid non-zero value (a 0 increment is a protocol error), so the
+  connection is never torn down. `--l7-method h2-priority` (CVE-2019-9513, the
+  "Resource Loop") floods `PRIORITY` frames, each of which reshuffles the server's
+  priority tree — work it must do even though no request stream is opened. Both
+  extend the existing `H2FrameFloodEngine` and reuse `l7::h2_frames`, so they share
+  the same connection setup, rate-capped drive loop, and safety boundary as the
+  SETTINGS/PING floods. The rate cap is reinterpreted as *frames per second*;
+  `https` negotiates HTTP/2 via ALPN, `http` uses prior-knowledge h2c.
+
+### Security
+
+- The two new frame floods keep the **identical trust boundary** as the other L7
+  primitives: the URL host is authorized as a datum and pinned to a single connect
+  address, so the connection only ever reaches the gate-authorized target. Direct
+  self-tests — no source-IP spoofing, no reflection/amplification.
+
 ## [0.13.0] — 2026-07-12
 
 Phase 7 (extension): TCP data (PSH-ACK) flood.
@@ -434,7 +459,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/h4b00b/jinrai/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/h4b00b/jinrai/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/h4b00b/jinrai/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/h4b00b/jinrai/compare/v0.10.0...v0.11.0

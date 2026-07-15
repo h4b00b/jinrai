@@ -16,6 +16,8 @@ pub(crate) const TYPE_SETTINGS: u8 = 0x4;
 pub(crate) const TYPE_PING: u8 = 0x6;
 pub(crate) const TYPE_HEADERS: u8 = 0x1;
 pub(crate) const TYPE_CONTINUATION: u8 = 0x9;
+pub(crate) const TYPE_PRIORITY: u8 = 0x2;
+pub(crate) const TYPE_WINDOW_UPDATE: u8 = 0x8;
 
 /// No frame flag set. (`ACK` on SETTINGS/PING and `END_HEADERS`/`END_STREAM` on
 /// HEADERS all live in the flags byte; the framing floods deliberately set none.)
