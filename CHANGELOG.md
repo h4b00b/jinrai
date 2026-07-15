@@ -16,6 +16,42 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.20.0] — 2026-07-15
+
+L7 (extension): stream-based HTTP/2 floods — closes the in-scope HTTP/2 gap
+with three new `--l7-method` primitives in a shared `h2_stream_flood` engine.
+Unlike the connection-level control-frame floods, these open **real request
+streams** (a minimal hand-rolled HPACK request block, std-only, no new dep).
+
+### Added
+
+- **`h2-made-you-reset`** — MadeYouReset (CVE-2025-8671): open a complete request
+  (`HEADERS` with `END_STREAM`), then send a **zero-increment `WINDOW_UPDATE`** on
+  that stream. RFC 9113 §6.9 makes a zero increment a *stream* error, so the
+  **server** emits `RST_STREAM` — the client never sends `RST_STREAM` itself,
+  side-stepping Rapid-Reset mitigations while the reset streams stop counting
+  against `MAX_CONCURRENT_STREAMS`. Rate cap = reset cycles/sec.
+- **`h2-empty-data`** — empty-DATA flood (CVE-2019-9518): open a stream that does
+  not end (`HEADERS` without `END_STREAM`), then flood **zero-length `DATA`
+  frames** without `END_STREAM`; the peer does per-frame work disproportionate to
+  the near-zero bandwidth. Rate cap = frames/sec.
+- **`h2-bomb`** — HTTP/2 Bomb (CVE-2026-49975 / CVE-2026-47774): each `HEADERS`
+  frame inserts one 1-byte HPACK dynamic-table entry and then references it
+  thousands of times (1 byte each), so the server materialises thousands of header
+  entries per frame (HPACK amplification). The opening `SETTINGS` advertises
+  `INITIAL_WINDOW_SIZE = 0` so the server can never send a response body and free
+  the stream, pinning the amplified memory. Rate cap = bomb frames/sec.
+
+### Notes
+
+- All three reuse the shared raw-framing primitives in `l7::h2_frames` (extended
+  with `DATA`/`END_STREAM`/`END_HEADERS` constants) and the same safety boundary
+  as the other L7 engines: datum-authorized, pinned connect address, `https` via
+  ALPN `h2` / `http` via prior-knowledge h2c, bounded by duration + rate cap +
+  kill switch. The amplification is **server-side memory/CPU** from bytes the
+  client really sends from its real address — no spoofing, no network reflection.
+  `forbid(unsafe_code)` retained; no new dependency.
+
 ## [0.19.0] — 2026-07-15
 
 L7 (extension): connection-concurrency cap for the fast request flood — the

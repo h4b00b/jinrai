@@ -98,6 +98,9 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `h2-ping` | HTTP/2 | flood `PING` frames the server must answer with a PONG (CVE-2019-9512); rate cap = frames/sec |
 | `h2-window-update` | HTTP/2 | flood connection-level `WINDOW_UPDATE` frames the server must process (CVE-2019-9514); rate cap = frames/sec |
 | `h2-priority` | HTTP/2 | flood `PRIORITY` frames that reshuffle the server's priority tree (CVE-2019-9513, "Resource Loop"); rate cap = frames/sec |
+| `h2-made-you-reset` | HTTP/2 | complete request then a zero-increment `WINDOW_UPDATE` so the **server** resets the stream (CVE-2025-8671, "MadeYouReset") — evades Rapid-Reset mitigations; rate cap = reset cycles/sec |
+| `h2-empty-data` | HTTP/2 | open a stream, then flood zero-length `DATA` frames without `END_STREAM` (CVE-2019-9518); rate cap = frames/sec |
+| `h2-bomb` | HTTP/2 | HPACK 1-byte-reference header amplification + `INITIAL_WINDOW_SIZE=0` so the amplified memory stays pinned (CVE-2026-49975, "HTTP/2 Bomb"); rate cap = bomb frames/sec |
 
 For slow modes the rate cap means *connections opened per second*; `--slow-connections`
 is the concurrent ceiling and `--drip-ms` the per-tick interval (the keep-alive write

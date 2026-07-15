@@ -12,6 +12,7 @@
 pub(crate) const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// HTTP/2 frame type bytes (RFC 7540 §6).
+pub(crate) const TYPE_DATA: u8 = 0x0;
 pub(crate) const TYPE_SETTINGS: u8 = 0x4;
 pub(crate) const TYPE_PING: u8 = 0x6;
 pub(crate) const TYPE_HEADERS: u8 = 0x1;
@@ -22,6 +23,11 @@ pub(crate) const TYPE_WINDOW_UPDATE: u8 = 0x8;
 /// No frame flag set. (`ACK` on SETTINGS/PING and `END_HEADERS`/`END_STREAM` on
 /// HEADERS all live in the flags byte; the framing floods deliberately set none.)
 pub(crate) const FLAG_NONE: u8 = 0x0;
+/// HEADERS/DATA `END_STREAM` flag (RFC 7540 §6.1/§6.2): the client half of the
+/// stream is finished — for HEADERS this makes it a complete request.
+pub(crate) const FLAG_END_STREAM: u8 = 0x1;
+/// HEADERS/CONTINUATION `END_HEADERS` flag: the header block is complete.
+pub(crate) const FLAG_END_HEADERS: u8 = 0x4;
 
 /// Encode a 9-byte HTTP/2 frame header (RFC 7540 §4.1) followed by `payload`,
 /// appending to `out`. `len` is taken from the payload; the 24-bit length field
