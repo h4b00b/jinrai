@@ -73,6 +73,9 @@ pub use h2_continuation::H2ContinuationEngine;
 pub mod h2_frame_flood;
 pub use h2_frame_flood::{H2FrameFloodEngine, H2FrameKind};
 
+pub mod h2_stream_flood;
+pub use h2_stream_flood::{H2StreamFloodEngine, H2StreamKind};
+
 pub mod tls_flood;
 pub use tls_flood::TlsHandshakeEngine;
 

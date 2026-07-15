@@ -19,9 +19,9 @@ use jinrai_core::{
 };
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
-    H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, L7Engine, L7Method,
-    L7SlowEngine, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine,
-    WatchdogConfig,
+    H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
+    H2StreamKind, L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode,
+    TlsHandshakeEngine, WatchdogConfig,
 };
 use jinrai_metrics::{AuditEvent, AuditLog};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
@@ -116,6 +116,20 @@ OPTIONS:
                                                  (CVE-2019-9513, Resource Loop):
                                                  frames that reshuffle the priority
                                                  tree; all four rate cap = frames/sec
+                            h2-made-you-reset    HTTP/2 MadeYouReset (CVE-2025-8671):
+                                                 complete request then a 0-increment
+                                                 WINDOW_UPDATE so the SERVER resets
+                                                 the stream (evades rapid-reset
+                                                 mitigations); rate cap = cycles/sec
+                            h2-empty-data        HTTP/2 empty-DATA flood
+                                                 (CVE-2019-9518): open a stream, then
+                                                 flood 0-length DATA frames without
+                                                 END_STREAM; rate cap = frames/sec
+                            h2-bomb              HTTP/2 Bomb (CVE-2026-49975): HPACK
+                                                 1-byte-reference header amplification
+                                                 + zero initial window so the
+                                                 amplified memory stays pinned; rate
+                                                 cap = bomb frames/sec
                           For slow modes the rate cap is connections-opened/sec,
                           and https targets are supported (slow-TLS; the handshake
                           accepts any server certificate — see README). h2-rapid-reset
@@ -203,6 +217,8 @@ enum L7Kind {
     TlsHandshake,
     /// HTTP/2 control-frame flood (SETTINGS / PING / WINDOW_UPDATE / PRIORITY).
     H2Frame(H2FrameKind),
+    /// HTTP/2 stream-based flood (MadeYouReset / empty-DATA / HTTP/2 Bomb).
+    H2Stream(H2StreamKind),
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -437,6 +453,10 @@ fn run_l7(
         }
         L7Kind::H2Frame(kind) => {
             let engine = H2FrameFloodEngine::new(gate, url.clone(), kind);
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
+        L7Kind::H2Stream(kind) => {
+            let engine = H2StreamFloodEngine::new(gate, url.clone(), kind);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
     };
@@ -715,11 +735,15 @@ fn parse_args() -> Result<Args, String> {
                     "h2-ping" => L7Kind::H2Frame(H2FrameKind::Ping),
                     "h2-window-update" => L7Kind::H2Frame(H2FrameKind::WindowUpdate),
                     "h2-priority" => L7Kind::H2Frame(H2FrameKind::Priority),
+                    "h2-made-you-reset" => L7Kind::H2Stream(H2StreamKind::MadeYouReset),
+                    "h2-empty-data" => L7Kind::H2Stream(H2StreamKind::EmptyData),
+                    "h2-bomb" => L7Kind::H2Stream(H2StreamKind::Bomb),
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
                              slow-read|h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|\
-                             h2-ping|h2-window-update|h2-priority)"
+                             h2-ping|h2-window-update|h2-priority|h2-made-you-reset|h2-empty-data|\
+                             h2-bomb)"
                         ))
                     }
                 }
