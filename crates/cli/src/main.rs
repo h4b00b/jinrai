@@ -78,9 +78,13 @@ OPTIONS:
                                                  NOP-padded) — stresses the target's
                                                  option parser / SACK+timestamp
                                                  state (same raw-socket constraints)
-                            icmp                 L3 ICMPv4 echo-request flood;
-                                                 needs CAP_NET_RAW/root, IPv4-only,
-                                                 real source IP, no --port needed
+                            icmp | icmp-timestamp | icmp-address-mask
+                                                 L3 ICMPv4 query floods (echo type 8,
+                                                 timestamp type 13, address-mask
+                                                 type 17) — each forces the target to
+                                                 answer directly; needs CAP_NET_RAW/
+                                                 root, IPv4-only, real source IP (never
+                                                 spoofed), no --port needed
     --l7-method <METHOD>  L7 primitive (default: get). One of:
                             get | post | head   fast request flood
                             slowloris            slow partial headers (Slowloris)
@@ -548,10 +552,10 @@ fn run_l4(
         return Err("--layer l3/l4 requires at least one --target <IP>".into());
     }
     // ICMP is portless; every other mode targets a port.
-    let port = if args.l4_mode == L4Mode::Icmp {
+    let port = if args.l4_mode.is_icmp() {
         args.port.unwrap_or(0)
     } else {
-        args.port.ok_or("--layer l3/l4 requires --port <N> (except --l4-mode icmp)")?
+        args.port.ok_or("--layer l3/l4 requires --port <N> (except the icmp* modes)")?
     };
 
     let authorized = match gate.authorize_all(args.targets.iter().copied()) {
@@ -733,11 +737,13 @@ fn parse_args() -> Result<Args, String> {
                     "data" => L4Mode::Data,
                     "tcp-options" => L4Mode::TcpOptions,
                     "icmp" => L4Mode::Icmp,
+                    "icmp-timestamp" => L4Mode::IcmpTimestamp,
+                    "icmp-address-mask" => L4Mode::IcmpAddressMask,
                     other => {
                         return Err(format!(
                             "unknown --l4-mode: {other} \
                              (want udp|tcp|syn|ack|fin|rst|urg|cwr|ece|syn-fin|syn-rst|\
-                              xmas|null|data|tcp-options|icmp)"
+                              xmas|null|data|tcp-options|icmp|icmp-timestamp|icmp-address-mask)"
                         ))
                     }
                 }

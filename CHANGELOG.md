@@ -16,6 +16,28 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.17.0] — 2026-07-15
+
+Phase 7 (extension): ICMP timestamp + address-mask query floods (L3).
+
+### Added
+
+- **ICMP timestamp-request flood** — `--l4-mode icmp-timestamp` sends ICMPv4
+  timestamp requests (type 13): a 20-byte message carrying three 32-bit
+  timestamps (originate set from the per-packet sequence, receive/transmit zero),
+  forcing the target's ICMP timestamp handler and probing hosts that answer — and
+  potentially leak clock state — under load.
+- **ICMP address-mask-request flood** — `--l4-mode icmp-address-mask` sends ICMPv4
+  address-mask requests (type 17): a 12-byte message with a zero mask field,
+  forcing the address-mask handler.
+- Both extend the existing L3 echo flood: they are **query** messages the target
+  answers directly (never forged error/redirect/router messages, which only make
+  sense spoofed and remain out of scope). The ICMP builder was generalised to
+  emit echo/timestamp/address-mask from one shared code path (same `IPPROTO_ICMP`
+  raw socket, kernel-supplied IP header with the host's **real** source address —
+  no spoofing — IPv4-only, `CAP_NET_RAW`, portless, gated behind `--ack-l34-lab`
+  + the allowlist).
+
 ## [0.16.0] — 2026-07-15
 
 Phase 7 (extension): extended anomalous TCP flag floods (L4).
@@ -503,7 +525,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/h4b00b/jinrai/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/h4b00b/jinrai/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/h4b00b/jinrai/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/h4b00b/jinrai/compare/v0.13.0...v0.14.0
