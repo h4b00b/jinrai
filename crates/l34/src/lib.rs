@@ -97,6 +97,40 @@ pub enum L4Mode {
     /// ICMP echo-request flood (raw socket, L3). IPv4-only; source is the
     /// kernel-assigned real address (the kernel builds the IP header).
     Icmp,
+    /// ICMP timestamp-request flood (type 13, raw socket, L3). Same machinery as
+    /// the echo flood; exercises the target's timestamp handler instead.
+    IcmpTimestamp,
+    /// ICMP address-mask-request flood (type 17, raw socket, L3). Exercises the
+    /// target's address-mask handler.
+    IcmpAddressMask,
+}
+
+/// Which ICMPv4 *query* message an ICMP flood mode emits. All three are messages
+/// the target host answers directly (like a ping) — never forged error, redirect,
+/// or router messages, which are only meaningful spoofed as if from a gateway and
+/// are out of scope by design. They differ only in the ICMP type byte and the
+/// fixed body that follows the identifier/sequence header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IcmpQuery {
+    /// Echo request (type 8) — the classic ping flood, carries an arbitrary body.
+    Echo,
+    /// Timestamp request (type 13) — a 20-byte message with three 32-bit
+    /// timestamps; forces the ICMP timestamp handler and can leak clock state.
+    Timestamp,
+    /// Address-mask request (type 17) — a 12-byte message with a 4-byte mask
+    /// field; forces the address-mask handler.
+    AddressMask,
+}
+
+impl IcmpQuery {
+    /// The ICMPv4 type byte; the code byte is 0 for every query request.
+    fn type_byte(self) -> u8 {
+        match self {
+            IcmpQuery::Echo => 8,
+            IcmpQuery::Timestamp => 13,
+            IcmpQuery::AddressMask => 17,
+        }
+    }
 }
 
 /// The TCP control flags a raw-TCP flood sets on each crafted packet. All raw-TCP
@@ -151,7 +185,24 @@ impl L4Mode {
             L4Mode::Data => "tcp-data-flood",
             L4Mode::TcpOptions => "tcp-options-flood",
             L4Mode::Icmp => "icmp-echo-flood",
+            L4Mode::IcmpTimestamp => "icmp-timestamp-flood",
+            L4Mode::IcmpAddressMask => "icmp-address-mask-flood",
         }
+    }
+
+    /// The ICMP query message this mode emits, or `None` for the non-ICMP modes.
+    fn icmp_query(self) -> Option<IcmpQuery> {
+        match self {
+            L4Mode::Icmp => Some(IcmpQuery::Echo),
+            L4Mode::IcmpTimestamp => Some(IcmpQuery::Timestamp),
+            L4Mode::IcmpAddressMask => Some(IcmpQuery::AddressMask),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode is one of the L3 ICMP query floods.
+    pub fn is_icmp(self) -> bool {
+        self.icmp_query().is_some()
     }
 
     /// The TCP flags for a raw-TCP flood mode, or `None` for every other mode
@@ -173,8 +224,14 @@ impl L4Mode {
             // Xmas lights FIN+PSH+URG at once; NULL sets nothing at all.
             L4Mode::Xmas => Some(TcpFlags { fin: true, psh: true, urg: true, ..TcpFlags::NONE }),
             L4Mode::Null => Some(TcpFlags::NONE),
-            // Data flood uses the OS TCP stack (no crafted packet), like TcpConnect.
-            L4Mode::Udp | L4Mode::TcpConnect | L4Mode::Data | L4Mode::Icmp => None,
+            // Data flood uses the OS TCP stack (no crafted packet), like TcpConnect;
+            // the ICMP floods are not TCP at all.
+            L4Mode::Udp
+            | L4Mode::TcpConnect
+            | L4Mode::Data
+            | L4Mode::Icmp
+            | L4Mode::IcmpTimestamp
+            | L4Mode::IcmpAddressMask => None,
         }
     }
 
@@ -192,7 +249,7 @@ impl L4Mode {
     fn raw_socket_protocol(self) -> Option<Protocol> {
         if self.raw_tcp_flags().is_some() {
             Some(Protocol::from(IPPROTO_RAW))
-        } else if self == L4Mode::Icmp {
+        } else if self.is_icmp() {
             Some(Protocol::ICMPV4)
         } else {
             None
@@ -201,7 +258,7 @@ impl L4Mode {
 
     /// Which OSI layer this mode drives: ICMP is L3, everything else L4.
     fn layer(self) -> Layer {
-        if self == L4Mode::Icmp {
+        if self.is_icmp() {
             Layer::L3
         } else {
             Layer::L4
@@ -353,7 +410,7 @@ impl L34Engine {
 
         let targets_suffix = format!("({} target{})", ips.len(), if ips.len() == 1 { "" } else { "s" });
         // ICMP has no port; every other mode targets a port.
-        let label = if self.config.mode == L4Mode::Icmp {
+        let label = if self.config.mode.is_icmp() {
             format!("L3 {} {targets_suffix}", self.config.mode.label())
         } else {
             format!("L4 {} -> port {} {targets_suffix}", self.config.mode.label(), self.config.port)
@@ -433,10 +490,12 @@ enum Sender {
         srcs: HashMap<IpAddr, Ipv4Addr>,
         counter: u32,
     },
-    /// Raw ICMPv4 echo-request flood. The kernel supplies the IP header (real
-    /// source address); we craft the ICMP echo message + checksum. `id` tags this
-    /// run; `counter` is the per-packet sequence number. `payload` is a fixed body.
-    Icmp { raw: Socket, id: u16, counter: u16, payload: Vec<u8> },
+    /// Raw ICMPv4 query flood (echo / timestamp / address-mask). The kernel
+    /// supplies the IP header (real source address); we craft the ICMP message +
+    /// checksum. `query` selects the message type; `id` tags this run; `counter`
+    /// is the per-packet sequence number; `payload` is the echo body (ignored by
+    /// the fixed-format timestamp and address-mask messages).
+    Icmp { raw: Socket, query: IcmpQuery, id: u16, counter: u16, payload: Vec<u8> },
 }
 
 /// UDP payloads above this are rejected to avoid accidental fragmentation.
@@ -469,14 +528,16 @@ impl Sender {
                 timeout: Duration::from_millis(500),
                 idx: 0,
             }),
-            L4Mode::Icmp => {
+            L4Mode::Icmp | L4Mode::IcmpTimestamp | L4Mode::IcmpAddressMask => {
+                let query = mode.icmp_query().expect("ICMP mode without a query kind");
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
                     .map_err(|e| L34Error::RawSocket(e.to_string()))?;
-                // Payload capped like UDP to avoid accidental fragmentation.
+                // Payload capped like UDP to avoid accidental fragmentation (echo
+                // only; the timestamp/address-mask messages are fixed-length).
                 let payload = vec![0u8; payload_size.min(MAX_UDP_PAYLOAD)];
                 // Identifier from the PID, so replies (if any) are attributable.
                 let id = std::process::id() as u16;
-                Ok(Sender::Icmp { raw, id, counter: 0, payload })
+                Ok(Sender::Icmp { raw, query, id, counter: 0, payload })
             }
             other => {
                 // SYN/ACK/FIN/RST/Xmas/NULL: all raw-TCP flag floods share one setup.
@@ -568,14 +629,14 @@ impl Sender {
                     .map_err(|e| L34Error::Setup(e.to_string()))
             }
 
-            Sender::Icmp { raw, id, counter, payload } => {
+            Sender::Icmp { raw, query, id, counter, payload } => {
                 let dst = match ip {
                     IpAddr::V4(v4) => v4,
                     // check_targets refuses IPv6 for ICMP up front; this is defensive.
                     IpAddr::V6(_) => return Err(L34Error::Ipv6RawTcpUnsupported(ip)),
                 };
                 *counter = counter.wrapping_add(1);
-                let packet = build_icmp_echo(*id, *counter, payload);
+                let packet = build_icmp_query(*query, *id, *counter, payload);
                 // Port is irrelevant for ICMP; the kernel builds the IP header from
                 // the real source address (IPPROTO_ICMP), so there is no spoof path.
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
@@ -722,17 +783,32 @@ fn build_tcp_options_syn(
     Ok(out)
 }
 
-/// Build an ICMPv4 echo-request message (type 8, code 0) with its checksum. The
-/// kernel prepends the IPv4 header (real source address), so we only craft the
-/// ICMP message itself: header + `payload`.
-fn build_icmp_echo(id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
-    let mut pkt = Vec::with_capacity(8 + payload.len());
-    pkt.push(8); // type: echo request
-    pkt.push(0); // code
+/// Build an ICMPv4 query-request message (echo / timestamp / address-mask) with
+/// its checksum. The kernel prepends the IPv4 header (real source address), so we
+/// only craft the ICMP message itself: the shared 8-byte header (type, code 0,
+/// checksum, identifier, sequence) followed by the per-type body. Echo carries the
+/// arbitrary `payload`; timestamp appends three 32-bit timestamps (originate set,
+/// receive/transmit zero for a request); address-mask appends a zero 4-byte mask.
+fn build_icmp_query(query: IcmpQuery, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(20 + payload.len());
+    pkt.push(query.type_byte());
+    pkt.push(0); // code is 0 for every query request
     pkt.extend_from_slice(&[0, 0]); // checksum placeholder
     pkt.extend_from_slice(&id.to_be_bytes());
     pkt.extend_from_slice(&seq.to_be_bytes());
-    pkt.extend_from_slice(payload);
+    match query {
+        IcmpQuery::Echo => pkt.extend_from_slice(payload),
+        IcmpQuery::Timestamp => {
+            // Originate carries the per-packet sequence so successive packets are
+            // not byte-identical; receive/transmit are zero in a request.
+            pkt.extend_from_slice(&(seq as u32).to_be_bytes()); // originate
+            pkt.extend_from_slice(&[0, 0, 0, 0]); // receive
+            pkt.extend_from_slice(&[0, 0, 0, 0]); // transmit
+        }
+        IcmpQuery::AddressMask => {
+            pkt.extend_from_slice(&[0, 0, 0, 0]); // address mask, zero in a request
+        }
+    }
     let ck = icmp_checksum(&pkt);
     pkt[2..4].copy_from_slice(&ck.to_be_bytes());
     pkt
@@ -961,16 +1037,9 @@ mod tests {
         assert_eq!(tcp.data_offset(), 5, "minimum data offset when there are no options");
     }
 
-    #[test]
-    fn icmp_echo_is_well_formed_with_valid_checksum() {
-        let pkt = build_icmp_echo(0x1234, 7, b"ping");
-        assert_eq!(pkt[0], 8, "type must be echo request");
-        assert_eq!(pkt[1], 0, "code must be 0");
-        assert_eq!(&pkt[4..6], &0x1234u16.to_be_bytes(), "identifier");
-        assert_eq!(&pkt[6..8], &7u16.to_be_bytes(), "sequence");
-        assert_eq!(&pkt[8..], b"ping", "payload");
-        // A correct Internet checksum makes the one's-complement sum of the whole
-        // message equal 0xFFFF (i.e. the checksum verifies).
+    /// One's-complement sum of a whole ICMP message must be 0xFFFF for the
+    /// checksum to verify.
+    fn icmp_checksum_verifies(pkt: &[u8]) -> bool {
         let mut sum = 0u32;
         for c in pkt.chunks(2) {
             let word = if c.len() == 2 { u16::from_be_bytes([c[0], c[1]]) } else { (c[0] as u16) << 8 };
@@ -979,7 +1048,56 @@ mod tests {
         while (sum >> 16) != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
-        assert_eq!(sum as u16, 0xFFFF, "checksum must verify");
+        sum as u16 == 0xFFFF
+    }
+
+    #[test]
+    fn icmp_echo_is_well_formed_with_valid_checksum() {
+        let pkt = build_icmp_query(IcmpQuery::Echo, 0x1234, 7, b"ping");
+        assert_eq!(pkt[0], 8, "type must be echo request");
+        assert_eq!(pkt[1], 0, "code must be 0");
+        assert_eq!(&pkt[4..6], &0x1234u16.to_be_bytes(), "identifier");
+        assert_eq!(&pkt[6..8], &7u16.to_be_bytes(), "sequence");
+        assert_eq!(&pkt[8..], b"ping", "payload");
+        assert!(icmp_checksum_verifies(&pkt), "checksum must verify");
+    }
+
+    #[test]
+    fn icmp_timestamp_is_a_20_byte_message_with_valid_checksum() {
+        let pkt = build_icmp_query(IcmpQuery::Timestamp, 0xBEEF, 9, b"ignored");
+        assert_eq!(pkt.len(), 20, "timestamp message is header + 3x32-bit timestamps");
+        assert_eq!(pkt[0], 13, "type must be timestamp request");
+        assert_eq!(pkt[1], 0, "code must be 0");
+        assert_eq!(&pkt[8..12], &9u32.to_be_bytes(), "originate timestamp = sequence");
+        assert_eq!(&pkt[12..20], &[0u8; 8], "receive/transmit zero in a request");
+        assert!(icmp_checksum_verifies(&pkt), "checksum must verify");
+    }
+
+    #[test]
+    fn icmp_address_mask_is_a_12_byte_message_with_valid_checksum() {
+        let pkt = build_icmp_query(IcmpQuery::AddressMask, 0x0042, 3, b"ignored");
+        assert_eq!(pkt.len(), 12, "address-mask message is header + 4-byte mask");
+        assert_eq!(pkt[0], 17, "type must be address-mask request");
+        assert_eq!(pkt[1], 0, "code must be 0");
+        assert_eq!(&pkt[8..12], &[0u8; 4], "mask is zero in a request");
+        assert!(icmp_checksum_verifies(&pkt), "checksum must verify");
+    }
+
+    #[test]
+    fn all_icmp_query_modes_are_l3_raw_and_carry_no_tcp_flags() {
+        for (mode, name, ty) in [
+            (L4Mode::Icmp, "icmp-echo-flood", 8u8),
+            (L4Mode::IcmpTimestamp, "icmp-timestamp-flood", 13),
+            (L4Mode::IcmpAddressMask, "icmp-address-mask-flood", 17),
+        ] {
+            let engine = L34Engine::new(L34Config { mode, port: 0, payload_size: 32 });
+            assert_eq!(engine.layer(), Layer::L3, "{mode:?} is L3");
+            assert_eq!(engine.name(), name);
+            assert!(mode.is_icmp(), "{mode:?} is an ICMP mode");
+            assert!(mode.needs_raw_socket(), "{mode:?} needs a raw socket");
+            assert_eq!(mode.raw_tcp_flags(), None, "{mode:?} carries no TCP flags");
+            assert_eq!(mode.icmp_query().map(|q| q.type_byte()), Some(ty));
+        }
     }
 
     #[test]
@@ -1080,6 +1198,8 @@ mod tests {
             L4Mode::Xmas,
             L4Mode::Null,
             L4Mode::Icmp,
+            L4Mode::IcmpTimestamp,
+            L4Mode::IcmpAddressMask,
         ] {
             let t = authorized_ip("::1/128", "::1");
             let engine = L34Engine::new(L34Config { mode, port: 9, payload_size: 16 });

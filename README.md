@@ -154,7 +154,8 @@ jinrai --layer l7 --allow '*.staging.internal' \
 an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp`/`data`
 need no privilege (and `tcp`/`data` work over IPv4 **and** IPv6); the raw-socket
 modes (`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-fin`/`syn-rst`/`xmas`/`null`/
-`tcp-options`/`icmp`) need `CAP_NET_RAW`/root and are IPv4-only:
+`tcp-options`/`icmp`/`icmp-timestamp`/`icmp-address-mask`) need `CAP_NET_RAW`/root
+and are IPv4-only:
 
 ```sh
 jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 \
@@ -195,6 +196,19 @@ IPv4-only constraints as the flag floods:
 ```sh
 jinrai --layer l4 --l4-mode tcp-options --allow 10.0.0.0/8 \
        --target 10.1.2.3 --port 80 --ack-l34-lab --rate 1000 --duration 10
+```
+
+The `icmp` modes are **L3 ICMPv4 query floods** — each sends a request message the
+target host answers directly (never a forged error/redirect/router message):
+`icmp` sends echo requests (type 8, the classic ping flood), `icmp-timestamp`
+sends timestamp requests (type 13), and `icmp-address-mask` sends address-mask
+requests (type 17), exercising the target's different ICMP handlers. They are
+portless; the kernel supplies the IP header, so the source is always the host's
+real address (no spoofing):
+
+```sh
+jinrai --layer l3 --l4-mode icmp-timestamp --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --ack-l34-lab --rate 1000 --duration 10
 ```
 
 A target outside every `--allow` block aborts the whole run. There is **no
