@@ -88,8 +88,14 @@ OPTIONS:
                                                  (CVE-2019-9515): empty SETTINGS
                                                  frames the server must ACK
                             h2-ping              HTTP/2 PING flood (CVE-2019-9512):
-                                                 PING frames the server must PONG;
-                                                 both rate cap = frames/sec
+                                                 PING frames the server must PONG
+                            h2-window-update     HTTP/2 WINDOW_UPDATE flood
+                                                 (CVE-2019-9514): connection-level
+                                                 flow-control updates on stream 0
+                            h2-priority          HTTP/2 PRIORITY flood
+                                                 (CVE-2019-9513, Resource Loop):
+                                                 frames that reshuffle the priority
+                                                 tree; all four rate cap = frames/sec
                           For slow modes the rate cap is connections-opened/sec,
                           and https targets are supported (slow-TLS; the handshake
                           accepts any server certificate — see README). h2-rapid-reset
@@ -167,7 +173,7 @@ enum L7Kind {
     Continuation,
     /// TLS handshake flood (THC-SSL-DoS: full handshake, immediate drop, repeat).
     TlsHandshake,
-    /// HTTP/2 control-frame flood (SETTINGS / PING).
+    /// HTTP/2 control-frame flood (SETTINGS / PING / WINDOW_UPDATE / PRIORITY).
     H2Frame(H2FrameKind),
 }
 
@@ -675,10 +681,13 @@ fn parse_args() -> Result<Args, String> {
                     "tls-handshake" => L7Kind::TlsHandshake,
                     "h2-settings" => L7Kind::H2Frame(H2FrameKind::Settings),
                     "h2-ping" => L7Kind::H2Frame(H2FrameKind::Ping),
+                    "h2-window-update" => L7Kind::H2Frame(H2FrameKind::WindowUpdate),
+                    "h2-priority" => L7Kind::H2Frame(H2FrameKind::Priority),
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
-                             h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|h2-ping)"
+                             h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|h2-ping|\
+                             h2-window-update|h2-priority)"
                         ))
                     }
                 }

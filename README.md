@@ -95,6 +95,8 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `tls-handshake` | TLS | full TLS handshake then drop, repeated concurrently (THC-SSL-DoS); https-only; rate cap = handshakes/sec |
 | `h2-settings` | HTTP/2 | flood empty `SETTINGS` frames the server must ACK (CVE-2019-9515); rate cap = frames/sec |
 | `h2-ping` | HTTP/2 | flood `PING` frames the server must answer with a PONG (CVE-2019-9512); rate cap = frames/sec |
+| `h2-window-update` | HTTP/2 | flood connection-level `WINDOW_UPDATE` frames the server must process (CVE-2019-9514); rate cap = frames/sec |
+| `h2-priority` | HTTP/2 | flood `PRIORITY` frames that reshuffle the server's priority tree (CVE-2019-9513, "Resource Loop"); rate cap = frames/sec |
 
 For slow modes the rate cap means *connections opened per second*; `--slow-connections`
 is the concurrent ceiling and `--drip-ms` the keep-alive write interval. Slow mode is
