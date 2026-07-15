@@ -153,8 +153,8 @@ jinrai --layer l7 --allow '*.staging.internal' \
 **L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,
 an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp`/`data`
 need no privilege (and `tcp`/`data` work over IPv4 **and** IPv6); the raw-socket
-modes (`syn`/`ack`/`fin`/`rst`/`xmas`/`null`/`icmp`) need `CAP_NET_RAW`/root and
-are IPv4-only:
+modes (`syn`/`ack`/`fin`/`rst`/`xmas`/`null`/`tcp-options`/`icmp`) need
+`CAP_NET_RAW`/root and are IPv4-only:
 
 ```sh
 jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 \
@@ -180,6 +180,18 @@ application buffers rather than just its accept backlog. No privilege needed:
 jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 \
        --target 10.1.2.3 --port 80 --ack-l34-lab \
        --payload-size 4096 --rate 500 --duration 30
+```
+
+The `tcp-options` mode is a **TCP-options bomb**: a raw SYN flood whose every
+packet carries the full 40-byte maximum of TCP options (MSS + SACK-permitted +
+timestamp + window scale, NOP-padded to the limit). Each SYN forces the target's
+TCP stack to walk a maximal option block and allocate SACK/timestamp state,
+amplifying the per-SYN cost over a bare SYN. Same raw-socket / real-source /
+IPv4-only constraints as the flag floods:
+
+```sh
+jinrai --layer l4 --l4-mode tcp-options --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --port 80 --ack-l34-lab --rate 1000 --duration 10
 ```
 
 A target outside every `--allow` block aborts the whole run. There is **no
