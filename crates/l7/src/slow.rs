@@ -11,6 +11,11 @@
 //!   - [`SlowMode::Body`] — **slow body** (R-U-Dead-Yet style): send complete
 //!     headers with a large `Content-Length`, then trickle the body one byte per
 //!     tick, never reaching the declared length. Exercises the body read timeout.
+//!   - [`SlowMode::Read`] — **slow read**: send a *complete* request, then drain
+//!     the response one small chunk per tick while advertising a shrunken receive
+//!     window (`SO_RCVBUF`), so the server's send buffer stays full and it cannot
+//!     retire the connection. Exercises the response-write / send timeout — the
+//!     read-side mirror of slow body.
 //!
 //! ## Same safety boundary as the fast engine
 //!
@@ -34,12 +39,11 @@
 //! keeps reqwest's normal certificate verification.
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -58,6 +62,11 @@ pub enum SlowMode {
     Headers,
     /// Slow body (RUDY): full headers, oversized `Content-Length`, trickled body.
     Body,
+    /// Slow read: send a *complete* request, then drain the response one small
+    /// chunk per tick with a shrunken receive buffer, so the server cannot flush
+    /// its response and holds the connection (and its send buffer) open. This is
+    /// the read-side mirror of [`SlowMode::Body`] (slowhttptest's "slow read").
+    Read,
 }
 
 impl SlowMode {
@@ -65,7 +74,13 @@ impl SlowMode {
         match self {
             SlowMode::Headers => "l7-slowloris",
             SlowMode::Body => "l7-slowbody",
+            SlowMode::Read => "l7-slowread",
         }
+    }
+
+    /// Whether this mode reads the response (slow-read) rather than only writing.
+    fn reads(self) -> bool {
+        matches!(self, SlowMode::Read)
     }
 }
 
@@ -270,10 +285,21 @@ impl StressModule for L7SlowEngine {
     }
 }
 
-/// Open one connection and keep it half-open until the deadline or kill. Counts
-/// a successful connect+opening-write as `established`; a failed connect as an
-/// `error`. A mid-run write failure (the server timing us out) is the *expected*
-/// end of a held connection, not an error — we simply stop.
+/// Advertised receive-buffer size for slow-read connections. Set as small as the
+/// OS allows so even a modest response cannot be fully buffered: the server's
+/// send buffer stays full and it keeps the connection (and a worker) pinned.
+/// Best-effort — kernels round up to their own floor.
+const SLOW_READ_RCVBUF: usize = 512;
+
+/// Bytes drained per tick in slow-read mode. Small enough that a real response
+/// is retired over many ticks, keeping the server writing for the whole run.
+const SLOW_READ_CHUNK: usize = 64;
+
+/// Open one connection and keep it busy-but-unfinished until the deadline or
+/// kill. Counts a successful connect + opening write as `established`; a failed
+/// connect/handshake as an `error`. A mid-run I/O failure (the server timing us
+/// out or closing) is the *expected* end of a held connection, not an error — we
+/// simply stop.
 #[allow(clippy::too_many_arguments)]
 async fn hold_connection(
     addr: SocketAddr,
@@ -296,26 +322,52 @@ async fn hold_connection(
         }
     };
 
-    // For https, complete the TLS handshake and dribble inside the session; for
-    // http, write plaintext. Both are write-only sinks (slow modes never read a
-    // response), so we box either as one `AsyncWrite`. A failed handshake counts
-    // as a connect error, same as a failed TCP connect.
-    let mut stream: Pin<Box<dyn AsyncWrite + Send>> = match tls {
-        None => Box::pin(tcp),
+    // Slow-read: shrink the receive window *before* any bytes flow so the server
+    // can never flush its whole response. Best-effort; ignore an unsupported OS.
+    if mode.reads() {
+        let _ = socket2::SockRef::from(&tcp).set_recv_buffer_size(SLOW_READ_RCVBUF);
+    }
+
+    // For https, complete the TLS handshake and drive the slow exchange inside
+    // the session; for http, drive it in plaintext. `drive_connection` is generic
+    // over the concrete stream (TcpStream or TlsStream) so no trait-object boxing
+    // is needed. A failed handshake counts as a connect error.
+    match tls {
+        None => drive_connection(tcp, target, host_header, mode, drip, deadline, kill, &established, &errors).await,
         Some(t) => {
             let handshake =
                 tokio::time::timeout(Duration::from_secs(10), t.connector.connect(t.server_name, tcp));
             match handshake.await {
-                Ok(Ok(s)) => Box::pin(s),
+                Ok(Ok(s)) => {
+                    drive_connection(s, target, host_header, mode, drip, deadline, kill, &established, &errors).await
+                }
                 _ => {
                     errors.fetch_add(1, Ordering::Relaxed);
-                    return;
                 }
             }
         }
-    };
+    }
+}
 
-    // Opening bytes: a request that is deliberately never completed.
+/// Write the opening request for `mode`, then sustain the connection one tick at
+/// a time until the deadline/kill. Generic over any concrete async stream so both
+/// plaintext TCP and TLS sessions share one code path (no boxing / dynamic
+/// dispatch). On the opening-write failure it records an `error`; a later I/O
+/// failure ends the connection quietly (the server's timeout is the point).
+#[allow(clippy::too_many_arguments)]
+async fn drive_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    target: Arc<String>,
+    host_header: Arc<String>,
+    mode: SlowMode,
+    drip: Duration,
+    deadline: Instant,
+    kill: jinrai_safety::KillSwitch,
+    established: &AtomicU64,
+    errors: &AtomicU64,
+) {
+    // Opening bytes. Headers/Body deliberately never complete the request;
+    // Read sends a *complete* request and then drains the response slowly.
     let opening = match mode {
         SlowMode::Headers => {
             // Request line + Host, but NO terminating "\r\n" — the server keeps
@@ -330,6 +382,14 @@ async fn hold_connection(
                  Content-Length: 1048576\r\n\r\n"
             )
         }
+        SlowMode::Read => {
+            // A fully-formed GET: the request completes so the server *starts*
+            // sending a response, which we then refuse to drain quickly.
+            format!(
+                "GET {target} HTTP/1.1\r\nHost: {host_header}\r\n\
+                 User-Agent: jinrai\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n"
+            )
+        }
     };
     if stream.write_all(opening.as_bytes()).await.is_err() {
         errors.fetch_add(1, Ordering::Relaxed);
@@ -338,18 +398,22 @@ async fn hold_connection(
     established.fetch_add(1, Ordering::Relaxed);
 
     let mut n = 0u64;
+    let mut buf = [0u8; SLOW_READ_CHUNK];
     while Instant::now() < deadline && !kill.is_tripped() {
         tokio::time::sleep(drip).await;
         if kill.is_tripped() {
             break;
         }
         n += 1;
-        let chunk = match mode {
-            SlowMode::Headers => format!("X-{n}: {n}\r\n"),
-            SlowMode::Body => "a".to_string(),
+        let progressed = match mode {
+            SlowMode::Headers => stream.write_all(format!("X-{n}: {n}\r\n").as_bytes()).await.is_ok(),
+            SlowMode::Body => stream.write_all(b"a").await.is_ok(),
+            // Drain a small chunk. `Ok(0)` is EOF: the whole response fit despite
+            // the shrunken window and the server closed — the connection is done.
+            SlowMode::Read => matches!(stream.read(&mut buf).await, Ok(n) if n > 0),
         };
-        if stream.write_all(chunk.as_bytes()).await.is_err() {
-            // Server closed us out (its timeout fired) — the expected outcome.
+        if !progressed {
+            // Server closed us out (timeout / response fully sent) — expected.
             break;
         }
     }
@@ -358,7 +422,7 @@ async fn hold_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::ErrorKind;
+    use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
     use std::thread;
@@ -402,7 +466,11 @@ mod tests {
 
     #[test]
     fn mode_surfaces_in_name() {
-        for (mode, want) in [(SlowMode::Headers, "l7-slowloris"), (SlowMode::Body, "l7-slowbody")] {
+        for (mode, want) in [
+            (SlowMode::Headers, "l7-slowloris"),
+            (SlowMode::Body, "l7-slowbody"),
+            (SlowMode::Read, "l7-slowread"),
+        ] {
             let engine = L7SlowEngine::new(gate_cidrs(&["127.0.0.0/8"]), "http://127.0.0.1/", cfg(mode));
             assert_eq!(engine.name(), want);
         }
@@ -450,6 +518,56 @@ mod tests {
         server.join().unwrap();
 
         assert!(report.units_sent > 0, "should hold at least one connection open");
+        assert_eq!(report.errors, 0, "loopback connects should not error");
+        assert!(!report.aborted_early);
+    }
+
+    #[test]
+    fn slowread_drains_a_responding_listener() {
+        // A listener that accepts, drains the request, sends a response, then
+        // holds the socket open. Slow-read should send a *complete* request
+        // (counted established) and drain the response slowly without erroring.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_srv = stop.clone();
+        let server = thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+                        let mut buf = [0u8; 1024];
+                        let _ = s.read(&mut buf); // drain the (complete) request
+                        let body = "x".repeat(4096);
+                        let resp =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                        let _ = s.write_all(resp.as_bytes());
+                        held.push(s); // keep the connection open
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let g = gate_cidrs(&["127.0.0.0/8"]);
+        let mut engine = L7SlowEngine::new(
+            g.clone(),
+            url.clone(),
+            SlowConfig { mode: SlowMode::Read, max_conns: 2, drip: Duration::from_millis(50) },
+        );
+        let report = engine.execute(&plan(&g, &url, 50, 600));
+
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+
+        assert!(report.units_sent > 0, "slow-read should establish (send a full request)");
         assert_eq!(report.errors, 0, "loopback connects should not error");
         assert!(!report.aborted_early);
     }
