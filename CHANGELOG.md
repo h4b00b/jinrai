@@ -32,6 +32,22 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   Also fixed a stale line that still called `h2-rapid-reset` and
   `h2-continuation` "the two HTTP/2 primitives" — there are now nine.
 
+- **A cookbook of complete, runnable commands, and a table of what `--rate`
+  actually counts.** Follow-up to the above: knowing *which* technique to pick
+  is only half the answer if the catalogue gives fragments (`--l7-method
+  slowloris`) rather than a command that runs. The cookbook now carries one
+  complete invocation per technique — nothing implied or omitted — grouped into
+  L7 (no privilege) and L3/L4 (lab, `--ack-l34-lab`), with a "swap only the mode
+  name" note for the families that share a shape (the nine `h2-*` methods, the
+  eleven raw flag/anomaly floods, the three ICMP query floods, the three slow
+  modes). Alongside it, a table of the trap that costs the most time: `--rate`
+  means requests/sec, connections-opened/sec, handshakes/sec, frames/sec or
+  packets/sec depending on the family, and each family reads a different
+  footprint knob — `--slow-connections` on an `h2-*` method does nothing, and
+  `--concurrency` is inert for every stateless flood. Every command in the
+  cookbook, and all 34 documented method/mode names, were executed against the
+  built binary to confirm the CLI accepts them as written.
+
 ## [0.23.0] — 2026-07-30
 
 Operator-feedback release. A technician ran `tcp-connect-flood` against a lab
