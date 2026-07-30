@@ -193,12 +193,74 @@ pub enum ErrnoBucket {
     /// reported nothing, *we* gave up first, so the bucket size is a function of
     /// the configured timeout as much as of the target.
     Timeout,
+    /// The socket was fine but the exchange failed at the application-protocol
+    /// level — most often a version mismatch (an HTTP/2-only client against a
+    /// server that only speaks HTTP/1.1, a malformed/refused stream). No errno
+    /// exists: the OS delivered the bytes, the peer would not play along. Kept
+    /// apart from the socket buckets because the fix is a different flag, not a
+    /// different network.
+    Protocol,
     /// Any other OS error, carrying the raw code so it stays actionable without
     /// a code change here.
     Other(i32),
     /// The attempt was refused before it reached the OS (a structural mismatch,
     /// e.g. an IPv6 target handed to an IPv4-only primitive). No errno exists.
     Internal,
+}
+
+impl ErrnoBucket {
+    /// Classify an I/O failure into a reporting bucket.
+    ///
+    /// Portable [`ErrorKind`](std::io::ErrorKind)s are matched first. `EMFILE` /
+    /// `ENFILE` / `ENOBUFS` have no stable `ErrorKind` (they still decode to
+    /// `Uncategorized`), so they are recognised by raw code — and telling `EMFILE`
+    /// apart from target behaviour is the entire reason this breakdown exists.
+    /// Anything unrecognised keeps its raw code via [`Other`](ErrnoBucket::Other),
+    /// so no failure is ever reported as an anonymous increment.
+    ///
+    /// Lives here rather than in a traffic crate so every layer buckets the same
+    /// failure the same way — an operator comparing an L4 and an L7 run must not
+    /// have to know which crate wrote the number.
+    pub fn from_io_error(e: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match e.kind() {
+            ErrorKind::ConnectionRefused => return ErrnoBucket::Econnrefused,
+            ErrorKind::ConnectionReset => return ErrnoBucket::Econnreset,
+            ErrorKind::AddrNotAvailable => return ErrnoBucket::Eaddrnotavail,
+            ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+                return ErrnoBucket::Eunreach
+            }
+            ErrorKind::TimedOut => {
+                // `TcpStream::connect_timeout` signals *our* expired deadline with
+                // a synthetic TimedOut error that carries no OS code; the kernel's
+                // own ETIMEDOUT does carry one. The two have different fixes (raise
+                // the timeout vs. the target is not answering), so they get
+                // different buckets.
+                return match e.raw_os_error() {
+                    Some(_) => ErrnoBucket::Etimedout,
+                    None => ErrnoBucket::Timeout,
+                };
+            }
+            // A non-blocking connect that has not resolved yet is our timeout too.
+            ErrorKind::WouldBlock => return ErrnoBucket::Timeout,
+            _ => {}
+        }
+        match e.raw_os_error() {
+            // EMFILE/ENFILE sit in the original low POSIX errno range, whose
+            // values are identical across Linux, macOS and the BSDs.
+            #[cfg(unix)]
+            Some(24) => ErrnoBucket::Emfile,
+            #[cfg(unix)]
+            Some(23) => ErrnoBucket::Enfile,
+            // ENOBUFS is *not* value-stable across unixes (105 on Linux, 55 on
+            // macOS), so only Linux's value is claimed by name; elsewhere it falls
+            // through to `Other` with its raw code intact.
+            #[cfg(target_os = "linux")]
+            Some(105) => ErrnoBucket::Enobufs,
+            Some(code) => ErrnoBucket::Other(code),
+            None => ErrnoBucket::Internal,
+        }
+    }
 }
 
 impl std::fmt::Display for ErrnoBucket {
@@ -213,6 +275,7 @@ impl std::fmt::Display for ErrnoBucket {
             ErrnoBucket::Econnreset => write!(f, "ECONNRESET"),
             ErrnoBucket::Eunreach => write!(f, "EUNREACH"),
             ErrnoBucket::Timeout => write!(f, "timeout"),
+            ErrnoBucket::Protocol => write!(f, "protocol"),
             ErrnoBucket::Other(code) => write!(f, "os:{code}"),
             ErrnoBucket::Internal => write!(f, "internal"),
         }
@@ -313,6 +376,16 @@ pub struct RunReport {
     /// breached the SLO: the capacity knee. `None` for every non-discovery run
     /// and for a discovery run that never breached (target held the whole ramp).
     pub knee: Option<Knee>,
+    /// Completed responses tallied by the HTTP version actually used on the wire
+    /// (`"HTTP/1.1"`, `"HTTP/2.0"`, …), as reported by the client.
+    ///
+    /// This exists because the negotiated version is *not* obvious from the
+    /// command line: an `https` target with ALPN can silently answer HTTP/2 for a
+    /// run the operator believed was HTTP/1.1, which changes what is being tested
+    /// (multiplexing, header compression, per-connection limits). Layers without a
+    /// response leave it empty and the reporter omits it. Sums to `units_sent` for
+    /// the fast L7 methods.
+    pub http_versions: BTreeMap<String, u64>,
 }
 
 impl RunReport {

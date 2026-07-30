@@ -20,10 +20,10 @@ use jinrai_core::{
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
     H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
-    H2StreamKind, L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode,
+    H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode,
     TlsHandshakeEngine, WatchdogConfig,
 };
-use jinrai_metrics::{AuditEvent, AuditLog};
+use jinrai_metrics::{AuditEvent, AuditLog, RunContext};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
 
 const USAGE: &str = "\
@@ -135,6 +135,19 @@ OPTIONS:
                           accepts any server certificate — see README). h2-rapid-reset
                           and h2-continuation use ALPN h2 for https and
                           prior-knowledge h2c for http.
+    --http-version <V>    HTTP version for the fast get/post/head flood:
+                            auto  (default) negotiate: HTTP/1.1 for http://,
+                                  ALPN for https:// — which means an https target
+                                  that offers h2 IS TESTED OVER HTTP/2
+                            1.1   force HTTP/1.1, never negotiate h2
+                            2     force HTTP/2 (ALPN h2 only for https,
+                                  prior-knowledge h2c for http). A target that
+                                  cannot do h2 fails every request instead of
+                                  silently downgrading
+                          Whatever is chosen, the run summary reports the version
+                          the responses actually came back on. Slow modes are
+                          HTTP/1.1 by construction and the h2-* methods are HTTP/2
+                          by construction, so this flag does not apply to them.
     --body <STRING>       Request body sent with each POST (l7-method post)
     --cache-bust          Append a unique _cb=<n> query to every l7 request so
                           caches/CDNs cannot serve a stored response (query only;
@@ -193,14 +206,22 @@ OPTIONS:
                           at least one --slo-max-*-rate to have something to watch.
     --watchdog-window <SECS>  Watchdog sample window (default: 5)
     --watchdog-breaches <K>   Consecutive breaching windows before abort (default: 3)
+    --output <FORM>       End-of-run report form:
+                            human  (default) a readable block: offered vs.
+                                   achieved load, status/protocol breakdown with
+                                   percentages, who ended the run, and what the
+                                   failures mean
+                            line   the single machine-friendly summary line
+                                   (stable for scripts/log scraping)
     --audit-log <PATH>    Append a tamper-evident audit record for this run to
                           PATH (authorized/completed/refused). Operator identity
                           comes from $JINRAI_OPERATOR (else the OS user).
     -h, --help            Show this help
 
 AUDIT:
-    --verify-audit <PATH> Verify the hash chain of an existing audit log and exit
-                          (0 = intact, non-zero = tampered/corrupt). Runs nothing.
+    --verify-audit <PATH> Verify the hash chain of an existing audit log and print
+                          every record in readable form, then exit (0 = intact,
+                          non-zero = tampered/corrupt). Runs nothing.
 ";
 
 fn main() -> ExitCode {
@@ -245,12 +266,25 @@ enum ProfileKind {
     Spike,
 }
 
+/// How the end-of-run report is printed. Two forms rather than one because the
+/// two readers are different: an operator needs the reasoning, a script needs a
+/// stable single line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutputForm {
+    /// Multi-line readable block (default).
+    Human,
+    /// The historical one-line summary.
+    Line,
+}
+
 struct Args {
     allow: Vec<String>,
     targets: Vec<IpAddr>,
     url: Option<String>,
     headers: Vec<(String, String)>,
     l7_kind: L7Kind,
+    http_version: HttpVersion,
+    output: OutputForm,
     body: Option<String>,
     cache_bust: bool,
     slow_connections: usize,
@@ -324,8 +358,17 @@ fn run() -> Result<(), String> {
     // A verify-only invocation checks an existing log's integrity and exits
     // without touching the allowlist, the gate, or any traffic path.
     if let Some(path) = &args.verify_audit {
-        let n = jinrai_metrics::verify(path).map_err(|e| e.to_string())?;
-        println!("audit log OK: {n} record(s), hash chain intact ({path})");
+        // Verify AND show. "The chain is intact" answers a question nobody asked
+        // on its own; what the log is for is reading what was fired at whom.
+        let records = jinrai_metrics::verify_and_read(path).map_err(|e| e.to_string())?;
+        println!("audit log {path}");
+        println!("hash chain: INTACT ({} record(s))\n", records.len());
+        for r in &records {
+            println!("  #{:<4} {}  {:<16} {}", r.seq, r.ts, r.operator, r.summary);
+        }
+        if records.is_empty() {
+            println!("  (no records)");
+        }
         return Ok(());
     }
 
@@ -468,6 +511,7 @@ fn run_l7(
                 headers: args.headers.clone(),
                 body: args.body.clone().map(String::into_bytes),
                 cache_bust: args.cache_bust,
+                http_version: args.http_version,
             };
             let mut engine =
                 L7Engine::new(gate, spec).with_slo(args.slo).with_max_connections(args.max_connections);
@@ -563,14 +607,55 @@ fn run_l7(
     if !is_fast && (args.discover_knee || args.profile != ProfileKind::Constant) {
         eprintln!("warning: load profiles / --discover-knee apply to fast l7 methods only; ignored here");
     }
+    // The protocol version is a property of the fast client; the other primitives
+    // are fixed by construction (slow modes speak HTTP/1.1, h2-* speak HTTP/2).
+    if !is_fast && args.http_version != HttpVersion::Auto {
+        eprintln!(
+            "warning: --http-version applies to the fast get/post/head methods only; \
+             ignored here (slow modes are HTTP/1.1, h2-* methods are HTTP/2 by construction)"
+        );
+    }
 
     let plan = RunPlan { targets, rate_cap, duration, kill };
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
+    let started = std::time::Instant::now();
     let report = engine.execute(&plan);
-    println!("{}", jinrai_metrics::render(&report));
+    let elapsed = started.elapsed();
 
-    // A knee-discovery run reports the breaking point, not a pass/fail verdict:
-    // reaching a breach is the goal, so the SLO here is the probe, not a target.
+    // Evaluate the SLO verdict (only when the operator declared one, and only for
+    // fast methods that produced a classification). A knee-discovery run reports
+    // the breaking point instead: reaching a breach is the goal there, so its SLO
+    // is the probe, not a target to pass.
+    let verdict = if !args.discover_knee && !args.slo.is_empty() && is_fast {
+        Some(args.slo.evaluate(&report))
+    } else {
+        None
+    };
+
+    let mut notes = Vec::new();
+    if is_fast {
+        if let Some(v) = args.http_version.forced_label() {
+            notes.push(v.to_string());
+        }
+        if args.max_connections > 0 {
+            notes.push(format!("max {} concurrent connections", args.max_connections));
+        }
+    }
+    report_run(
+        args,
+        &report,
+        verdict.as_ref(),
+        RunContext {
+            layer: format!("{:?}", engine.layer()),
+            mode: engine.name().to_string(),
+            target: url.clone(),
+            rate_per_sec: args.rate,
+            planned: duration,
+            elapsed,
+            notes,
+        },
+    );
+
     if args.discover_knee {
         match report.knee {
             Some(k) => println!(
@@ -588,18 +673,32 @@ fn run_l7(
         return Ok(());
     }
 
-    // Evaluate the SLO verdict (only when the operator declared one, and only for
-    // fast methods that produced a classification).
-    let verdict = if !args.slo.is_empty() && matches!(args.l7_kind, L7Kind::Fast(_)) {
-        let v = args.slo.evaluate(&report);
-        println!("{}", jinrai_metrics::render_verdict(&v));
-        Some(v)
-    } else {
-        None
-    };
-
     audit_record(&mut audit, AuditEvent::completed(&report, verdict.as_ref()))?;
     check_l7_outcome(&report, verdict.as_ref())
+}
+
+/// Print the end-of-run report in the operator's chosen form.
+///
+/// `human` is the default because the compact line — two counters and a boolean —
+/// reads the same whether the target absorbed the load or never received a byte,
+/// which is precisely the distinction the run exists to establish.
+fn report_run(
+    args: &Args,
+    report: &RunReport,
+    verdict: Option<&SloVerdict>,
+    ctx: RunContext,
+) {
+    match args.output {
+        OutputForm::Human => {
+            println!("{}", jinrai_metrics::render_summary(report, &ctx, verdict))
+        }
+        OutputForm::Line => {
+            println!("{}", jinrai_metrics::render(report));
+            if let Some(v) = verdict {
+                println!("{}", jinrai_metrics::render_verdict(v));
+            }
+        }
+    }
 }
 
 /// Post-run gate for L7: a watchdog abort or an unmet SLO exits non-zero so
@@ -616,6 +715,19 @@ fn check_l7_outcome(report: &RunReport, verdict: Option<&SloVerdict>) -> Result<
         if !v.passed() {
             return Err(format!("target did not meet SLO — {v}"));
         }
+    }
+    // A run where every single attempt failed exercised nothing, and must not
+    // report success — the same policy L3/L4 already applies (`check_l4_outcome`).
+    // Every L7 primitive counts a unit once it got somewhere (a response, an
+    // established slow connection, a sent frame), so 0 units with only failures
+    // means the target was never reached. Without this, `--http-version 2` against
+    // an HTTP/1.1-only target exits 0 having sent no valid request at all.
+    if report.units_sent == 0 && report.errors > 0 {
+        return Err(format!(
+            "L7 run completed 0 of {} attempts: target unreachable, refusing, or \
+             not speaking the requested protocol (nothing was stress-tested)",
+            report.attempts()
+        ));
     }
     Ok(())
 }
@@ -703,8 +815,34 @@ fn run_l4(
         return Err(format!("refusing L3/L4 run: {e}"));
     }
     println!("running module '{}' ({:?})...", module.name(), module.layer());
+    let started = std::time::Instant::now();
     let report = module.execute(&plan);
-    println!("{}", jinrai_metrics::render(&report));
+    let elapsed = started.elapsed();
+
+    let mut notes = if args.l4_mode.is_icmp() {
+        Vec::new() // ICMP is portless
+    } else {
+        vec![format!("port {port}")]
+    };
+    // Only the connection-holding modes are bounded by --concurrency; restating it
+    // for a stateless flood would suggest a limit that does not exist.
+    if matches!(args.l4_mode, L4Mode::TcpConnect | L4Mode::Data) {
+        notes.push(format!("max {} sockets open at once", args.concurrency));
+    }
+    report_run(
+        args,
+        &report,
+        None,
+        RunContext {
+            layer: format!("{:?}", module.layer()),
+            mode: module.name().to_string(),
+            target: plan.targets.iter().map(target_label).collect::<Vec<_>>().join(", "),
+            rate_per_sec: args.rate,
+            planned: duration,
+            elapsed,
+            notes,
+        },
+    );
     audit_record(&mut audit, AuditEvent::completed(&report, None))?;
 
     // A run that could not complete, or that emitted nothing while every attempt
@@ -736,6 +874,8 @@ fn parse_args() -> Result<Args, String> {
     let mut url = None;
     let mut headers = Vec::new();
     let mut l7_kind = L7Kind::Fast(L7Method::Get);
+    let mut http_version = HttpVersion::Auto;
+    let mut output = OutputForm::Human;
     let mut body = None;
     let mut cache_bust = false;
     let mut slow_connections = 100usize;
@@ -804,6 +944,29 @@ fn parse_args() -> Result<Args, String> {
                              h2-ping|h2-window-update|h2-priority|h2-made-you-reset|h2-empty-data|\
                              h2-bomb)"
                         ))
+                    }
+                }
+            }
+            "--http-version" => {
+                let raw = next_val(&mut it, "--http-version")?;
+                http_version = match raw.as_str() {
+                    "auto" => HttpVersion::Auto,
+                    // Accept the spellings an operator actually types.
+                    "1.1" | "1" | "http1.1" | "http/1.1" => HttpVersion::Http11,
+                    "2" | "2.0" | "h2" | "http2" | "http/2" => HttpVersion::Http2,
+                    other => {
+                        return Err(format!(
+                            "unknown --http-version: {other} (want auto|1.1|2)"
+                        ))
+                    }
+                };
+            }
+            "--output" => {
+                output = match next_val(&mut it, "--output")?.as_str() {
+                    "human" => OutputForm::Human,
+                    "line" => OutputForm::Line,
+                    other => {
+                        return Err(format!("unknown --output: {other} (want human|line)"))
                     }
                 }
             }
@@ -969,6 +1132,8 @@ fn parse_args() -> Result<Args, String> {
         url,
         headers,
         l7_kind,
+        http_version,
+        output,
         body,
         cache_bust,
         slow_connections,

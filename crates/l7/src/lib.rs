@@ -44,6 +44,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,7 +57,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
-use jinrai_core::{Knee, Layer, LoadProfile, LoadStage, RunPlan, RunReport, SloSpec, StressModule};
+use jinrai_core::{
+    ErrnoBucket, ErrnoTally, Knee, Layer, LoadProfile, LoadStage, RunPlan, RunReport, SloSpec,
+    StressModule,
+};
 use jinrai_safety::{AuthorizedTarget, Authorization, KillSwitch, SafetyError};
 
 pub mod slow;
@@ -107,6 +111,39 @@ impl L7Method {
     }
 }
 
+/// Which HTTP protocol version the fast request-flood methods must use.
+///
+/// Without this the version is whatever the client negotiates, and for an
+/// `https` target that means ALPN — so a run the operator thought was HTTP/1.1
+/// silently becomes HTTP/2 whenever the server offers it. The two are different
+/// tests (one connection per request vs. multiplexed streams, plain vs.
+/// HPACK-compressed headers, different server-side limits), so which one runs
+/// has to be the operator's choice, not the server's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpVersion {
+    /// Let the client negotiate: HTTP/1.1 for `http`, ALPN (usually HTTP/2 when
+    /// offered) for `https`. The historical behaviour.
+    #[default]
+    Auto,
+    /// Force HTTP/1.1 — never negotiate h2, even when the server offers it.
+    Http11,
+    /// Force HTTP/2: ALPN `h2` only for `https`, prior-knowledge h2c for `http`.
+    /// A server that cannot do h2 makes every request fail rather than silently
+    /// downgrading, so the run reports the mismatch instead of hiding it.
+    Http2,
+}
+
+impl HttpVersion {
+    /// Short operator-facing label, or `None` for `Auto` (nothing was forced).
+    pub fn forced_label(self) -> Option<&'static str> {
+        match self {
+            HttpVersion::Auto => None,
+            HttpVersion::Http11 => Some("HTTP/1.1 forced"),
+            HttpVersion::Http2 => Some("HTTP/2 forced"),
+        }
+    }
+}
+
 /// What to request. A GET/POST/HEAD against one authorized datum, optionally
 /// with a body and per-request cache-busting.
 #[derive(Debug, Clone)]
@@ -127,6 +164,8 @@ pub struct RequestSpec {
     /// mutated — never the host — so the datum authorization and the pinned DNS
     /// resolution still hold for every request.
     pub cache_bust: bool,
+    /// Which HTTP version to speak (default: whatever the client negotiates).
+    pub http_version: HttpVersion,
 }
 
 impl RequestSpec {
@@ -137,6 +176,7 @@ impl RequestSpec {
             headers: Vec::new(),
             body: None,
             cache_bust: false,
+            http_version: HttpVersion::Auto,
         }
     }
 }
@@ -369,12 +409,21 @@ impl L7Engine {
         let addrs = resolve_addrs(&datum)?;
 
         let headers = self.headers()?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .resolve_to_addrs(&datum.host, &addrs)
             .default_headers(headers)
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| L7Error::Client(e.to_string()))?;
+            .timeout(Duration::from_secs(10));
+        // Pin the protocol version when the operator asked for one. `Auto` leaves
+        // reqwest's negotiation alone (h1 for http, ALPN for https).
+        builder = match self.spec.http_version {
+            HttpVersion::Auto => builder,
+            HttpVersion::Http11 => builder.http1_only(),
+            // Prior knowledge: h2 with no negotiation and no h1 fallback — for
+            // https reqwest offers only `h2` in ALPN, for http it sends the h2c
+            // preface directly.
+            HttpVersion::Http2 => builder.http2_prior_knowledge(),
+        };
+        let client = builder.build().map_err(|e| L7Error::Client(e.to_string()))?;
 
         Ok((client, datum.url))
     }
@@ -457,6 +506,13 @@ impl StressModule for L7Engine {
         let hist = Arc::new(Mutex::new(
             Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds"),
         ));
+        // Which HTTP version each response actually arrived on. Recorded even for
+        // `HttpVersion::Auto` (especially then): it is the only way an operator can
+        // see that an https run they read as HTTP/1.1 was negotiated up to h2.
+        let protos: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        // Why each failed attempt failed — refused / unanswered / protocol / a
+        // local ceiling of ours. See `classify_reqwest`.
+        let errno = Arc::new(Mutex::new(ErrnoTally::default()));
 
         let kill = plan.kill.clone();
         let discover_knee = self.discover_knee;
@@ -485,6 +541,8 @@ impl StressModule for L7Engine {
         let s5xx_w = s5xx.clone();
         let timeouts_w = timeouts.clone();
         let hist_w = hist.clone();
+        let protos_w = protos.clone();
+        let errno_w = errno.clone();
         let wd_flag = aborted_by_watchdog.clone();
 
         let (aborted, knee) = rt.block_on(async move {
@@ -572,6 +630,8 @@ impl StressModule for L7Engine {
                     let s5xx = s5xx_w.clone();
                     let timeouts = timeouts_w.clone();
                     let hist = hist_w.clone();
+                    let protos = protos_w.clone();
+                    let errno = errno_w.clone();
                     let body = body.clone();
                     let cb_counter = cb_counter.clone();
                     tasks.spawn(async move {
@@ -610,6 +670,13 @@ impl StressModule for L7Engine {
                                     _ => &s2xx,
                                 };
                                 counter.fetch_add(1, Ordering::Relaxed);
+                                // The version actually used on the wire, not the
+                                // one we asked for.
+                                *protos
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .entry(format!("{:?}", resp.version()))
+                                    .or_insert(0) += 1;
                                 hist.lock()
                                     .unwrap_or_else(|p| p.into_inner())
                                     .saturating_record(micros);
@@ -619,6 +686,10 @@ impl StressModule for L7Engine {
                                 if e.is_timeout() {
                                     timeouts.fetch_add(1, Ordering::Relaxed);
                                 }
+                                errno
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .record(classify_reqwest(&e));
                             }
                         }
                     });
@@ -660,14 +731,19 @@ impl StressModule for L7Engine {
         });
 
         let hist = hist.lock().unwrap_or_else(|p| p.into_inner());
+        let http_versions =
+            std::mem::take(&mut *protos.lock().unwrap_or_else(|p| p.into_inner()));
+        let errno = std::mem::take(&mut *errno.lock().unwrap_or_else(|p| p.into_inner()));
         let by_watchdog = aborted_by_watchdog.load(Ordering::Relaxed);
-        let label = if by_watchdog {
-            format!("L7 {} {} (SLO watchdog abort)", self.spec.method.label(), self.spec.url)
-        } else if knee.is_some() {
-            format!("L7 {} {} (knee found)", self.spec.method.label(), self.spec.url)
-        } else {
-            format!("L7 {} {}", self.spec.method.label(), self.spec.url)
+        let note = match (by_watchdog, knee.is_some(), self.spec.http_version.forced_label()) {
+            (true, _, Some(v)) => format!(" ({v}, SLO watchdog abort)"),
+            (true, _, None) => " (SLO watchdog abort)".to_string(),
+            (_, true, Some(v)) => format!(" ({v}, knee found)"),
+            (_, true, None) => " (knee found)".to_string(),
+            (_, _, Some(v)) => format!(" ({v})"),
+            (_, _, None) => String::new(),
         };
+        let label = format!("L7 {} {}{note}", self.spec.method.label(), self.spec.url);
         RunReport {
             layer_label: label,
             units_sent: sent.load(Ordering::Relaxed),
@@ -678,16 +754,14 @@ impl StressModule for L7Engine {
             status_4xx: s4xx.load(Ordering::Relaxed),
             status_5xx: s5xx.load(Ordering::Relaxed),
             timeouts: timeouts.load(Ordering::Relaxed),
-            // The L7 client reports transport failures at the HTTP level, not as
-            // raw socket errnos, so this layer leaves the breakdown empty and the
-            // reporter omits it.
-            errno: Default::default(),
+            errno,
             aborted_by_watchdog: by_watchdog,
             p50_micros: hist.value_at_quantile(0.5),
             p90_micros: hist.value_at_quantile(0.9),
             p99_micros: hist.value_at_quantile(0.99),
             max_micros: hist.max(),
             knee,
+            http_versions,
         }
     }
 }
@@ -749,6 +823,30 @@ async fn run_watchdog(
             }
         }
     }
+}
+
+/// Bucket one failed HTTP attempt by *why* it failed.
+///
+/// `errors=100` is the same number whether the target refused every connection,
+/// never answered, or answered fine over a protocol version the operator forced
+/// it not to speak — three findings with three different next steps. reqwest wraps
+/// the real cause, so this walks the source chain down to the underlying
+/// [`std::io::Error`] and reuses the shared classifier; a failure with no I/O
+/// cause is a protocol-level one.
+fn classify_reqwest(e: &reqwest::Error) -> ErrnoBucket {
+    // Our own request timeout (`Client::timeout`) first: it can surface with or
+    // without an I/O cause, and either way *we* gave up, not the OS.
+    if e.is_timeout() {
+        return ErrnoBucket::Timeout;
+    }
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = src {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return ErrnoBucket::from_io_error(io);
+        }
+        src = err.source();
+    }
+    ErrnoBucket::Protocol
 }
 
 /// Resolve when the kill switch trips. Polled at a fine granularity so a run
@@ -829,6 +927,127 @@ mod tests {
         assert_eq!(report.status_5xx, report.units_sent, "every completion was a 500");
         assert_eq!(report.status_2xx, 0);
         assert_eq!(report.errors, 0, "a 500 is a response, not a transport error");
+    }
+
+    /// Build a spec for `url` with a forced protocol version.
+    fn spec_with_version(url: &str, v: HttpVersion) -> RequestSpec {
+        RequestSpec { http_version: v, ..RequestSpec::new(url) }
+    }
+
+    #[test]
+    fn records_the_http_version_responses_actually_used() {
+        // The test server speaks HTTP/1.1 only; forcing 1.1 must succeed and the
+        // report must name the version rather than leaving the operator guessing.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(
+            gate_cidrs(&["127.0.0.0/8"]),
+            spec_with_version(&url, HttpVersion::Http11),
+        );
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "HTTP/1.1 should work against an h1 server");
+        assert_eq!(
+            report.http_versions.get("HTTP/1.1").copied(),
+            Some(report.units_sent),
+            "every completion should be tallied as HTTP/1.1: {:?}",
+            report.http_versions
+        );
+        assert!(
+            report.layer_label.contains("HTTP/1.1 forced"),
+            "label should state the forced version: {}",
+            report.layer_label
+        );
+    }
+
+    #[test]
+    fn forcing_http2_against_an_h1_server_fails_as_protocol_not_as_success() {
+        // Prior-knowledge h2 against an HTTP/1.1-only server: every attempt must
+        // fail, and land in the `protocol` bucket — not be silently downgraded to
+        // h1 and reported as a healthy run.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(
+            gate_cidrs(&["127.0.0.0/8"]),
+            spec_with_version(&url, HttpVersion::Http2),
+        );
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert_eq!(report.units_sent, 0, "an h1 server cannot answer prior-knowledge h2");
+        assert!(report.errors > 0, "the attempts must be counted as failures");
+        assert!(report.http_versions.is_empty(), "no response, so no version tally");
+        let buckets: Vec<ErrnoBucket> = report.errno.iter().map(|(b, _)| b).collect();
+        assert!(
+            buckets.contains(&ErrnoBucket::Protocol),
+            "a version mismatch is a protocol failure, got {buckets:?}"
+        );
+        assert_eq!(report.errno.total(), report.errors, "the breakdown must sum to errors");
+    }
+
+    #[test]
+    fn refused_connections_are_bucketed_as_econnrefused() {
+        // Nothing listening: the failures must name the target's refusal, so an
+        // operator can tell it from a local limit of ours.
+        let port = {
+            // Bind and drop to get a port that is (almost certainly) closed.
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(30),
+            duration: Duration::from_millis(300),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+
+        assert_eq!(report.units_sent, 0);
+        assert!(report.errors > 0);
+        let buckets: Vec<ErrnoBucket> = report.errno.iter().map(|(b, _)| b).collect();
+        assert!(
+            buckets.contains(&ErrnoBucket::Econnrefused),
+            "closed port should be ECONNREFUSED, got {buckets:?}"
+        );
+    }
+
+    #[test]
+    fn auto_version_leaves_the_label_and_negotiation_alone() {
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(30),
+            duration: Duration::from_millis(300),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0);
+        assert!(!report.layer_label.contains("forced"), "label: {}", report.layer_label);
+        assert_eq!(HttpVersion::default(), HttpVersion::Auto);
+        // Even unforced, the negotiated version is reported.
+        assert!(!report.http_versions.is_empty());
     }
 
     #[test]
