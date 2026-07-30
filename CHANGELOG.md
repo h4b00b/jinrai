@@ -676,7 +676,11 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/h4b00b/jinrai/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/h4b00b/jinrai/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/h4b00b/jinrai/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/h4b00b/jinrai/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/h4b00b/jinrai/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/h4b00b/jinrai/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/h4b00b/jinrai/compare/v0.14.0...v0.15.0
