@@ -23,5 +23,12 @@ jinrai-metrics = { workspace = true }
 # and a working abort control is safety-critical for a live traffic generator.
 ctrlc = "3"
 
+# setrlimit(RLIMIT_NOFILE) at startup. A shell's `ulimit -n` is shell-local and
+# absent under systemd/cron, so descriptor headroom cannot be left to the caller's
+# environment. `nix` is already in the tree (ctrlc pulls it) and its wrapper is
+# safe, so this needs no new supply chain and no `unsafe` — which this crate forbids.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["resource"] }
+
 [lints.rust]
 unsafe_code = "forbid"

@@ -149,6 +149,16 @@ OPTIONS:
     --drip-ms <MS>        Per-tick interval for slow modes (default: 10000): the
                           keep-alive write interval for slowloris/slowbody, or the
                           read interval draining one chunk for slow-read
+    --concurrency <N>     Max SIMULTANEOUSLY OPEN sockets for the connection-
+                          holding l4 modes (tcp, data) (default: 256). This is the
+                          run's local footprint, and it is independent of
+                          --duration: --rate is the offered load (attempts/sec),
+                          --concurrency is how many connections are held at once,
+                          --duration is only wall-clock length. Once N are open,
+                          admitting a new attempt closes the oldest connection.
+    --connect-timeout-ms <MS>  How long one l4 connection attempt may stay
+                          unresolved before it is abandoned and counted in the
+                          `timeout` errno bucket (default: 500)
     --payload-size <N>    Payload bytes per unit (default: 64) — UDP datagram size
                           (l4-mode udp) or PSH-ACK write size (l4-mode data)
     --rate <N>            Rate cap, units/sec (default: 100). This is a hard
@@ -250,6 +260,8 @@ struct Args {
     l4_mode: L4Mode,
     port: Option<u16>,
     payload_size: usize,
+    concurrency: usize,
+    connect_timeout_ms: u64,
     ack_l34_lab: bool,
     rate: u64,
     duration_secs: u64,
@@ -267,6 +279,45 @@ struct Args {
     verify_audit: Option<String>,
 }
 
+/// Raise this process's open-file-descriptor soft limit to its hard limit and log
+/// the resulting ceiling.
+///
+/// Done here rather than left to the caller because `ulimit -n` is *shell-local*:
+/// it does not exist under systemd, cron, or any other non-shell exec, so a run's
+/// descriptor headroom must not depend on how it happened to be launched.
+///
+/// This is headroom, not a fix. The connection-holding L4 modes bound their own
+/// footprint with `--concurrency`; a run that needs a raised ceiling to avoid
+/// EMFILE is misconfigured, and the `errno(EMFILE=…)` bucket exists to say so out
+/// loud rather than let a local limit masquerade as target behaviour.
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("warning: could not read RLIMIT_NOFILE: {e}");
+            return;
+        }
+    };
+    let mut ceiling = soft;
+    if soft < hard {
+        match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+            Ok(()) => ceiling = hard,
+            Err(e) => eprintln!(
+                "warning: could not raise RLIMIT_NOFILE from {soft} to {hard}: {e}"
+            ),
+        }
+    }
+    println!("fd ceiling: {ceiling} (hard limit {hard})");
+}
+
+/// No RLIMIT_NOFILE concept on non-unix targets; descriptor limits are handled by
+/// the platform.
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
 
@@ -277,6 +328,10 @@ fn run() -> Result<(), String> {
         println!("audit log OK: {n} record(s), hash chain intact ({path})");
         return Ok(());
     }
+
+    // Before anything opens a socket: take whatever descriptor headroom the OS
+    // will grant, and say what it is.
+    raise_nofile_limit();
 
     // Open the audit log (if requested) up front so an unusable log aborts the
     // run BEFORE any authorization or traffic — no untracked runs.
@@ -618,6 +673,8 @@ fn run_l4(
         mode: args.l4_mode,
         port,
         payload_size: args.payload_size,
+        concurrency: args.concurrency,
+        connect_timeout: Duration::from_millis(args.connect_timeout_ms),
     });
 
     // Record the authorized run (targets + rules + params) before any traffic.
@@ -688,6 +745,8 @@ fn parse_args() -> Result<Args, String> {
     let mut l4_mode = L4Mode::Udp;
     let mut port = None;
     let mut payload_size = 64usize;
+    let mut concurrency = jinrai_l34::DEFAULT_CONCURRENCY;
+    let mut connect_timeout_ms = jinrai_l34::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64;
     let mut ack_l34_lab = false;
     let mut rate = 100u64;
     let mut duration_secs = 10u64;
@@ -806,6 +865,16 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "invalid --payload-size".to_string())?;
             }
+            "--concurrency" => {
+                concurrency = next_val(&mut it, "--concurrency")?
+                    .parse()
+                    .map_err(|_| "invalid --concurrency".to_string())?;
+            }
+            "--connect-timeout-ms" => {
+                connect_timeout_ms = next_val(&mut it, "--connect-timeout-ms")?
+                    .parse()
+                    .map_err(|_| "invalid --connect-timeout-ms".to_string())?;
+            }
             "--ack-l34-lab" => ack_l34_lab = true,
             "--header" => {
                 let raw = next_val(&mut it, "--header")?;
@@ -909,6 +978,8 @@ fn parse_args() -> Result<Args, String> {
         l4_mode,
         port,
         payload_size,
+        concurrency,
+        connect_timeout_ms,
         ack_l34_lab,
         rate,
         duration_secs,

@@ -34,6 +34,14 @@ pub fn render(report: &RunReport) -> String {
             report.timeouts,
         ));
     }
+    // Per-errno breakdown of `errors`, for layers that classify failures. Without
+    // it, a local descriptor ceiling (EMFILE) and the target refusing every
+    // connection (ECONNREFUSED) are the same number — see `ErrnoBucket`.
+    if !report.errno.is_empty() {
+        let buckets: Vec<String> =
+            report.errno.iter().map(|(b, n)| format!("{b}={n}")).collect();
+        line.push_str(&format!(" errno({})", buckets.join(" ")));
+    }
     if report.aborted_by_watchdog {
         line.push_str(" watchdog=ABORTED");
     }
@@ -92,6 +100,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render(&r), "[L4 (stub)] sent=0 errors=0 aborted_early=false");
+    }
+
+    #[test]
+    fn renders_errno_breakdown_when_failures_are_classified() {
+        use jinrai_core::{ErrnoBucket, ErrnoTally};
+        let mut errno = ErrnoTally::default();
+        for _ in 0..957 {
+            errno.record(ErrnoBucket::Emfile);
+        }
+        errno.record(ErrnoBucket::Econnrefused);
+        errno.record(ErrnoBucket::Timeout);
+        let r = RunReport {
+            layer_label: "L4 tcp-connect-flood".into(),
+            units_sent: 1021,
+            errors: errno.total(),
+            errno,
+            ..Default::default()
+        };
+        let out = render(&r);
+        assert!(
+            out.contains("errno(EMFILE=957 ECONNREFUSED=1 timeout=1)"),
+            "rendered: {out}"
+        );
+    }
+
+    #[test]
+    fn omits_errno_breakdown_when_layer_does_not_classify() {
+        // An unclassified layer must not grow an empty `errno()` group.
+        let r = RunReport { layer_label: "L4".into(), errors: 3, ..Default::default() };
+        assert_eq!(render(&r), "[L4] sent=0 errors=3 aborted_early=false");
     }
 
     #[test]

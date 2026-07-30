@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use jinrai_safety::{AuthorizedTarget, KillSwitch};
@@ -152,6 +153,100 @@ pub struct Knee {
     pub breached_at_per_sec: u64,
 }
 
+/// Which operating-system error caused one attempt to fail.
+///
+/// A bare `errors=<n>` counter is the same number for four unrelated causes with
+/// four different fixes: `EMFILE` is *our own* descriptor ceiling (a local
+/// misconfiguration, nothing to do with the target), `EADDRNOTAVAIL` is local
+/// ephemeral-port exhaustion, `ENOBUFS` is local kernel memory, while
+/// `ECONNREFUSED`/`ETIMEDOUT` are the target actually rejecting or blackholing
+/// traffic — the only two that say anything about the system under test. Keeping
+/// them apart is what makes the summary line diagnostic rather than merely
+/// alarming.
+///
+/// The derived `Ord` fixes the reporting order: the named buckets in declaration
+/// order, then [`Other`](ErrnoBucket::Other) sorted by raw code, then
+/// [`Internal`](ErrnoBucket::Internal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ErrnoBucket {
+    /// `EMFILE` — the process hit its own open-file-descriptor limit. A local
+    /// ceiling, not target behaviour.
+    Emfile,
+    /// `ENFILE` — the system-wide open-file table is full. Also local.
+    Enfile,
+    /// `ENOBUFS` — the kernel could not allocate socket buffer space. Local.
+    Enobufs,
+    /// `EADDRNOTAVAIL` — no local ephemeral port/address left to bind. Local.
+    Eaddrnotavail,
+    /// `ECONNREFUSED` — the target actively refused the connection (RST). This
+    /// is target behaviour.
+    Econnrefused,
+    /// `ETIMEDOUT` — the kernel's own connection timeout expired (no response).
+    /// Target behaviour.
+    Etimedout,
+    /// `ECONNRESET` — the connection was reset mid-handshake. Target behaviour.
+    Econnreset,
+    /// `EHOSTUNREACH` / `ENETUNREACH` — no route to the target.
+    Eunreach,
+    /// Our own configurable attempt timeout expired before the handshake
+    /// resolved. Distinct from [`Etimedout`](ErrnoBucket::Etimedout): the OS
+    /// reported nothing, *we* gave up first, so the bucket size is a function of
+    /// the configured timeout as much as of the target.
+    Timeout,
+    /// Any other OS error, carrying the raw code so it stays actionable without
+    /// a code change here.
+    Other(i32),
+    /// The attempt was refused before it reached the OS (a structural mismatch,
+    /// e.g. an IPv6 target handed to an IPv4-only primitive). No errno exists.
+    Internal,
+}
+
+impl std::fmt::Display for ErrnoBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrnoBucket::Emfile => write!(f, "EMFILE"),
+            ErrnoBucket::Enfile => write!(f, "ENFILE"),
+            ErrnoBucket::Enobufs => write!(f, "ENOBUFS"),
+            ErrnoBucket::Eaddrnotavail => write!(f, "EADDRNOTAVAIL"),
+            ErrnoBucket::Econnrefused => write!(f, "ECONNREFUSED"),
+            ErrnoBucket::Etimedout => write!(f, "ETIMEDOUT"),
+            ErrnoBucket::Econnreset => write!(f, "ECONNRESET"),
+            ErrnoBucket::Eunreach => write!(f, "EUNREACH"),
+            ErrnoBucket::Timeout => write!(f, "timeout"),
+            ErrnoBucket::Other(code) => write!(f, "os:{code}"),
+            ErrnoBucket::Internal => write!(f, "internal"),
+        }
+    }
+}
+
+/// A per-[`ErrnoBucket`] tally of failed attempts. Sums to [`RunReport::errors`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErrnoTally {
+    counts: BTreeMap<ErrnoBucket, u64>,
+}
+
+impl ErrnoTally {
+    /// Count one failure in `bucket`.
+    pub fn record(&mut self, bucket: ErrnoBucket) {
+        *self.counts.entry(bucket).or_insert(0) += 1;
+    }
+
+    /// Total failures tallied — should equal the run's `errors` count.
+    pub fn total(&self) -> u64 {
+        self.counts.values().sum()
+    }
+
+    /// True when nothing failed (or the layer does not classify failures).
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// Non-zero buckets in reporting order (see [`ErrnoBucket`]).
+    pub fn iter(&self) -> impl Iterator<Item = (ErrnoBucket, u64)> + '_ {
+        self.counts.iter().map(|(&b, &n)| (b, n))
+    }
+}
+
 /// Everything a module needs to execute one run, already validated.
 ///
 /// Note the field type: `Vec<AuthorizedTarget>`. A caller physically cannot
@@ -198,6 +293,11 @@ pub struct RunReport {
     pub status_5xx: u64,
     /// Transport failures that were specifically timeouts (subset of `errors`).
     pub timeouts: u64,
+    /// `errors` broken down by the OS error behind each failure. Layers that
+    /// classify their failures fill this (it sums to `errors`); layers that do
+    /// not leave it empty and the reporter omits it. See [`ErrnoBucket`] for why
+    /// a single `errors` number is not enough to act on.
+    pub errno: ErrnoTally,
     /// The SLO watchdog tripped the kill-switch on sustained breach (distinct
     /// from `aborted_early`, which is also set by an operator Ctrl-C).
     pub aborted_by_watchdog: bool,
@@ -516,6 +616,39 @@ mod tests {
         assert_eq!(stages[2].rate, RateCap::new(50));
         assert_eq!(stages[0].duration, Duration::from_secs(4));
         assert_eq!(stages[1].duration, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn errno_tally_sums_and_orders_buckets() {
+        let mut t = ErrnoTally::default();
+        assert!(t.is_empty());
+        t.record(ErrnoBucket::Econnrefused);
+        t.record(ErrnoBucket::Emfile);
+        t.record(ErrnoBucket::Emfile);
+        t.record(ErrnoBucket::Other(99));
+        t.record(ErrnoBucket::Internal);
+        t.record(ErrnoBucket::Other(13));
+        assert_eq!(t.total(), 6);
+        assert!(!t.is_empty());
+        // Named buckets in declaration order, then Other by raw code, then Internal.
+        assert_eq!(
+            t.iter().collect::<Vec<_>>(),
+            vec![
+                (ErrnoBucket::Emfile, 2),
+                (ErrnoBucket::Econnrefused, 1),
+                (ErrnoBucket::Other(13), 1),
+                (ErrnoBucket::Other(99), 1),
+                (ErrnoBucket::Internal, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn errno_bucket_labels_distinguish_our_timeout_from_the_kernels() {
+        // The whole point of the breakdown: these two must not read the same.
+        assert_eq!(ErrnoBucket::Etimedout.to_string(), "ETIMEDOUT");
+        assert_eq!(ErrnoBucket::Timeout.to_string(), "timeout");
+        assert_eq!(ErrnoBucket::Other(-7).to_string(), "os:-7");
     }
 
     #[test]
