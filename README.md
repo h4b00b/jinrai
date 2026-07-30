@@ -128,6 +128,126 @@ reacts to control flags it should never see.
 | Illegal flag combinations (contradictory / all-set / none-set) | `syn-fin`, `syn-rst`, `xmas`, `null` |
 | Maximal 40-byte TCP option block on every SYN | `tcp-options` |
 
+## What `--rate` counts, and which knobs each family actually reads
+
+The single most common mistake is assuming `--rate` always means
+requests/second and that every concurrency flag applies everywhere. Neither is
+true — `--rate` is reinterpreted per family, and a flag belonging to another
+family is silently inert (jinrai warns for the ones that would change the
+verdict):
+
+| Family | `--rate` counts | Bound the footprint with | Does **not** read |
+|---|---|---|---|
+| `get` / `post` / `head` | requests/sec | `--max-connections` (0 = unbounded) | — |
+| `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
+| `tls-handshake` | handshakes/sec | *nothing* — concurrency follows the rate | same as above |
+| every `h2-*` | frames/sec (cycles/sec for `h2-made-you-reset`) | *nothing* — one connection, frames paced by `--rate` | same as above |
+| l4 `tcp` | connection attempts/sec | `--concurrency` (open sockets), `--connect-timeout-ms` | `--slo-*`, `--profile` |
+| l4 `data` | writes/sec | `--concurrency`, `--payload-size` | same |
+| l4 `udp` | datagrams/sec | `--payload-size` (stateless — no footprint to bound) | same |
+| l4 raw floods, l3 `icmp*` | packets/sec | *nothing* — stateless | same |
+
+Two consequences worth internalising: passing `--slow-connections 500` to an
+`h2-*` method changes nothing at all, and for `--l4-mode tcp` the reachable rate
+is capped at roughly `--concurrency / RTT` no matter what `--rate` says (the run
+summary tells you when that is what happened).
+
+## The cookbook — one complete, runnable command per technique
+
+Copy, swap the allowlist and the target, run. Every command below is complete:
+nothing is implied or omitted.
+
+### L7 — no privilege required, safe to point at staging
+
+```sh
+# Capacity, with a verdict: fails the run (exit != 0) if the target misses the SLO
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/health --rate 200 --duration 60 \
+       --slo-max-5xx-rate 0.01 --slo-max-p99-ms 250
+
+# Write path: POST with a body, cache-busted so a CDN cannot answer for the origin
+jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
+       --url https://api.staging.internal/ingest --body '{"probe":1}' \
+       --cache-bust --rate 200 --duration 60
+
+# Breaking point: ramp to the ceiling, stop at the first stage that breaks the SLO
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/health --rate 5000 --duration 300 \
+       --profile ramp --ramp-start 100 --ramp-steps 20 \
+       --discover-knee --slo-max-5xx-rate 0.01
+
+# Burst: hold a baseline, jump to the ceiling for 30s, fall back (autoscaling test)
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/health --rate 2000 --duration 300 \
+       --profile spike --spike-base 200 --spike-secs 30
+
+# Endurance: a long flat hold that surfaces leaks and slow degradation
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/health --rate 300 --duration 3600 \
+       --profile soak --slo-max-p99-ms 500 --watchdog --slo-max-error-rate 0.05
+
+# Same load over a pinned protocol version (auto would negotiate h2 on https)
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/health --http-version 1.1 \
+       --rate 200 --duration 60
+
+# Connection-slot exhaustion: at most 50 keep-alive connections held busy
+jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/ --max-connections 50 \
+       --cache-bust --rate 1000 --duration 60
+
+# Slowloris: 200 half-open connections, one header line each every 10s
+#   swap --l7-method for slowbody (trickled POST body, RUDY)
+#   or for slow-read (complete request, response drained one chunk per tick)
+jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
+       --url https://api.staging.internal/ --slow-connections 200 \
+       --drip-ms 10000 --rate 50 --duration 300
+
+# TLS handshake flood (THC-SSL-DoS): full handshake, immediate drop, repeat
+jinrai --layer l7 --allow '*.staging.internal' --l7-method tls-handshake \
+       --url https://api.staging.internal/ --rate 200 --duration 60
+
+# HTTP/2 rapid reset (CVE-2023-44487). Every h2-* method takes this exact shape;
+# only the method name changes:
+#   h2-rapid-reset  h2-made-you-reset  h2-continuation  h2-bomb
+#   h2-settings     h2-ping            h2-window-update h2-priority  h2-empty-data
+jinrai --layer l7 --allow '*.staging.internal' --l7-method h2-rapid-reset \
+       --url https://api.staging.internal/ --rate 500 --duration 60
+```
+
+### L3/L4 — isolated lab only (`--ack-l34-lab` is mandatory)
+
+```sh
+# UDP datagram flood — no privilege needed
+jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 --target 10.1.2.3 --port 9 \
+       --ack-l34-lab --payload-size 1400 --rate 1000 --duration 30
+
+# TCP connect flood: real handshakes held open against the accept backlog.
+# --concurrency is both the local footprint AND the parallelism: no privilege needed
+jinrai --layer l4 --l4-mode tcp --allow 10.0.0.0/8 --target 10.1.2.3 --port 443 \
+       --ack-l34-lab --rate 5000 --duration 60 \
+       --concurrency 512 --connect-timeout-ms 500
+
+# PSH-ACK data flood: real connections filled with application data
+jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 --target 10.1.2.3 --port 80 \
+       --ack-l34-lab --payload-size 4096 --concurrency 256 --rate 500 --duration 30
+
+# Raw SYN flood — needs CAP_NET_RAW/root, IPv4 only. Same shape for every raw
+# flag flood; only --l4-mode changes:
+#   syn  ack  fin  rst  urg  cwr  ece          (one flag each)
+#   syn-fin  syn-rst  xmas  null               (illegal combinations)
+#   tcp-options                                (SYN + maximal 40-byte option block)
+sudo -E jinrai --layer l4 --l4-mode syn --allow 10.0.0.0/8 --target 10.1.2.3 \
+       --port 80 --ack-l34-lab --rate 5000 --duration 30
+
+# ICMP query flood — portless, needs CAP_NET_RAW/root. Swap --l4-mode for
+# icmp-timestamp (type 13) or icmp-address-mask (type 17)
+sudo -E jinrai --layer l3 --l4-mode icmp --allow 10.0.0.0/8 --target 10.1.2.3 \
+       --ack-l34-lab --rate 1000 --duration 30
+```
+
+`sudo -E` preserves `$JINRAI_OPERATOR` so the audit log still records who ran it.
+
 ## Your first four runs, in order
 
 ```sh
