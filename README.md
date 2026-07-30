@@ -9,6 +9,180 @@ Covers L3/L4 and L7. Built in-house and validated in-house.
 > allowlist is passed at runtime (multiple CIDR blocks), never hard-coded,
 > because different campaigns target different networks.
 
+---
+
+# jinrai 101 — what you can launch, and how to choose
+
+*New here? Read this section and nothing else. It is the map; everything from
+[Usage](#usage) onward is the reference manual.*
+
+## One run = one pressure, on one authorized target, for a bounded time
+
+A jinrai run applies **one** kind of pressure to **one** authorized target and
+then reports whether the target held. Every command you will ever type is the
+same five decisions:
+
+| Decision | Flag(s) | |
+|---|---|---|
+| **Where am I allowed to send?** | `--allow` (repeatable) | An IP/CIDR (`10.0.0.0/8`) or a DNS pattern (`*.staging.internal`). No default: with an empty allowlist the run is refused. |
+| **Which target?** | `--url` (L7), or `--target` + `--port` (L3/L4) | Checked against the allowlist before a single byte is sent. |
+| **Which pressure?** | `--layer`, then `--l7-method` / `--l4-mode` | This is "the attack" — the catalogue is below. |
+| **How hard?** | `--rate`, plus a concurrency ceiling (`--max-connections`, `--slow-connections`, `--concurrency`) | `--rate` is a hard safety ceiling, never exceeded by anything. |
+| **How long?** | `--duration`, optionally shaped by `--profile` | |
+
+Everything else — `--slo-*`, `--watchdog`, `--audit-log` — is about **judging**
+and **bounding** the run, not about generating traffic. The smallest useful
+command is:
+
+```sh
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/health --rate 50 --duration 10
+```
+
+## Which layer?
+
+| Layer | What it exercises | Requires | Where to run it |
+|---|---|---|---|
+| **L7** `--layer l7` | the service: request handlers, connection slots, TLS, HTTP/2 state machine | nothing special | staging / QA. Real requests, real responses — the only layer that yields a `PASS`/`FAIL` verdict |
+| **L4** `--layer l4` | the transport: accept backlog, connection tracking, firewall state, socket buffers | `--ack-l34-lab`; the raw modes also need `CAP_NET_RAW`/root (Linux, IPv4-only) | isolated lab only |
+| **L3** `--layer l3` | the host's IP/ICMP handlers | same as L4 | isolated lab only |
+
+Rule of thumb: **L7 answers "can the service still serve?", L3/L4 answer "can
+the host and the middleboxes survive the packets?"**. Only L7 reads responses,
+so only L7 can tell a healthy target from one that answers `500` at full speed.
+**Start at L7** — it is the layer that maps onto a real incident, and it needs
+no privilege and no isolated network.
+
+## The catalogue — pick by the resource you want to squeeze
+
+### 1. Throughput capacity — "how many requests/s before it degrades?"
+
+L7 fast methods. Realistic traffic, fully classified, safe to point at staging.
+
+| Goal | Command shape |
+|---|---|
+| Read-path capacity | `--l7-method get` |
+| Write-path capacity | `--l7-method post --body '{...}'` |
+| Make sure you are testing the origin, not a cache/CDN | add `--cache-bust` |
+| **Find the breaking point automatically** | `--profile ramp --discover-knee --slo-max-5xx-rate 0.01` |
+| Burst tolerance / autoscaling reaction | `--profile spike --spike-secs 30` |
+| Slow degradation, leaks, GC pressure | `--profile soak --duration 3600` |
+| Same load over a different protocol | `--http-version 1.1` vs `--http-version 2` |
+
+### 2. Concurrency limits — "how many simultaneous clients before it stops accepting?"
+
+This is a *different* failure than throughput: the server has capacity left but
+no free slot. Cheap for the client, which is exactly the point.
+
+| Goal | Method |
+|---|---|
+| Keep-alive slot / worker-pool exhaustion, controlled | `--l7-method get --max-connections 50` |
+| Classic **Slowloris** — hold connections with never-finished request headers | `--l7-method slowloris` |
+| **RUDY** — oversized `Content-Length`, body trickled one byte at a time | `--l7-method slowbody` |
+| **Slow read** — complete request, then refuse to drain the response | `--l7-method slow-read` |
+| Accept backlog / conntrack table, below HTTP | `--layer l4 --l4-mode tcp --concurrency 256` |
+
+For all slow modes `--slow-connections` is the ceiling of held connections and
+`--drip-ms` the tick interval; `--rate` becomes *connections opened per second*.
+
+### 3. Handshake cost — "is the crypto the bottleneck?"
+
+| Goal | Method |
+|---|---|
+| **THC-SSL-DoS** — complete a TLS handshake, drop it, repeat (asymmetric CPU cost) | `--l7-method tls-handshake` (https only) |
+
+### 4. Protocol asymmetry (HTTP/2) — "one cheap frame, one expensive server reaction"
+
+Each of these is a published CVE class: work that costs the client almost
+nothing and the server a great deal. They send no application data and read no
+responses, so `--slo-*` and `--watchdog` do not apply — you judge them by
+whether the target survives.
+
+| Method | What it does | CVE |
+|---|---|---|
+| `h2-rapid-reset` | open a stream, immediately `RST_STREAM` | CVE-2023-44487 |
+| `h2-made-you-reset` | make the **server** reset the stream — evades rapid-reset mitigations | CVE-2025-8671 |
+| `h2-continuation` | `HEADERS` without `END_HEADERS`, then endless `CONTINUATION` | CVE-2024-27316 |
+| `h2-bomb` | HPACK header amplification with the memory pinned by a zero window | CVE-2026-49975 |
+| `h2-settings` / `h2-ping` | control frames the server is obliged to ACK / PONG | CVE-2019-9515 / -9512 |
+| `h2-window-update` / `h2-priority` | flow-control updates / priority-tree reshuffles | CVE-2019-9514 / -9513 |
+| `h2-empty-data` | zero-length `DATA` frames without `END_STREAM` | CVE-2019-9518 |
+
+### 5. Volume and buffers (lab) — "what happens at packet scale?"
+
+| Goal | Mode |
+|---|---|
+| Raw datagram volume | `--l4-mode udp --payload-size 1400` |
+| Fill application read buffers over real connections (PSH-ACK data flood) | `--l4-mode data --payload-size 4096` |
+| ICMP query handlers (echo / timestamp / address-mask) | `--layer l3 --l4-mode icmp` \| `icmp-timestamp` \| `icmp-address-mask` |
+
+### 6. Stateful middlebox behaviour (lab, raw sockets) — "does the firewall/IDS handle this correctly?"
+
+These probe *handling*, not volume: how a connection tracker, IDS or TCP stack
+reacts to control flags it should never see.
+
+| Goal | Mode |
+|---|---|
+| Half-open state exhaustion | `syn` |
+| Out-of-state segments — does the tracker create state it shouldn't? | `ack`, `fin`, `rst`, `urg`, `cwr`, `ece` |
+| Illegal flag combinations (contradictory / all-set / none-set) | `syn-fin`, `syn-rst`, `xmas`, `null` |
+| Maximal 40-byte TCP option block on every SYN | `tcp-options` |
+
+## Your first four runs, in order
+
+```sh
+# 1. Prove the gate and the path. Trivial load — if the allowlist or the URL is
+#    wrong, this refuses instead of sending, which is the point of run #1.
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/health --rate 10 --duration 5
+
+# 2. Steady state with an actual verdict (exits non-zero if the SLO is missed).
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/health --rate 200 --duration 60 \
+       --slo-max-5xx-rate 0.01 --slo-max-p99-ms 250
+
+# 3. Find the capacity knee: ramp until the SLO breaks, then stop and report it.
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/health --rate 5000 --duration 300 \
+       --profile ramp --discover-knee --slo-max-5xx-rate 0.01
+
+# 4. The same, on the record: hash-chained audit trail, plus an automatic abort.
+export JINRAI_OPERATOR="you@example.com"
+jinrai --layer l7 --allow '*.staging.internal' \
+       --url https://api.staging.internal/ --rate 1000 --duration 300 \
+       --slo-max-error-rate 0.05 --watchdog --audit-log runs.jsonl
+jinrai --verify-audit runs.jsonl
+```
+
+## Choosing numbers without breaking something you meant to keep
+
+* **`--rate` is a ceiling, not a target.** No profile ever exceeds it. Start an
+  order of magnitude below the capacity you expect and ramp — `--discover-knee`
+  exists so you do not have to guess twice.
+* **Concurrency is your own footprint.** `--concurrency` / `--slow-connections` /
+  `--max-connections` bound the sockets held open *by jinrai*, independently of
+  `--duration`. Doubling the duration does not double the footprint.
+* **`--watchdog` is the automatic brake**: it aborts the run after
+  `--watchdog-breaches` consecutive breaching windows. It can only ever *stop*
+  traffic, never generate it. Use it on anything long or unattended.
+* **Ctrl-C is the manual brake** — it trips the same kill-switch, and no target
+  can be authorized once it is tripped.
+* **If the summary says the run fell short of the rate cap, believe it.** A test
+  that never produced the load it promised is not evidence that the target
+  coped; see [Reading the result](#reading-the-result---output).
+
+## What jinrai deliberately will not do
+
+There is **no source-IP spoofing** anywhere: every crafted packet carries the
+host's real, OS-routed source address. There is no reflection or amplification
+through third parties, and the ICMP modes send only *query* messages the target
+answers itself — never forged errors, redirects or router messages. A target
+outside every `--allow` rule aborts the entire run. Those techniques exist to
+hide the sender or to borrow someone else's bandwidth; a test of your own
+infrastructure needs neither.
+
+---
+
 ## Language
 
 **Rust** — chosen for raw-packet throughput (L3/L4) *and* high-concurrency
@@ -74,7 +248,9 @@ Every run needs at least one `--allow` rule; an empty allowlist authorizes
 nothing and the run is refused (fail-closed). `--allow` takes either an IP/CIDR
 or a DNS pattern (`api.staging.internal`, `*.staging.internal`).
 
-**L7 — HTTP/API constant-rate load.** The `--url` host is validated as a
+### L7 — HTTP/API load
+
+Constant-rate by default. The `--url` host is validated as a
 *datum* against its own rule type (an IP-literal host against the CIDR rules, a
 DNS-name host against the DNS rules) and only then resolved once and pinned:
 
@@ -157,10 +333,10 @@ jinrai --layer l7 --allow '*.staging.internal' --l7-method slow-read \
        --drip-ms 10000 --rate 50 --duration 60
 ```
 
-The two HTTP/2 primitives (`h2-rapid-reset`, `h2-continuation`) negotiate h2 via
-ALPN for `https` and prior-knowledge h2c for `http`; the rate cap is
-reinterpreted per primitive (resets/sec, frames/sec). They send no application
-data and read no response, so `--slo-*` / `--watchdog` don't apply.
+All the `h2-*` primitives negotiate h2 via ALPN for `https` and prior-knowledge
+h2c for `http`; the rate cap is reinterpreted per primitive (resets/sec,
+frames/sec, cycles/sec). They send no application data and read no response, so
+`--slo-*` / `--watchdog` don't apply.
 
 ```sh
 # HTTP/2 CONTINUATION flood: HEADERS without END_HEADERS, then endless
@@ -192,7 +368,9 @@ jinrai --layer l7 --allow '*.staging.internal' \
        --watchdog --watchdog-window 5 --watchdog-breaches 3
 ```
 
-**L3/L4 — isolated-lab only.** Requires raw target IPs matching a CIDR `--allow`,
+### L3/L4 — isolated-lab only
+
+Requires raw target IPs matching a CIDR `--allow`,
 an explicit `--ack-l34-lab` acknowledgement, and a `--port`. `udp`/`tcp`/`data`
 need no privilege (and `tcp`/`data` work over IPv4 **and** IPv6); the raw-socket
 modes (`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-fin`/`syn-rst`/`xmas`/`null`/

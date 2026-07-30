@@ -14,7 +14,23 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
-Nothing yet.
+### Documentation
+
+- **"jinrai 101" opening section in the README.** Operator feedback: the README
+  documented every flag but never answered the first question an operator
+  actually has — *which test do I launch, and what does it tell me?* The
+  reference material described each primitive one at a time, in the order it was
+  built, so choosing between `slowloris`, `--max-connections` and `l4-mode tcp`
+  meant reading all three and inferring that they pressure the same resource.
+  The new section leads the README with the five decisions every run is made of,
+  a layer-choice rule of thumb (start at L7), and a catalogue **indexed by the
+  resource under pressure** — throughput capacity, concurrency limits, handshake
+  cost, HTTP/2 protocol asymmetry, packet volume, stateful-middlebox handling —
+  rather than by primitive name. It ends with four runs to do in order, guidance
+  on picking `--rate`/concurrency safely, and an explicit statement of what the
+  tool will not do (no spoofing, no reflection/amplification, no forged ICMP).
+  Also fixed a stale line that still called `h2-rapid-reset` and
+  `h2-continuation` "the two HTTP/2 primitives" — there are now nine.
 
 ## [0.23.0] — 2026-07-30
 
