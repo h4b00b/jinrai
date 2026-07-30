@@ -192,9 +192,52 @@ jinrai --layer l4 --l4-mode xmas --allow 10.0.0.0/8 \
        --target 10.1.2.3 --port 80 --ack-l34-lab --rate 1000 --duration 10
 ```
 
+The `tcp` mode is a **full-handshake connect flood**: it completes real TCP
+handshakes and holds them open to pressure the target's connection table and
+accept backlog. `--concurrency <N>` caps how many connections are held open at
+once (default 256); once `N` are open, admitting a new attempt closes the oldest.
+The three knobs are orthogonal, and this is the property that keeps a long run
+safe to leave running:
+
+| flag | meaning |
+| --- | --- |
+| `--rate` | offered load — connection attempts per second |
+| `--concurrency` | maximum **simultaneously open sockets** — the local footprint |
+| `--duration` | wall-clock run length, and nothing else |
+
+Because the footprint is bounded by `--concurrency` rather than by
+`rate × duration`, doubling `--duration` does not change the peak descriptor
+count. `--connect-timeout-ms` (default 500) bounds a single attempt; an attempt
+that outlives it is abandoned and counted in the `timeout` bucket:
+
+```sh
+jinrai --layer l4 --l4-mode tcp --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --port 443 --ack-l34-lab \
+       --rate 200 --duration 60 --concurrency 256
+```
+
+Handshake latency (attempt initiation → resolution) is reported as
+`latency_us(p50=… p90=… p99=… max=…)`, and failures are broken out **per
+errno** rather than as one flat count:
+
+```
+[L4 tcp-connect-flood -> port 443 (1 target)] sent=1021 errors=1964 \
+  aborted_early=false errno(EMFILE=1964) latency_us(p50=28 p90=39 p99=75 max=14855)
+```
+
+That distinction is the point: `EMFILE` / `ENFILE` / `ENOBUFS` /
+`EADDRNOTAVAIL` are *local* limits on the machine running jinrai and say nothing
+about the target, whereas `ECONNREFUSED` / `ETIMEDOUT` / `ECONNRESET` are the
+target actually rejecting traffic. A single `errors=<n>` cannot tell them apart,
+and each has a different fix. At startup jinrai also raises its own
+`RLIMIT_NOFILE` soft limit to the hard limit and logs the resulting ceiling
+(`fd ceiling: …`), because a shell's `ulimit -n` is shell-local and absent under
+systemd or cron. That is headroom, not a substitute for `--concurrency`.
+
 The `data` mode is a **PSH-ACK data flood**: it opens a bounded pool of real OS
-connections and writes `--payload-size` bytes into each, filling the target's
-application buffers rather than just its accept backlog. No privilege needed:
+connections (also capped by `--concurrency`) and writes `--payload-size` bytes
+into each, filling the target's application buffers rather than just its accept
+backlog. No privilege needed:
 
 ```sh
 jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 \

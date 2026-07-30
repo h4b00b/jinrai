@@ -16,6 +16,69 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.21.0] — 2026-07-30
+
+L4 (fix): the `tcp-connect-flood` had no completion path. Every `TcpStream` was
+pushed into a `Vec` that lived for the whole run, so no descriptor was ever
+closed, the in-flight count grew as `rate × duration`, and the run's local
+footprint was a function of how long it ran. Measured: fd count rising
+monotonically 3 → 1899 over a 10s run at rate 200 with **zero** closes; under a
+default `ulimit -n 1024` exactly 1021 connects succeeded and every later attempt
+failed, reported only as an anonymous `errors=957`.
+
+### Fixed
+
+- **Connection completion + bounded footprint.** Each attempt now awaits handshake
+  resolution, records its outcome, and the held set is a **bounded FIFO** capped by
+  the new `--concurrency`: eviction happens *before* the next connect, so the open
+  descriptor count never exceeds the cap even momentarily. Resource usage is now
+  independent of `--duration` — verified at 5s/10s/20s, peak fd identical.
+- **Latency is actually measured.** The handshake is timed from attempt initiation
+  to resolution and fed to an `hdrhistogram`, so `latency_us(p50/p90/p99/max)` is
+  populated instead of reporting all-zero after thousands of successful connects.
+  (`connect_timeout` is blocking and returns only once the handshake has resolved,
+  so there is no `EINPROGRESS` to mis-measure.)
+- The `data` flood's connection pool is now sized by `--concurrency` too, replacing
+  a hard-coded `MAX_DATA_CONNS = 128`.
+
+### Added
+
+- **`--concurrency <N>`** (default 256) — the ceiling on simultaneously open
+  sockets for the connection-holding L4 modes (`tcp`, `data`). Makes the three
+  knobs orthogonal: `--rate` is offered load, `--concurrency` is the local
+  footprint, `--duration` is wall-clock length only. A cap of `0` clamps to `1`
+  rather than silently disabling the mode.
+- **`--connect-timeout-ms <MS>`** (default 500) — previously hard-coded.
+- **Per-errno failure breakdown** in the summary line, e.g.
+  `errno(EMFILE=1964 ECONNREFUSED=3 timeout=1)`, via `ErrnoBucket` / `ErrnoTally`
+  in `core`. A bare `errors=<n>` is the same number for four causes with four
+  different fixes: `EMFILE`/`ENFILE`/`ENOBUFS`/`EADDRNOTAVAIL` are *local* limits
+  on the host running jinrai, while `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` are the
+  target rejecting traffic. Our own expired `--connect-timeout-ms` gets a `timeout`
+  bucket distinct from the kernel's `ETIMEDOUT`; anything unrecognised keeps its
+  raw code as `os:<code>`, so no failure is ever an anonymous increment.
+- **`RLIMIT_NOFILE` raised at startup** (soft → hard) with the resulting ceiling
+  logged as `fd ceiling: <n> (hard limit <n>)`. A shell's `ulimit -n` is
+  shell-local and absent under systemd or cron, so descriptor headroom must not
+  depend on how the run was launched. This is headroom, **not** a fix — the cap is
+  what bounds the footprint, and `errno(EMFILE=…)` now says so out loud rather than
+  letting a local limit masquerade as target behaviour.
+- `scripts/lab_listener.py` + `scripts/verify_criteria.sh` —  reproduce the
+  fd-footprint, latency, errno and pacing measurements against a local listener.
+
+### Notes
+
+- **The pacer was left alone, deliberately.** The reported 2–10% shortfall in
+  `sent` was a *consequence* of the leak (the missing units were EMFILE failures),
+  not independent drift: with the footprint bounded, attempts land at 100.0% /
+  100.0% / 99.8% / 99.4% / 99.2% of `rate × duration` at rates 50 / 100 / 200 /
+  400 / 800 per second. The loop already schedules on absolute deadlines
+  (`next += interval`). At 1600/s it reaches 94.4%, the floor set by
+  `thread::sleep` granularity against a 625µs period — and closing that last gap
+  would require bursting to repay accumulated debt, which `RateCap` exists to
+  forbid. Honouring the rate ceiling is worth a few percent at extreme rates.
+- No change to allowlist enforcement or the `--ack-l34-lab` gate.
+
 ## [0.20.0] — 2026-07-15
 
 L7 (extension): stream-based HTTP/2 floods — closes the in-scope HTTP/2 gap

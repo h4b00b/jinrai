@@ -678,6 +678,10 @@ impl StressModule for L7Engine {
             status_4xx: s4xx.load(Ordering::Relaxed),
             status_5xx: s5xx.load(Ordering::Relaxed),
             timeouts: timeouts.load(Ordering::Relaxed),
+            // The L7 client reports transport failures at the HTTP level, not as
+            // raw socket errnos, so this layer leaves the breakdown empty and the
+            // reporter omits it.
+            errno: Default::default(),
             aborted_by_watchdog: by_watchdog,
             p50_micros: hist.value_at_quantile(0.5),
             p90_micros: hist.value_at_quantile(0.9),

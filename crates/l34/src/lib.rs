@@ -38,13 +38,14 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
+use hdrhistogram::Histogram;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
+use jinrai_core::{ErrnoBucket, ErrnoTally, Layer, RunPlan, RunReport, StressModule};
 
 /// Which L4 primitive to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +275,95 @@ pub struct L34Config {
     /// UDP payload size in bytes (ignored by TCP/SYN). Capped to a sane MTU-ish
     /// ceiling to avoid accidental fragmentation surprises.
     pub payload_size: usize,
+    /// Ceiling on **simultaneously open sockets** for the connection-holding
+    /// modes (`tcp` / `data`). This is what decouples the run's local footprint
+    /// from `--duration`: the three knobs are orthogonal —
+    ///   * `rate` is the offered load (attempts/sec),
+    ///   * `concurrency` is the maximum open sockets at any instant,
+    ///   * `duration` is wall-clock run length and *nothing else*.
+    ///
+    /// Clamped to at least 1 (see [`L34Config::effective_concurrency`]).
+    pub concurrency: usize,
+    /// How long a single connection attempt may stay unresolved before it is
+    /// abandoned and bucketed as [`ErrnoBucket::Timeout`].
+    pub connect_timeout: Duration,
+}
+
+/// Default in-flight cap: high enough to apply real connection-table pressure,
+/// comfortably below a default 1024-descriptor ceiling so a stock shell cannot
+/// turn the run into an EMFILE self-test.
+pub const DEFAULT_CONCURRENCY: usize = 256;
+
+/// Default per-attempt connect timeout (the historical hard-coded value).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+impl L34Config {
+    /// The in-flight cap actually enforced: a cap of 0 would mean "close the
+    /// socket we just opened before doing anything with it", so 0 is clamped up
+    /// to 1 rather than silently disabling the mode.
+    pub fn effective_concurrency(&self) -> usize {
+        self.concurrency.max(1)
+    }
+}
+
+/// What one emission attempt produced.
+enum Emission {
+    /// The unit went out. `latency` is `Some` only for attempts with an
+    /// observable completion — the TCP handshake, timed from initiation to
+    /// resolution. A fire-and-forget packet send (UDP / raw / ICMP) has no
+    /// completion to observe, so it reports `None` rather than a meaningless 0.
+    Sent { latency: Option<Duration> },
+    /// The attempt failed, bucketed by the OS error behind it.
+    Failed(ErrnoBucket),
+}
+
+/// Classify an I/O failure into a reporting bucket.
+///
+/// Portable [`ErrorKind`](std::io::ErrorKind)s are matched first. `EMFILE` /
+/// `ENFILE` / `ENOBUFS` have no stable `ErrorKind` (they still decode to
+/// `Uncategorized`), so they are recognised by raw code — and telling `EMFILE`
+/// apart from target behaviour is the entire reason this breakdown exists.
+/// Anything unrecognised keeps its raw code via [`ErrnoBucket::Other`], so no
+/// failure is ever reported as an anonymous increment.
+fn classify_io(e: &std::io::Error) -> ErrnoBucket {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused => return ErrnoBucket::Econnrefused,
+        ErrorKind::ConnectionReset => return ErrnoBucket::Econnreset,
+        ErrorKind::AddrNotAvailable => return ErrnoBucket::Eaddrnotavail,
+        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+            return ErrnoBucket::Eunreach
+        }
+        ErrorKind::TimedOut => {
+            // `TcpStream::connect_timeout` signals *our* expired deadline with a
+            // synthetic TimedOut error that carries no OS code; the kernel's own
+            // ETIMEDOUT does carry one. The two have different fixes (raise the
+            // timeout vs. the target is not answering), so they get different
+            // buckets.
+            return match e.raw_os_error() {
+                Some(_) => ErrnoBucket::Etimedout,
+                None => ErrnoBucket::Timeout,
+            };
+        }
+        // A non-blocking connect that has not resolved yet is our timeout too.
+        ErrorKind::WouldBlock => return ErrnoBucket::Timeout,
+        _ => {}
+    }
+    match e.raw_os_error() {
+        // EMFILE/ENFILE sit in the original low POSIX errno range, whose values
+        // are identical across Linux, macOS and the BSDs.
+        #[cfg(unix)]
+        Some(24) => ErrnoBucket::Emfile,
+        #[cfg(unix)]
+        Some(23) => ErrnoBucket::Enfile,
+        // ENOBUFS is *not* value-stable across unixes (105 on Linux, 55 on
+        // macOS), so only Linux's value is claimed by name; elsewhere it falls
+        // through to `Other` with its raw code intact.
+        #[cfg(target_os = "linux")]
+        Some(105) => ErrnoBucket::Enobufs,
+        Some(code) => ErrnoBucket::Other(code),
+        None => ErrnoBucket::Internal,
+    }
 }
 
 /// Why an L3/L4 run could not be prepared or fully run. Fail-closed.
@@ -425,12 +515,17 @@ impl L34Engine {
             }
         };
 
-        let mut sender = Sender::setup(self.config.mode, self.config.payload_size, &ips)?;
+        let mut sender = Sender::setup(&self.config)?;
 
         let mut sent = 0u64;
         let mut errors = 0u64;
+        let mut errno = ErrnoTally::default();
         let mut aborted = false;
         let mut idx = 0usize;
+        // 1us .. 60s at 3 significant figures — bounded memory regardless of how
+        // long the run holds, unlike retaining every sample.
+        let mut latency: Histogram<u64> =
+            Histogram::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds");
 
         let start = Instant::now();
         let mut next = start;
@@ -442,8 +537,23 @@ impl L34Engine {
             let ip = ips[idx % ips.len()];
             idx += 1;
             match sender.send(ip, self.config.port) {
-                Ok(()) => sent += 1,
-                Err(_) => errors += 1,
+                Ok(Emission::Sent { latency: observed }) => {
+                    sent += 1;
+                    if let Some(d) = observed {
+                        // Saturate at the histogram ceiling rather than drop the
+                        // sample: a 60s+ handshake still belongs in `max`.
+                        let us = (d.as_micros() as u64).clamp(1, 60_000_000);
+                        let _ = latency.record(us);
+                    }
+                }
+                Ok(Emission::Failed(bucket)) => {
+                    errors += 1;
+                    errno.record(bucket);
+                }
+                Err(_) => {
+                    errors += 1;
+                    errno.record(ErrnoBucket::Internal);
+                }
             }
 
             next += interval;
@@ -459,11 +569,19 @@ impl L34Engine {
             }
         }
 
+        // Only the connection-oriented modes feed the histogram; a packet flood
+        // leaves it empty and reports zeros rather than inventing percentiles.
+        let measured = !latency.is_empty();
         Ok(RunReport {
             layer_label: label,
             units_sent: sent,
             errors,
+            errno,
             aborted_early: aborted,
+            p50_micros: if measured { latency.value_at_quantile(0.5) } else { 0 },
+            p90_micros: if measured { latency.value_at_quantile(0.9) } else { 0 },
+            p99_micros: if measured { latency.value_at_quantile(0.99) } else { 0 },
+            max_micros: if measured { latency.max() } else { 0 },
             ..Default::default()
         })
     }
@@ -472,13 +590,19 @@ impl L34Engine {
 /// Per-mode socket state, created once before the send loop.
 enum Sender {
     Udp { sock: UdpSocket, payload: Vec<u8> },
-    Tcp { held: Vec<TcpStream>, timeout: Duration },
+    /// TCP full-handshake connect flood. `held` is a **bounded** FIFO of open
+    /// connections: the flood keeps up to `cap` handshakes established at once to
+    /// apply connection-table pressure, and admitting attempt `cap + 1` closes
+    /// the oldest first. That bound is the whole point — the footprint is a
+    /// function of `cap`, never of how long the run lasts.
+    Tcp { held: VecDeque<TcpStream>, cap: usize, timeout: Duration },
     /// TCP data (PSH-ACK) flood: a bounded pool of established connections that we
     /// write application data into. `idx` round-robins writes across the pool;
     /// dead connections are dropped and replaced. `timeout` bounds both connect
     /// and each write (a write that blocks on a full buffer is *pressure applied*,
-    /// not a failure).
-    TcpData { conns: Vec<TcpStream>, payload: Vec<u8>, timeout: Duration, idx: usize },
+    /// not a failure). `cap` is the pool ceiling, taken from the same
+    /// `concurrency` knob the connect flood uses.
+    TcpData { conns: Vec<TcpStream>, payload: Vec<u8>, cap: usize, timeout: Duration, idx: usize },
     /// Raw IPv4+TCP flag flood (SYN/ACK/FIN/RST/Xmas/NULL) or TCP-options bomb.
     /// `flags` selects which control flags are set; `with_options` attaches the
     /// maximal 40-byte option block (the options-bomb mode); everything else is
@@ -501,15 +625,14 @@ enum Sender {
 /// UDP payloads above this are rejected to avoid accidental fragmentation.
 const MAX_UDP_PAYLOAD: usize = 1472;
 
-/// TCP-data-flood tunables. The pool is bounded so the flood establishes a fixed
-/// number of connections and then sustains data on them (rather than growing
-/// unboundedly like the connect flood). The per-write payload is capped well
-/// above a single segment — TCP handles segmentation — to push more per write.
-const MAX_DATA_CONNS: usize = 128;
+/// The per-write payload for the data flood is capped well above a single
+/// segment — TCP handles segmentation — to push more bytes per write.
 const MAX_DATA_PAYLOAD: usize = 65_536;
 
 impl Sender {
-    fn setup(mode: L4Mode, payload_size: usize, _ips: &[IpAddr]) -> Result<Self, L34Error> {
+    fn setup(config: &L34Config) -> Result<Self, L34Error> {
+        let L34Config { mode, payload_size, connect_timeout, .. } = *config;
+        let cap = config.effective_concurrency();
         match mode {
             L4Mode::Udp => {
                 let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
@@ -518,14 +641,16 @@ impl Sender {
                 Ok(Sender::Udp { sock, payload })
             }
             L4Mode::TcpConnect => Ok(Sender::Tcp {
-                held: Vec::new(),
-                timeout: Duration::from_millis(500),
+                held: VecDeque::with_capacity(cap),
+                cap,
+                timeout: connect_timeout,
             }),
             L4Mode::Data => Ok(Sender::TcpData {
-                conns: Vec::new(),
+                conns: Vec::with_capacity(cap),
                 // Non-zero, bounded payload for each PSH-ACK write.
                 payload: vec![0u8; payload_size.clamp(1, MAX_DATA_PAYLOAD)],
-                timeout: Duration::from_millis(500),
+                cap,
+                timeout: connect_timeout,
                 idx: 0,
             }),
             L4Mode::Icmp | L4Mode::IcmpTimestamp | L4Mode::IcmpAddressMask => {
@@ -552,34 +677,57 @@ impl Sender {
         }
     }
 
-    fn send(&mut self, ip: IpAddr, port: u16) -> Result<(), L34Error> {
+    fn send(&mut self, ip: IpAddr, port: u16) -> Result<Emission, L34Error> {
         match self {
-            Sender::Udp { sock, payload } => sock
-                .send_to(payload, SocketAddr::new(ip, port))
-                .map(|_| ())
-                .map_err(|e| L34Error::Setup(e.to_string())),
+            Sender::Udp { sock, payload } => Ok(
+                match sock.send_to(payload, SocketAddr::new(ip, port)) {
+                    // A datagram send has no completion to observe.
+                    Ok(_) => Emission::Sent { latency: None },
+                    Err(e) => Emission::Failed(classify_io(&e)),
+                },
+            ),
 
-            Sender::Tcp { held, timeout } => {
-                let stream = TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout)
-                    .map_err(|e| L34Error::Setup(e.to_string()))?;
-                // Hold the connection open to exercise the target's connection
-                // table / backlog; dropped when the run ends.
-                held.push(stream);
-                Ok(())
+            Sender::Tcp { held, cap, timeout } => {
+                // Evict *before* connecting, so the number of open descriptors
+                // never exceeds `cap` even momentarily. Dropping the stream closes
+                // it — this is the completion path the flood previously lacked,
+                // and why the footprint no longer tracks the run's duration.
+                while held.len() >= *cap {
+                    held.pop_front();
+                }
+                // Blocking connect: it returns only once the handshake has
+                // resolved (or the timeout expired), so the elapsed time either
+                // side of it *is* attempt-initiation-to-resolution. There is no
+                // EINPROGRESS to mis-measure here.
+                let began = Instant::now();
+                match TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout) {
+                    Ok(stream) => {
+                        let elapsed = began.elapsed();
+                        // Hold the established connection to keep pressure on the
+                        // target's connection table, but only up to `cap`.
+                        held.push_back(stream);
+                        Ok(Emission::Sent { latency: Some(elapsed) })
+                    }
+                    Err(e) => Ok(Emission::Failed(classify_io(&e))),
+                }
             }
 
-            Sender::TcpData { conns, payload, timeout, idx } => {
+            Sender::TcpData { conns, payload, cap, timeout, idx } => {
                 // Below the pool cap, each send opens a new connection and primes
                 // it with a write — this ramps the pool up. Once full, we sustain
                 // data by round-robining a write onto an existing connection.
-                if conns.len() < MAX_DATA_CONNS {
+                if conns.len() < *cap {
+                    let began = Instant::now();
                     let mut stream =
-                        TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout)
-                            .map_err(|e| L34Error::Setup(e.to_string()))?;
+                        match TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout) {
+                            Ok(s) => s,
+                            Err(e) => return Ok(Emission::Failed(classify_io(&e))),
+                        };
+                    let elapsed = began.elapsed();
                     let _ = stream.set_write_timeout(Some(*timeout));
                     write_pshack(&mut stream, payload);
                     conns.push(stream);
-                    return Ok(());
+                    return Ok(Emission::Sent { latency: Some(elapsed) });
                 }
                 // Round-robin one connection; a full send buffer is pressure
                 // applied (counts as sent), a real error retires the connection
@@ -588,16 +736,23 @@ impl Sender {
                 *idx = (*idx + 1) % n;
                 let i = *idx;
                 match write_pshack(&mut conns[i], payload) {
-                    WriteOutcome::Sent => Ok(()),
+                    // A write onto an established connection has no handshake to time.
+                    WriteOutcome::Sent => Ok(Emission::Sent { latency: None }),
                     WriteOutcome::Dead => {
+                        // Retire the dead connection *first* so replacing it cannot
+                        // transiently exceed the cap.
                         conns.swap_remove(i);
+                        let began = Instant::now();
                         let mut stream =
-                            TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout)
-                                .map_err(|e| L34Error::Setup(e.to_string()))?;
+                            match TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout) {
+                                Ok(s) => s,
+                                Err(e) => return Ok(Emission::Failed(classify_io(&e))),
+                            };
+                        let elapsed = began.elapsed();
                         let _ = stream.set_write_timeout(Some(*timeout));
                         write_pshack(&mut stream, payload);
                         conns.push(stream);
-                        Ok(())
+                        Ok(Emission::Sent { latency: Some(elapsed) })
                     }
                 }
             }
@@ -624,9 +779,10 @@ impl Sender {
                     build_tcp_packet(src, dst, src_port, port, *counter, *flags)?
                 };
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
-                raw.send_to(&packet, &dest)
-                    .map(|_| ())
-                    .map_err(|e| L34Error::Setup(e.to_string()))
+                Ok(match raw.send_to(&packet, &dest) {
+                    Ok(_) => Emission::Sent { latency: None },
+                    Err(e) => Emission::Failed(classify_io(&e)),
+                })
             }
 
             Sender::Icmp { raw, query, id, counter, payload } => {
@@ -640,9 +796,10 @@ impl Sender {
                 // Port is irrelevant for ICMP; the kernel builds the IP header from
                 // the real source address (IPPROTO_ICMP), so there is no spoof path.
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
-                raw.send_to(&packet, &dest)
-                    .map(|_| ())
-                    .map_err(|e| L34Error::Setup(e.to_string()))
+                Ok(match raw.send_to(&packet, &dest) {
+                    Ok(_) => Emission::Sent { latency: None },
+                    Err(e) => Emission::Failed(classify_io(&e)),
+                })
             }
         }
     }
@@ -860,6 +1017,18 @@ mod tests {
             KillSwitch::new(),
         );
         gate.authorize(ip.parse().unwrap()).unwrap()
+    }
+
+    /// A config at the shipped defaults; tests that care about the in-flight cap
+    /// or the attempt timeout override the field they are testing.
+    fn config(mode: L4Mode, port: u16, payload_size: usize) -> L34Config {
+        L34Config {
+            mode,
+            port,
+            payload_size,
+            concurrency: DEFAULT_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        }
     }
 
     fn plan(targets: Vec<AuthorizedTarget>, rate: u64, secs: u64) -> RunPlan {
@@ -1090,7 +1259,7 @@ mod tests {
             (L4Mode::IcmpTimestamp, "icmp-timestamp-flood", 13),
             (L4Mode::IcmpAddressMask, "icmp-address-mask-flood", 17),
         ] {
-            let engine = L34Engine::new(L34Config { mode, port: 0, payload_size: 32 });
+            let engine = L34Engine::new(config(mode, 0, 32));
             assert_eq!(engine.layer(), Layer::L3, "{mode:?} is L3");
             assert_eq!(engine.name(), name);
             assert!(mode.is_icmp(), "{mode:?} is an ICMP mode");
@@ -1102,7 +1271,7 @@ mod tests {
 
     #[test]
     fn icmp_is_layer_l3_and_needs_a_raw_socket() {
-        let engine = L34Engine::new(L34Config { mode: L4Mode::Icmp, port: 0, payload_size: 32 });
+        let engine = L34Engine::new(config(L4Mode::Icmp, 0, 32));
         assert_eq!(engine.layer(), Layer::L3);
         assert_eq!(engine.name(), "icmp-echo-flood");
         assert!(L4Mode::Icmp.needs_raw_socket());
@@ -1150,11 +1319,7 @@ mod tests {
     fn rate_zero_sends_nothing() {
         // Rate 0 must be honoured deterministically, without opening a socket.
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
-        let mut engine = L34Engine::new(L34Config {
-            mode: L4Mode::Udp,
-            port: 9,
-            payload_size: 64,
-        });
+        let mut engine = L34Engine::new(config(L4Mode::Udp, 9, 64));
         let report = engine.execute(&plan(vec![t], 0, 1));
         assert_eq!(report.units_sent, 0);
         assert_eq!(report.errors, 0);
@@ -1169,11 +1334,7 @@ mod tests {
             KillSwitch::new(),
         );
         let host_target = gate.authorize_host("api.staging.internal").unwrap();
-        let mut engine = L34Engine::new(L34Config {
-            mode: L4Mode::Udp,
-            port: 9,
-            payload_size: 64,
-        });
+        let mut engine = L34Engine::new(config(L4Mode::Udp, 9, 64));
         let report = engine.execute(&plan(vec![host_target], 100, 1));
         assert_eq!(report.units_sent, 0);
         assert!(report.aborted_early);
@@ -1202,7 +1363,7 @@ mod tests {
             L4Mode::IcmpAddressMask,
         ] {
             let t = authorized_ip("::1/128", "::1");
-            let engine = L34Engine::new(L34Config { mode, port: 9, payload_size: 16 });
+            let engine = L34Engine::new(config(mode, 9, 16));
             let p = plan(vec![t], 50, 1);
             // preflight refuses before any socket work (no raw socket / no root needed).
             match engine.preflight(&p) {
@@ -1226,16 +1387,267 @@ mod tests {
         // TCP connect handles IPv6 natively, so it must NOT be refused by the
         // family guard (it will simply attempt the connection).
         let t = authorized_ip("::1/128", "::1");
-        let engine = L34Engine::new(L34Config {
-            mode: L4Mode::TcpConnect,
-            port: 9,
-            payload_size: 16,
-        });
+        let engine = L34Engine::new(config(L4Mode::TcpConnect, 9, 16));
         assert!(engine.preflight(&plan(vec![t], 50, 1)).is_ok());
+    }
+
+    /// Serialises every test that either *measures* or *perturbs* this process's
+    /// descriptor table. `/proc/self/fd` is process-wide and cargo runs tests as
+    /// parallel threads of one process, so an unguarded fd measurement silently
+    /// counts the sockets of whatever else is running — which reads exactly like
+    /// the leak it is supposed to detect.
+    static FD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the descriptor-table lock. A panicking test poisons the mutex; recover
+    /// the guard rather than cascading unrelated failures.
+    fn fd_guard() -> std::sync::MutexGuard<'static, ()> {
+        FD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many descriptors this process currently holds open. Linux-only (it
+    /// reads `/proc/self/fd`), which is where the leak was measured and where the
+    /// fd-plateau criteria are meaningful.
+    #[cfg(target_os = "linux")]
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd").count()
+    }
+
+    /// A loopback TCP listener that accepts each connection and immediately closes
+    /// its own end.
+    ///
+    /// The server end is deliberately *not* retained: listener and flood share this
+    /// process, so `/proc/self/fd` counts both ends and holding the accepted
+    /// sockets would make the harness itself ramp, masking what the flood does.
+    /// Closing the far end does not affect the measurement — a descriptor on our
+    /// side stays allocated until the `TcpStream` is dropped no matter what the
+    /// peer does, which is exactly the property under test.
+    #[cfg(target_os = "linux")]
+    fn accept_and_close_listener(hold: Duration) -> (u16, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + hold;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((s, _)) => drop(s),
+                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    /// Run the connect flood while sampling this process's fd count, and return
+    /// (report, samples). Mirrors the `fd count sampled every 0.5s` measurement
+    /// that exposed the leak, just at a finer interval for a short test.
+    #[cfg(target_os = "linux")]
+    fn connect_flood_fd_samples(
+        concurrency: usize,
+        rate: u64,
+        secs: u64,
+    ) -> (RunReport, Vec<usize>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let (port, acceptor) = accept_and_close_listener(Duration::from_secs(secs + 2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let sampler = {
+            let stop = stop.clone();
+            let samples = samples.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    samples.lock().unwrap().push(open_fds());
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            })
+        };
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(L34Config {
+            concurrency,
+            ..config(L4Mode::TcpConnect, port, 16)
+        });
+        let report = engine.execute(&plan(vec![t], rate, secs));
+
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        acceptor.join().unwrap();
+        let samples = samples.lock().unwrap().clone();
+        (report, samples)
+    }
+
+    /// ACCEPTANCE: fd count must rise to the cap and then *plateau*. A ramp
+    /// (strictly monotonic growth, deltas tracking the rate) is the bug.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn connect_flood_fd_count_plateaus_at_concurrency() {
+        let _fd = fd_guard();
+        const CAP: usize = 32;
+        let (report, samples) = connect_flood_fd_samples(CAP, 400, 2);
+        assert!(report.units_sent > 0, "flood should have connected: {report:?}");
+        assert!(samples.len() > 8, "sampler should have collected a series");
+
+        // Descriptors the flood itself holds, over the harness baseline. Slack
+        // covers the listener, the sampler, and a socket mid-accept.
+        let baseline = samples[0];
+        let peak = *samples.iter().max().unwrap();
+        let peak_delta = peak.saturating_sub(baseline);
+        assert!(
+            peak_delta <= CAP + 16,
+            "fd peak delta {peak_delta} (peak {peak}, baseline {baseline}) must stay \
+             bounded by the cap {CAP}, not grow with the {} attempts made; samples: {samples:?}",
+            report.units_sent
+        );
+        // A plateau, not a ramp. Under the leak this series was strictly
+        // monotonic for the whole run; a plateau's second half cannot be
+        // meaningfully higher than its first.
+        let split = samples.len() / 2;
+        let first_half_peak = *samples[..split].iter().max().unwrap();
+        let tail_peak = *samples[split..].iter().max().unwrap();
+        assert!(
+            tail_peak <= first_half_peak + 8,
+            "fd count is still ramping rather than plateauing: first-half peak \
+             {first_half_peak}, tail peak {tail_peak}; samples: {samples:?}"
+        );
+    }
+
+    /// ACCEPTANCE: doubling `--duration` must not change the peak fd count. This
+    /// is the property the old `Vec<TcpStream>` violated by construction.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn connect_flood_footprint_is_independent_of_duration() {
+        let _fd = fd_guard();
+        const CAP: usize = 24;
+        let (short_report, short_samples) = connect_flood_fd_samples(CAP, 300, 1);
+        let (long_report, long_samples) = connect_flood_fd_samples(CAP, 300, 2);
+
+        let peak_delta = |s: &[usize]| s.iter().max().unwrap().saturating_sub(s[0]);
+        let short_peak = peak_delta(&short_samples);
+        let long_peak = peak_delta(&long_samples);
+        assert!(
+            long_report.units_sent > short_report.units_sent,
+            "the longer run should have attempted more connections \
+             (short={}, long={})",
+            short_report.units_sent,
+            long_report.units_sent
+        );
+        // Roughly twice the attempts, same footprint. Under the leak the peak grew
+        // as rate*duration, so this margin could not be met.
+        assert!(
+            long_peak <= short_peak + 8,
+            "doubling duration changed the peak fd delta: {short_peak} -> {long_peak} \
+             (attempts {} -> {})",
+            short_report.units_sent,
+            long_report.units_sent
+        );
+    }
+
+    /// ACCEPTANCE: latency must be measured and ordered. The old code fed nothing
+    /// into a histogram and reported p50=p90=p99=max=0 even after ~2000 connects.
+    #[test]
+    fn connect_flood_reports_ordered_nonzero_latency() {
+        let _fd = fd_guard();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine =
+            L34Engine::new(L34Config { concurrency: 16, ..config(L4Mode::TcpConnect, port, 16) });
+        let report = engine.execute(&plan(vec![t], 300, 1));
+
+        assert!(report.units_sent > 0, "should have completed handshakes: {report:?}");
+        assert!(report.max_micros > 0, "handshake latency must be measured, not left at 0");
+        assert!(
+            report.p50_micros <= report.p90_micros
+                && report.p90_micros <= report.p99_micros
+                && report.p99_micros <= report.max_micros,
+            "percentiles must be monotonically ordered, got p50={} p90={} p99={} max={}",
+            report.p50_micros,
+            report.p90_micros,
+            report.p99_micros,
+            report.max_micros
+        );
+        drop(listener);
+    }
+
+    /// ACCEPTANCE: failures are bucketed by errno, and the tally reconciles with
+    /// the flat `errors` count. Connecting to a closed port yields ECONNREFUSED on
+    /// loopback — crucially *not* the same bucket a local fd ceiling would land in.
+    #[test]
+    fn connect_flood_buckets_failures_by_errno() {
+        let _fd = fd_guard();
+        // Bind then drop, so the port is almost certainly unbound and refusing.
+        let closed_port = {
+            let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(config(L4Mode::TcpConnect, closed_port, 16));
+        let report = engine.execute(&plan(vec![t], 100, 1));
+
+        assert!(report.errors > 0, "connecting to a closed port must fail: {report:?}");
+        assert_eq!(
+            report.errno.total(),
+            report.errors,
+            "the breakdown must account for every error: {:?}",
+            report.errno.iter().collect::<Vec<_>>()
+        );
+        let buckets: Vec<_> = report.errno.iter().map(|(b, _)| b).collect();
+        assert!(
+            buckets.contains(&ErrnoBucket::Econnrefused),
+            "a refused connection must be attributed to ECONNREFUSED, got {buckets:?}"
+        );
+        assert!(
+            !buckets.contains(&ErrnoBucket::Emfile),
+            "a refused connection must NOT be confused with a local fd ceiling"
+        );
+    }
+
+    /// The attempt timeout is configurable, and expiring it lands in the `timeout`
+    /// bucket rather than being reported as the kernel's ETIMEDOUT — the two have
+    /// different fixes.
+    #[test]
+    fn our_expired_attempt_timeout_is_its_own_bucket() {
+        let _fd = fd_guard();
+        // A blackhole: a listener with a full backlog, or an unroutable address.
+        // 192.0.2.0/24 (TEST-NET-1) is reserved and never routed, so the handshake
+        // simply never resolves.
+        let t = authorized_ip("192.0.2.0/24", "192.0.2.1");
+        let mut engine = L34Engine::new(L34Config {
+            concurrency: 8,
+            connect_timeout: Duration::from_millis(50),
+            ..config(L4Mode::TcpConnect, 443, 16)
+        });
+        let report = engine.execute(&plan(vec![t], 20, 1));
+
+        assert_eq!(report.units_sent, 0, "an unroutable target cannot complete a handshake");
+        assert_eq!(report.errno.total(), report.errors);
+        let buckets: Vec<_> = report.errno.iter().map(|(b, _)| b).collect();
+        // Either our own deadline expired (Timeout) or the host is unreachable —
+        // both are legitimate here, but neither may be a bare unclassified count.
+        assert!(
+            buckets
+                .iter()
+                .all(|b| !matches!(b, ErrnoBucket::Internal)),
+            "every failure must carry an OS attribution, got {buckets:?}"
+        );
+        assert!(!buckets.is_empty(), "failures must be bucketed: {report:?}");
+    }
+
+    #[test]
+    fn concurrency_of_zero_is_clamped_up_rather_than_disabling_the_mode() {
+        // A cap of 0 would mean "close the socket before using it"; clamp to 1.
+        let c = L34Config { concurrency: 0, ..config(L4Mode::TcpConnect, 9, 16) };
+        assert_eq!(c.effective_concurrency(), 1);
+        assert_eq!(config(L4Mode::TcpConnect, 9, 16).effective_concurrency(), DEFAULT_CONCURRENCY);
     }
 
     #[test]
     fn data_flood_delivers_bytes_to_a_local_listener() {
+        let _fd = fd_guard();
         // A TCP listener that accepts and drains: the data flood must establish a
         // real connection and deliver application bytes (PSH-ACK), i.e. exercise
         // the app buffers, not just the accept backlog.
@@ -1265,11 +1677,7 @@ mod tests {
         });
 
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
-        let mut engine = L34Engine::new(L34Config {
-            mode: L4Mode::Data,
-            port,
-            payload_size: 512,
-        });
+        let mut engine = L34Engine::new(config(L4Mode::Data, port, 512));
         let report = engine.execute(&plan(vec![t], 200, 1));
         acceptor.join().unwrap();
 
@@ -1285,12 +1693,13 @@ mod tests {
         assert_eq!(L4Mode::Data.raw_tcp_flags(), None);
         // Like TcpConnect, the OS stack handles IPv6, so it must not be refused.
         let t = authorized_ip("::1/128", "::1");
-        let engine = L34Engine::new(L34Config { mode: L4Mode::Data, port: 9, payload_size: 16 });
+        let engine = L34Engine::new(config(L4Mode::Data, 9, 16));
         assert!(engine.preflight(&plan(vec![t], 50, 1)).is_ok());
     }
 
     #[test]
     fn udp_flood_sends_to_local_listener() {
+        let _fd = fd_guard();
         // Bind a UDP listener and confirm the flood actually delivers datagrams.
         let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1299,11 +1708,7 @@ mod tests {
             .unwrap();
 
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
-        let mut engine = L34Engine::new(L34Config {
-            mode: L4Mode::Udp,
-            port,
-            payload_size: 16,
-        });
+        let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
         let report = engine.execute(&plan(vec![t], 200, 1));
         assert!(report.units_sent > 0, "should have sent datagrams");
         assert_eq!(report.errors, 0);
