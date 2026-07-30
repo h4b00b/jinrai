@@ -87,7 +87,7 @@ jinrai --layer l7 --allow '*.staging.internal' \
 
 | Method | Kind | Notes |
 |---|---|---|
-| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host); `--max-connections <N>` caps concurrent connections (see below) |
+| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host); `--max-connections <N>` caps concurrent connections (see below); `--http-version <auto\|1.1\|2>` pins the protocol version (see below) |
 | `slowloris` | slow connection | partial request headers, never terminated |
 | `slowbody` | slow connection | oversized `Content-Length`, body trickled a byte at a time (RUDY) |
 | `slow-read` | slow connection | send a *complete* request, then drain the response one small chunk per tick with a shrunken receive window (`SO_RCVBUF`) so the server cannot flush it — the read-side mirror of `slowbody` |
@@ -101,6 +101,32 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | `h2-made-you-reset` | HTTP/2 | complete request then a zero-increment `WINDOW_UPDATE` so the **server** resets the stream (CVE-2025-8671, "MadeYouReset") — evades Rapid-Reset mitigations; rate cap = reset cycles/sec |
 | `h2-empty-data` | HTTP/2 | open a stream, then flood zero-length `DATA` frames without `END_STREAM` (CVE-2019-9518); rate cap = frames/sec |
 | `h2-bomb` | HTTP/2 | HPACK 1-byte-reference header amplification + `INITIAL_WINDOW_SIZE=0` so the amplified memory stays pinned (CVE-2026-49975, "HTTP/2 Bomb"); rate cap = bomb frames/sec |
+
+**HTTP/1.1 vs HTTP/2 (`--http-version`).** For the fast `get`/`post`/`head`
+methods the protocol version is the operator's choice, not the server's. The
+default (`auto`) negotiates — plain HTTP/1.1 for an `http://` URL, but ALPN for
+`https://`, which means **an https target that offers h2 is tested over HTTP/2**.
+That is a different test (multiplexed streams instead of one request per
+connection, HPACK instead of plain headers, different server-side limits), so it
+has to be selectable:
+
+```sh
+# force HTTP/1.1 — never negotiate h2, even if the server offers it
+jinrai --layer l7 --allow '*.staging.internal' --http-version 1.1 \
+       --url https://api.staging.internal/health --rate 200 --duration 30
+
+# force HTTP/2 (ALPN h2 only for https, prior-knowledge h2c for http)
+jinrai --layer l7 --allow '*.staging.internal' --http-version 2 \
+       --url https://api.staging.internal/health --rate 200 --duration 30
+```
+
+Forcing `2` deliberately does **not** fall back: a target that cannot do h2 fails
+every request and the run says so (`protocol` failure bucket, non-zero exit)
+rather than silently downgrading to HTTP/1.1 and reporting a clean pass. Whatever
+is selected, the run summary reports the version the responses *actually* arrived
+on — the only way to notice that an "HTTP/1.1" run was negotiated up to h2. The
+slow modes are HTTP/1.1 by construction and the `h2-*` methods are HTTP/2 by
+construction, so the flag does not apply to them (it warns and is ignored).
 
 For slow modes the rate cap means *connections opened per second*; `--slow-connections`
 is the concurrent ceiling and `--drip-ms` the per-tick interval (the keep-alive write
@@ -274,6 +300,43 @@ A target outside every `--allow` block aborts the whole run. There is **no
 source-IP spoofing** anywhere: every crafted packet carries the host's real
 OS-routed source address.
 
+### Reading the result (`--output`)
+
+Every run ends with a summary block that states the offered load, what came back,
+and what it means. `--output line` switches to the single machine-friendly line
+instead (stable for scripts and log scraping):
+
+```
+==== run summary =========================================================
+ target     https://api.staging.internal/health
+ module     L7 / l7-http-get  (HTTP/1.1 forced)
+ window     30.0s elapsed of 30.0s planned, rate cap 200/s
+ attempts   6000 total, 199.4/s achieved (100% of the 200/s cap)
+ completed  5994 (99.9%)
+   status   2xx 5900 (98.4%)   3xx 0 (0.0%)   4xx 40 (0.7%)   5xx 54 (0.9%)
+   protocol HTTP/1.1 5994
+ failed     6 (0.1%), of which 6 timed out
+            6 x timeout — our own attempt timeout expired first
+ latency    p50 12.4ms   p90 45.1ms   p99 210.0ms   max 1.20s
+ outcome    ran to completion
+ SLO        FAIL (5xx-rate 0.9% > 0.5%)
+==========================================================================
+```
+
+Three things the block is there to make unmissable:
+
+* **Offered vs. achieved load** — `attempts … achieved (…% of the cap)` says
+  whether the tool actually produced the load that was asked for, so a result is
+  never read as "the target coped" when the generator never reached the rate.
+* **Whose failure it was** — L7 failures are bucketed like the L3/L4 ones:
+  `ECONNREFUSED` (the target refused), `timeout` (nobody answered),
+  `protocol` (the exchange failed above the socket — typically a forced
+  `--http-version` the target does not speak), `EMFILE`/`EADDRNOTAVAIL` (a local
+  ceiling on the *testing* host, saying nothing about the target).
+* **A run that tested nothing** — 0 completions with only failures prints an
+  explicit warning **and exits non-zero**, so "6000 attempts, 0 responses" can no
+  longer be mistaken for a successful test in a pipeline.
+
 ### Audit log (tamper-evident)
 
 Record an accountable, hash-chained trail of every run — who authorized what,
@@ -288,6 +351,20 @@ jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 --target 10.1.2.3 \
 jinrai --verify-audit runs.jsonl                 # 0 = chain intact, non-zero = tampered
 ```
 
+`--verify-audit` verifies **and prints** the log, one readable line per record:
+
+```
+audit log runs.jsonl
+hash chain: INTACT (2 record(s))
+
+  #0    2026-07-30T15:00:17Z  you@example.com   AUTHORIZED L7/l7-http-get at up to 60/s for 3s -> api.staging.internal [allowed by: *.staging.internal]
+  #1    2026-07-30T15:00:20Z  you@example.com   COMPLETED L7 l7-http-get https://api.staging.internal/ (HTTP/1.1 forced) — 180 attempts: 180 completed, 0 failed; status 2xx=180 3xx=0 4xx=0 5xx=0; proto HTTP/1.1=180; p99 45247us; SLO PASS
+```
+
 The log is append-only JSONL with a SHA-256 hash chain: editing, deleting, or
 reordering any record is detectable. The log is opened before any traffic and a
-write failure aborts the run, so traffic never outruns its own record.
+write failure aborts the run, so traffic never outruns its own record. Each record
+carries both the structured fields (`attempts`, `status`, `errno`,
+`http_versions`, `latency_us`, `slo` — greppable / `jq`-able) and the
+human-readable `summary` line printed above; the summary is inside the hashed
+body, so it cannot be edited to disagree with the numbers beside it.

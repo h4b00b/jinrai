@@ -53,6 +53,8 @@ pub enum AuditEvent {
     /// A run finished; carries the outcome metrics and the SLO verdict.
     RunCompleted {
         layer_label: String,
+        /// Completions plus failures — the denominator every rate is read against.
+        attempts: u64,
         units_sent: u64,
         errors: u64,
         aborted_early: bool,
@@ -62,6 +64,13 @@ pub enum AuditEvent {
         status_4xx: u64,
         status_5xx: u64,
         timeouts: u64,
+        /// `errors` broken down by OS cause, as `(bucket, count)` pairs. Empty for
+        /// layers that do not classify failures. Recorded because "12 errors" and
+        /// "12 ECONNREFUSED from the target" are different findings after the fact.
+        errno: Vec<(String, u64)>,
+        /// Completions by the HTTP version actually used on the wire — so a
+        /// reviewer can tell months later whether a run was HTTP/1.1 or HTTP/2.
+        http_versions: Vec<(String, u64)>,
         p50_micros: u64,
         p90_micros: u64,
         p99_micros: u64,
@@ -84,8 +93,15 @@ impl AuditEvent {
     pub fn completed(report: &RunReport, verdict: Option<&SloVerdict>) -> Self {
         AuditEvent::RunCompleted {
             layer_label: report.layer_label.clone(),
+            attempts: report.attempts(),
             units_sent: report.units_sent,
             errors: report.errors,
+            errno: report.errno.iter().map(|(b, n)| (b.to_string(), n)).collect(),
+            http_versions: report
+                .http_versions
+                .iter()
+                .map(|(v, n)| (v.clone(), *n))
+                .collect(),
             aborted_early: report.aborted_early,
             aborted_by_watchdog: report.aborted_by_watchdog,
             status_2xx: report.status_2xx,
@@ -104,9 +120,90 @@ impl AuditEvent {
         }
     }
 
-    /// Serialize just this event's fields (no leading/trailing comma or braces).
-    fn fields_json(&self) -> String {
+    /// One human-readable line describing this event.
+    ///
+    /// Stored in the record as `summary` and printed by `--verify-audit`. A JSONL
+    /// log is machine-readable by construction, but "readable by `jq`" is not the
+    /// same as "readable by the engineer reviewing what was fired at production
+    /// last Tuesday" — this field is what makes the log answer that question
+    /// without a query. It is inside the hashed body, so it cannot be edited to
+    /// disagree with the structured fields next to it.
+    pub fn human(&self) -> String {
         match self {
+            AuditEvent::RunAuthorized {
+                layer,
+                mode,
+                rate_per_sec,
+                duration_secs,
+                targets,
+                allow_rules,
+            } => format!(
+                "AUTHORIZED {layer}/{mode} at up to {rate_per_sec}/s for {duration_secs}s \
+                 -> {} [allowed by: {}]",
+                join_or(targets, "no target"),
+                join_or(allow_rules, "no rule"),
+            ),
+            AuditEvent::RunCompleted {
+                layer_label,
+                attempts,
+                units_sent,
+                errors,
+                aborted_early,
+                aborted_by_watchdog,
+                status_2xx,
+                status_3xx,
+                status_4xx,
+                status_5xx,
+                timeouts,
+                errno,
+                http_versions,
+                p99_micros,
+                slo,
+                ..
+            } => {
+                let mut s = format!(
+                    "COMPLETED {layer_label} — {attempts} attempts: {units_sent} completed, \
+                     {errors} failed"
+                );
+                if *timeouts > 0 {
+                    s.push_str(&format!(" ({timeouts} timed out)"));
+                }
+                if status_2xx + status_3xx + status_4xx + status_5xx > 0 {
+                    s.push_str(&format!(
+                        "; status 2xx={status_2xx} 3xx={status_3xx} 4xx={status_4xx} \
+                         5xx={status_5xx}"
+                    ));
+                }
+                if !http_versions.is_empty() {
+                    let v: Vec<String> =
+                        http_versions.iter().map(|(k, n)| format!("{k}={n}")).collect();
+                    s.push_str(&format!("; proto {}", v.join(" ")));
+                }
+                if !errno.is_empty() {
+                    let v: Vec<String> = errno.iter().map(|(k, n)| format!("{k}={n}")).collect();
+                    s.push_str(&format!("; errno {}", v.join(" ")));
+                }
+                if *units_sent > 0 {
+                    s.push_str(&format!("; p99 {}us", p99_micros));
+                }
+                if *aborted_by_watchdog {
+                    s.push_str("; ABORTED by SLO watchdog");
+                } else if *aborted_early {
+                    s.push_str("; ABORTED early");
+                }
+                s.push_str(&format!("; SLO {slo}"));
+                s
+            }
+            AuditEvent::RunRefused { stage, reason } => {
+                format!("REFUSED at {stage} — {reason} (no traffic was emitted)")
+            }
+        }
+    }
+
+    /// Serialize just this event's fields (no leading/trailing comma or braces),
+    /// with the human [`summary`](AuditEvent::human) appended as the last field.
+    fn fields_json(&self) -> String {
+        let structured = match self {
             AuditEvent::RunAuthorized {
                 layer,
                 mode,
@@ -126,6 +223,7 @@ impl AuditEvent {
             ),
             AuditEvent::RunCompleted {
                 layer_label,
+                attempts,
                 units_sent,
                 errors,
                 aborted_early,
@@ -135,17 +233,22 @@ impl AuditEvent {
                 status_4xx,
                 status_5xx,
                 timeouts,
+                errno,
+                http_versions,
                 p50_micros,
                 p90_micros,
                 p99_micros,
                 max_micros,
                 slo,
             } => format!(
-                "\"event\":\"run_completed\",\"layer\":\"{}\",\"units_sent\":{},\"errors\":{},\
+                "\"event\":\"run_completed\",\"layer\":\"{}\",\"attempts\":{},\
+                 \"units_sent\":{},\"errors\":{},\
                  \"aborted_early\":{},\"aborted_by_watchdog\":{},\
                  \"status\":{{\"c2xx\":{},\"c3xx\":{},\"c4xx\":{},\"c5xx\":{},\"timeout\":{}}},\
+                 \"errno\":{},\"http_versions\":{},\
                  \"latency_us\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},\"slo\":\"{}\"",
                 json_escape(layer_label),
+                attempts,
                 units_sent,
                 errors,
                 aborted_early,
@@ -155,6 +258,8 @@ impl AuditEvent {
                 status_4xx,
                 status_5xx,
                 timeouts,
+                json_count_object(errno),
+                json_count_object(http_versions),
                 p50_micros,
                 p90_micros,
                 p99_micros,
@@ -166,7 +271,8 @@ impl AuditEvent {
                 json_escape(stage),
                 json_escape(reason),
             ),
-        }
+        };
+        format!("{structured},\"summary\":\"{}\"", json_escape(&self.human()))
     }
 }
 
@@ -276,18 +382,37 @@ impl AuditLog {
     }
 }
 
-/// Walk the log at `path` and confirm the hash chain is intact.
+/// One verified record, reduced to what a human needs to read it.
 ///
-/// Returns the number of records verified on success. On the first inconsistency
-/// (a record whose recomputed hash differs, or whose `prev` does not match the
-/// preceding record's hash) it returns an [`AuditError::Tampered`] naming the
-/// offending line.
-pub fn verify(path: impl AsRef<Path>) -> Result<usize, AuditError> {
+/// Produced by [`verify_and_read`] so `--verify-audit` can *show the log* rather
+/// than only assert that its hash chain adds up.
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    /// Position in the chain.
+    pub seq: u64,
+    /// RFC 3339 UTC timestamp as recorded.
+    pub ts: String,
+    /// Who the run was attributed to.
+    pub operator: String,
+    /// Machine event name: `run_authorized` / `run_completed` / `run_refused`.
+    pub event: String,
+    /// The record's human-readable one-line summary.
+    pub summary: String,
+}
+
+/// Walk the log at `path`, confirm the hash chain is intact, and return every
+/// record in readable form.
+///
+/// On the first inconsistency (a record whose recomputed hash differs, or whose
+/// `prev` does not match the preceding record's hash) it returns an
+/// [`AuditError::Tampered`] naming the offending line — the records read so far
+/// are discarded, because a broken chain makes the whole file untrustworthy.
+pub fn verify_and_read(path: impl AsRef<Path>) -> Result<Vec<AuditRecord>, AuditError> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| AuditError::io(path, e))?;
 
     let mut expected_prev = GENESIS.to_string();
-    let mut count = 0usize;
+    let mut records = Vec::new();
 
     for (idx, line) in BufReader::new(file).lines().enumerate() {
         let lineno = idx + 1;
@@ -327,10 +452,29 @@ pub fn verify(path: impl AsRef<Path>) -> Result<usize, AuditError> {
         }
 
         expected_prev = stored_hash.to_string();
-        count += 1;
+        // Read-back is best-effort per field: a record whose chain is intact is
+        // trustworthy, so a missing display field is a gap in the view, never a
+        // reason to call the log tampered.
+        records.push(AuditRecord {
+            seq: extract_seq(body).unwrap_or(records.len() as u64),
+            ts: extract_json_str(body, "ts").unwrap_or_else(|| "?".into()),
+            operator: extract_json_str(body, "operator").unwrap_or_else(|| "?".into()),
+            event: extract_json_str(body, "event").unwrap_or_else(|| "?".into()),
+            summary: extract_json_str(body, "summary").unwrap_or_else(|| {
+                // Pre-0.22 records have no summary field; show the raw body tail
+                // rather than nothing.
+                format!("(no summary field) {body}")
+            }),
+        });
     }
 
-    Ok(count)
+    Ok(records)
+}
+
+/// Walk the log at `path` and confirm the hash chain is intact, returning the
+/// number of records verified. See [`verify_and_read`] to also read them back.
+pub fn verify(path: impl AsRef<Path>) -> Result<usize, AuditError> {
+    verify_and_read(path).map(|r| r.len())
 }
 
 /// Errors from opening, writing, or verifying an audit log.
@@ -417,6 +561,37 @@ fn extract_prev(s: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Read the string value of `"<key>":"…"` out of a record body, undoing the
+/// escaping [`json_escape`] applied. Stops at the first *unescaped* closing quote,
+/// so a value containing `\"` is read whole.
+fn extract_json_str(s: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\":\"");
+    let at = s.find(&marker)?;
+    let rest = &s[at + marker.len()..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    // `\uXXXX` is only emitted for control characters, which have
+                    // no display value — consume the digits and drop it.
+                    for _ in 0..4 {
+                        chars.next()?;
+                    }
+                }
+                other => out.push(other), // `\"` and `\\`
+            },
+            c => out.push(c),
+        }
+    }
+    None // unterminated string
+}
+
 /// Read the leading `seq` integer out of a record line.
 fn extract_seq(line: &str) -> Option<u64> {
     let marker = "\"seq\":";
@@ -437,6 +612,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// `"a, b"` — or `empty` when the list is empty, so a summary never reads as a
+/// dangling `-> `.
+fn join_or(items: &[String], empty: &str) -> String {
+    if items.is_empty() {
+        return empty.to_string();
+    }
+    items.join(", ")
+}
+
 /// Minimal JSON string escaping for the field values we emit.
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -451,6 +635,22 @@ fn json_escape(s: &str) -> String {
             c => out.push(c),
         }
     }
+    out
+}
+
+/// `(name, count)` pairs as a JSON object: `{"EMFILE":957,"ECONNREFUSED":1}`.
+fn json_count_object(items: &[(String, u64)]) -> String {
+    let mut out = String::from("{");
+    for (i, (k, n)) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(k));
+        out.push_str("\":");
+        out.push_str(&n.to_string());
+    }
+    out.push('}');
     out
 }
 
@@ -619,6 +819,72 @@ mod tests {
             Err(AuditError::Tampered { line, .. }) => assert_eq!(line, 2),
             other => panic!("expected Tampered on the second surviving line, got {other:?}"),
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn records_carry_a_readable_summary() {
+        let path = tmp_path("summary");
+        {
+            let mut log = AuditLog::open(&path, "tester").unwrap();
+            log.record(&authorized_event()).unwrap();
+            let mut r = RunReport {
+                layer_label: "L7 l7-http-get http://api.internal/ (HTTP/1.1 forced)".into(),
+                units_sent: 990,
+                errors: 10,
+                timeouts: 4,
+                status_2xx: 900,
+                status_5xx: 90,
+                p99_micros: 210_000,
+                ..Default::default()
+            };
+            r.http_versions.insert("HTTP/1.1".into(), 990);
+            log.record(&AuditEvent::completed(&r, None)).unwrap();
+        }
+
+        let records = verify_and_read(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].operator, "tester");
+        assert_eq!(records[0].event, "run_authorized");
+        assert!(
+            records[0].summary.contains("AUTHORIZED L4/udp-flood at up to 100/s for 10s")
+                && records[0].summary.contains("10.0.0.9")
+                && records[0].summary.contains("10.0.0.0/8"),
+            "{}",
+            records[0].summary
+        );
+        let done = &records[1].summary;
+        assert!(done.starts_with("COMPLETED"), "{done}");
+        assert!(done.contains("1000 attempts: 990 completed, 10 failed"), "{done}");
+        assert!(done.contains("(4 timed out)"), "{done}");
+        assert!(done.contains("proto HTTP/1.1=990"), "{done}");
+        assert!(done.contains("SLO n/a"), "{done}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn summary_field_survives_quotes_and_stays_in_the_hash() {
+        // The summary is inside the hashed body: editing it must break the chain,
+        // and reading it back must survive escaped quotes in the reason.
+        let path = tmp_path("summary-escape");
+        {
+            let mut log = AuditLog::open(&path, "op").unwrap();
+            log.record(&AuditEvent::RunRefused {
+                stage: "authorization".into(),
+                reason: "host \"evil.example\" not in allowlist".into(),
+            })
+            .unwrap();
+        }
+        let records = verify_and_read(&path).unwrap();
+        assert!(
+            records[0].summary.contains("host \"evil.example\" not in allowlist"),
+            "{}",
+            records[0].summary
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("not in allowlist", "was in allowlist")).unwrap();
+        assert!(matches!(verify(&path), Err(AuditError::Tampered { .. })));
         std::fs::remove_file(&path).ok();
     }
 

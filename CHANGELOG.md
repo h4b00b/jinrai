@@ -16,6 +16,64 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.22.0] — 2026-07-30
+
+Operator-feedback release. A technician running the tool asked two questions the
+tool could not answer: *"how do I run an HTTP/1.1 attack instead of HTTP/2?"* —
+there was no way, and no indication of which version was in use — and *"the
+end-of-run output on sent/errors isn't saying much, same for the audit output"*.
+
+### Added
+
+- **`--http-version <auto|1.1|2>`** for the fast `get`/`post`/`head` methods. The
+  version was previously whatever the client negotiated, which for an `https`
+  target means ALPN — so a run the operator read as HTTP/1.1 was silently tested
+  over HTTP/2 whenever the server offered it, a materially different test
+  (multiplexed streams, HPACK, different server-side limits). `1.1` forces
+  HTTP/1.1; `2` forces HTTP/2 (ALPN `h2` only for https, prior-knowledge h2c for
+  http) and deliberately does **not** fall back, so a target that cannot do h2
+  fails loudly instead of downgrading into a hollow pass. Warns and is ignored for
+  the slow modes (HTTP/1.1 by construction) and the `h2-*` methods (HTTP/2 by
+  construction).
+- **The negotiated HTTP version is reported** per run — `RunReport.http_versions`,
+  rendered as `protocol HTTP/1.1 5994` in the summary and `proto(...)` in the line
+  form. Recorded even for `auto`: it is the only way to see that an "HTTP/1.1" run
+  against an https target actually ran over h2.
+- **Readable end-of-run summary** (`--output human`, now the default) replacing the
+  single line as the operator-facing report: offered vs. **achieved** load
+  (`6000 total, 199.4/s achieved (100% of the 200/s cap)`), status classes and
+  protocol with percentages, latency in ms/s rather than raw microseconds, a
+  plain-language `outcome` line that names *who* ended the run (completion /
+  operator Ctrl-C / SLO watchdog / capacity knee), and an explicit warning when a
+  run completed nothing. `--output line` keeps the historical machine-friendly
+  line for scripts.
+- **L7 failures are now bucketed by cause**, as the L3/L4 layer already was:
+  `ECONNREFUSED` / `timeout` / `EMFILE` / … plus a new `ErrnoBucket::Protocol` for
+  failures above the socket (typically a forced `--http-version` the target does
+  not speak). Previously every L7 transport failure was an anonymous increment in
+  `errors=<n>`, which is the same number for "the target refused us", "nobody
+  answered", and "we ran out of local descriptors".
+- **`--verify-audit` now prints the log it verifies**, one readable line per
+  record (`#seq  timestamp  operator  AUTHORIZED/COMPLETED/REFUSED  …`) instead of
+  only asserting that the hash chain adds up. Each record gained a human `summary`
+  field plus structured `attempts`, `errno` and `http_versions` fields; the summary
+  lives inside the hashed body, so it cannot be edited to disagree with the numbers
+  beside it. Records written before 0.22.0 verify as before and display their raw
+  body.
+
+### Fixed
+
+- **An L7 run that completed nothing now exits non-zero.** `units_sent == 0` with
+  only failures means the target was never reached and nothing was stress-tested;
+  the L3/L4 path already refused to call that a success, while L7 reported exit 0.
+  A `--http-version 2` run against an HTTP/1.1-only target is the case that
+  surfaced it.
+
+### Changed
+
+- `ErrnoBucket::from_io_error` moved into `core` (from a private helper in `l34`)
+  so both traffic layers bucket the same OS failure identically.
+
 ## [0.21.0] — 2026-07-30
 
 L4 (fix): the `tcp-connect-flood` had no completion path. Every `TcpStream` was
@@ -676,7 +734,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/h4b00b/jinrai/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/h4b00b/jinrai/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/h4b00b/jinrai/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/h4b00b/jinrai/compare/v0.18.0...v0.19.0

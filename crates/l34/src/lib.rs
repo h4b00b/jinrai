@@ -317,53 +317,11 @@ enum Emission {
     Failed(ErrnoBucket),
 }
 
-/// Classify an I/O failure into a reporting bucket.
-///
-/// Portable [`ErrorKind`](std::io::ErrorKind)s are matched first. `EMFILE` /
-/// `ENFILE` / `ENOBUFS` have no stable `ErrorKind` (they still decode to
-/// `Uncategorized`), so they are recognised by raw code — and telling `EMFILE`
-/// apart from target behaviour is the entire reason this breakdown exists.
-/// Anything unrecognised keeps its raw code via [`ErrnoBucket::Other`], so no
-/// failure is ever reported as an anonymous increment.
+/// Classify an I/O failure into a reporting bucket. Thin alias for the shared
+/// classifier in `core`, which the L7 engine uses too so both layers bucket the
+/// same OS failure identically.
 fn classify_io(e: &std::io::Error) -> ErrnoBucket {
-    use std::io::ErrorKind;
-    match e.kind() {
-        ErrorKind::ConnectionRefused => return ErrnoBucket::Econnrefused,
-        ErrorKind::ConnectionReset => return ErrnoBucket::Econnreset,
-        ErrorKind::AddrNotAvailable => return ErrnoBucket::Eaddrnotavail,
-        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
-            return ErrnoBucket::Eunreach
-        }
-        ErrorKind::TimedOut => {
-            // `TcpStream::connect_timeout` signals *our* expired deadline with a
-            // synthetic TimedOut error that carries no OS code; the kernel's own
-            // ETIMEDOUT does carry one. The two have different fixes (raise the
-            // timeout vs. the target is not answering), so they get different
-            // buckets.
-            return match e.raw_os_error() {
-                Some(_) => ErrnoBucket::Etimedout,
-                None => ErrnoBucket::Timeout,
-            };
-        }
-        // A non-blocking connect that has not resolved yet is our timeout too.
-        ErrorKind::WouldBlock => return ErrnoBucket::Timeout,
-        _ => {}
-    }
-    match e.raw_os_error() {
-        // EMFILE/ENFILE sit in the original low POSIX errno range, whose values
-        // are identical across Linux, macOS and the BSDs.
-        #[cfg(unix)]
-        Some(24) => ErrnoBucket::Emfile,
-        #[cfg(unix)]
-        Some(23) => ErrnoBucket::Enfile,
-        // ENOBUFS is *not* value-stable across unixes (105 on Linux, 55 on
-        // macOS), so only Linux's value is claimed by name; elsewhere it falls
-        // through to `Other` with its raw code intact.
-        #[cfg(target_os = "linux")]
-        Some(105) => ErrnoBucket::Enobufs,
-        Some(code) => ErrnoBucket::Other(code),
-        None => ErrnoBucket::Internal,
-    }
+    ErrnoBucket::from_io_error(e)
 }
 
 /// Why an L3/L4 run could not be prepared or fully run. Fail-closed.
