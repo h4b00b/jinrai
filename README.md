@@ -233,8 +233,39 @@ safe to leave running:
 
 Because the footprint is bounded by `--concurrency` rather than by
 `rate × duration`, doubling `--duration` does not change the peak descriptor
-count. `--connect-timeout-ms` (default 500) bounds a single attempt; an attempt
-that outlives it is abandoned and counted in the `timeout` bucket:
+count.
+
+For `tcp`, that socket count includes connections still **mid-handshake**, so
+`--concurrency` is also how many handshakes run in parallel — and therefore what
+determines the rate the run can actually offer:
+
+```
+reachable rate ≈ --concurrency / round-trip-time
+```
+
+This matters because a connect flood is otherwise bounded by *one handshake per
+RTT*: 256 sockets against a 3 ms target reaches ~85k attempts/s, but a single
+handshake at a time reaches ~330/s no matter what `--rate` says. When a run falls
+short of its cap for this reason the summary names it rather than leaving the
+percentage to be misread as absorbed load:
+
+```
+ attempts   37877 total, 12621.1/s achieved (13% of the 100000/s cap)
+ bound by   concurrency, not the target: 1 in flight at a 20us median
+            attempt tops out near 50000/s, below the 100000/s cap — raise
+            --concurrency to offer more load
+```
+
+Evicted connections are closed **abortively** (`SO_LINGER 0`, i.e. RST rather
+than FIN) so the local ephemeral port is reusable immediately. A graceful close
+parks each port in `TIME_WAIT` for 60 s, which at any sustained rate above a few
+hundred per second exhausts the default ~28k-port range mid-run and turns the
+test into a local `EADDRNOTAVAIL` failure. Steady-state pressure on the target is
+unaffected: it comes from the `--concurrency` connections held established, not
+from the ones already closed.
+
+`--connect-timeout-ms` (default 500) bounds a single attempt; an attempt that
+outlives it is abandoned and counted in the `timeout` bucket:
 
 ```sh
 jinrai --layer l4 --l4-mode tcp --allow 10.0.0.0/8 \

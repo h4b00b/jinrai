@@ -16,6 +16,65 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 Nothing yet.
 
+## [0.23.0] — 2026-07-30
+
+Operator-feedback release. A technician ran `tcp-connect-flood` against a lab
+target at `--rate 10000` and got the same answer six times over, across two
+`--concurrency` settings and three durations: **~320 attempts/s, "3% of the
+10000/s cap", zero failures.** The number that moved between runs was not the
+concurrency setting — it was the target's round-trip time. The flood was
+measuring network latency, and the runs said nothing about the target's capacity.
+
+### Fixed
+
+- **The TCP connect flood no longer runs one handshake at a time.** The send loop
+  called a blocking `connect_timeout` inline, so attempt N+1 could not start until
+  attempt N resolved and the achievable rate was pinned to `1 / RTT` — about
+  330/s against a 3 ms target, regardless of `--rate`. `--rate` was
+  unreachable by construction at any setting above that, and the reported
+  "% of cap" was a property of jinrai, not of the target. Handshakes now run on a
+  pool of worker threads sized from `--concurrency`, so the ceiling is
+  `--concurrency / RTT` and the rate cap is the binding constraint again.
+  Measured against a lab blackhole at a 250 ms attempt cost: **24 → 1539 attempts**
+  in 6 s at `--concurrency 64`, i.e. the full 64× the parallelism allows. Against
+  a real listener: 70,882 completed handshakes in 5 s (14,128/s) with no failures.
+- **Evicted connections are closed abortively (`SO_LINGER 0`, RST not FIN).** A
+  graceful close made jinrai the active closer, parking every ephemeral port in
+  `TIME_WAIT` for 60 s. That capped a *sustainable* connect flood at roughly 450/s
+  from one source address — above it the default ~28k-port range is exhausted
+  mid-run and the tool starts failing on `EADDRNOTAVAIL`, reporting a local limit
+  as if it were a result. Fixing the concurrency bug without this would have hit
+  the wall within seconds. A 70,882-connection run now leaves **0** sockets in
+  `TIME_WAIT`. Steady-state pressure on the target is unchanged: it comes from the
+  `--concurrency` connections held established, not from the closed ones.
+
+### Changed
+
+- **`--concurrency` now bounds sockets mid-handshake as well as established
+  ones**, and so doubles as the connect flood's parallelism. The descriptor
+  ceiling is the same number it always was — admission requires
+  `held + in-flight < N`, so the local footprint still depends on `--concurrency`
+  alone and never on `--duration` or `--rate`. The acceptance tests that pin the
+  fd count to a plateau are unchanged and still pass.
+
+### Added
+
+- **The run summary explains a run that could not reach its rate cap.** A new
+  `bound by` line applies Little's law — `concurrency / median-attempt` — and says
+  so when that product lands below the cap:
+
+  ```
+   attempts   37877 total, 12621.1/s achieved (13% of the 100000/s cap)
+   bound by   concurrency, not the target: 1 in flight at a 20us median
+              attempt tops out near 50000/s, below the 100000/s cap — raise
+              --concurrency to offer more load
+  ```
+
+  Silent when the run got near its cap, when no latency was measured (the
+  stateless floods), or when concurrency had the headroom and the shortfall is
+  therefore a finding *about the target* — the case where blaming the knob would
+  point the operator at the wrong thing.
+
 ## [0.22.0] — 2026-07-30
 
 Operator-feedback release. A technician running the tool asked two questions the
@@ -734,7 +793,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/h4b00b/jinrai/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/h4b00b/jinrai/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/h4b00b/jinrai/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/h4b00b/jinrai/compare/v0.19.0...v0.20.0

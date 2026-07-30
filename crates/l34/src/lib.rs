@@ -40,6 +40,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
@@ -282,6 +284,12 @@ pub struct L34Config {
     ///   * `concurrency` is the maximum open sockets at any instant,
     ///   * `duration` is wall-clock run length and *nothing else*.
     ///
+    /// For `tcp` this ceiling covers sockets **mid-handshake** as well as
+    /// established ones, and so doubles as the connect flood's parallelism (see
+    /// [`ConnectPool`]): it is what lets the run reach `rate` instead of being
+    /// pinned to one handshake per round-trip. The descriptor bound is the same
+    /// number it always was.
+    ///
     /// Clamped to at least 1 (see [`L34Config::effective_concurrency`]).
     pub concurrency: usize,
     /// How long a single connection attempt may stay unresolved before it is
@@ -315,6 +323,11 @@ enum Emission {
     Sent { latency: Option<Duration> },
     /// The attempt failed, bucketed by the OS error behind it.
     Failed(ErrnoBucket),
+    /// No outcome to record at this tick. The attempt is either in flight on a
+    /// worker (and will be counted when it resolves) or was never admitted
+    /// because every in-flight slot was busy. Only the pooled connect flood
+    /// produces this; every other mode resolves inline.
+    Deferred,
 }
 
 /// Classify an I/O failure into a reporting bucket. Thin alias for the shared
@@ -475,15 +488,9 @@ impl L34Engine {
 
         let mut sender = Sender::setup(&self.config)?;
 
-        let mut sent = 0u64;
-        let mut errors = 0u64;
-        let mut errno = ErrnoTally::default();
+        let mut tally = Tally::new();
         let mut aborted = false;
         let mut idx = 0usize;
-        // 1us .. 60s at 3 significant figures — bounded memory regardless of how
-        // long the run holds, unlike retaining every sample.
-        let mut latency: Histogram<u64> =
-            Histogram::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds");
 
         let start = Instant::now();
         let mut next = start;
@@ -492,26 +499,16 @@ impl L34Engine {
                 aborted = true;
                 break;
             }
+            // Collect whatever finished since the last tick. Only the pooled
+            // connect flood defers work; every other mode resolves inline and
+            // this is a no-op.
+            sender.reap(&mut tally);
+
             let ip = ips[idx % ips.len()];
             idx += 1;
-            match sender.send(ip, self.config.port) {
-                Ok(Emission::Sent { latency: observed }) => {
-                    sent += 1;
-                    if let Some(d) = observed {
-                        // Saturate at the histogram ceiling rather than drop the
-                        // sample: a 60s+ handshake still belongs in `max`.
-                        let us = (d.as_micros() as u64).clamp(1, 60_000_000);
-                        let _ = latency.record(us);
-                    }
-                }
-                Ok(Emission::Failed(bucket)) => {
-                    errors += 1;
-                    errno.record(bucket);
-                }
-                Err(_) => {
-                    errors += 1;
-                    errno.record(ErrnoBucket::Internal);
-                }
+            match sender.send(ip, self.config.port, &mut tally) {
+                Ok(e) => tally.record(e),
+                Err(_) => tally.record(Emission::Failed(ErrnoBucket::Internal)),
             }
 
             next += interval;
@@ -527,33 +524,84 @@ impl L34Engine {
             }
         }
 
+        // Retire the worker pool and account for every attempt still in flight,
+        // so an attempt dispatched just before the deadline is reported rather
+        // than silently dropped.
+        sender.finish(&mut tally);
+
+        Ok(tally.into_report(label, aborted))
+    }
+}
+
+/// Running counters for one run. Exists so the pooled connect flood can fold in
+/// results that arrive *after* the tick that dispatched them, without threading
+/// four mutable locals through every call site.
+struct Tally {
+    sent: u64,
+    errors: u64,
+    errno: ErrnoTally,
+    latency: Histogram<u64>,
+}
+
+impl Tally {
+    fn new() -> Self {
+        Self {
+            sent: 0,
+            errors: 0,
+            errno: ErrnoTally::default(),
+            // 1us .. 60s at 3 significant figures — bounded memory regardless of
+            // how long the run holds, unlike retaining every sample.
+            latency: Histogram::new_with_bounds(1, 60_000_000, 3)
+                .expect("valid histogram bounds"),
+        }
+    }
+
+    fn record(&mut self, emission: Emission) {
+        match emission {
+            Emission::Sent { latency: observed } => {
+                self.sent += 1;
+                if let Some(d) = observed {
+                    // Saturate at the histogram ceiling rather than drop the
+                    // sample: a 60s+ handshake still belongs in `max`.
+                    let us = (d.as_micros() as u64).clamp(1, 60_000_000);
+                    let _ = self.latency.record(us);
+                }
+            }
+            Emission::Failed(bucket) => {
+                self.errors += 1;
+                self.errno.record(bucket);
+            }
+            // Nothing resolved at this tick; the counters move when the worker
+            // that owns the attempt reports back.
+            Emission::Deferred => {}
+        }
+    }
+
+    fn into_report(self, label: String, aborted: bool) -> RunReport {
         // Only the connection-oriented modes feed the histogram; a packet flood
         // leaves it empty and reports zeros rather than inventing percentiles.
-        let measured = !latency.is_empty();
-        Ok(RunReport {
+        let measured = !self.latency.is_empty();
+        RunReport {
             layer_label: label,
-            units_sent: sent,
-            errors,
-            errno,
+            units_sent: self.sent,
+            errors: self.errors,
+            errno: self.errno,
             aborted_early: aborted,
-            p50_micros: if measured { latency.value_at_quantile(0.5) } else { 0 },
-            p90_micros: if measured { latency.value_at_quantile(0.9) } else { 0 },
-            p99_micros: if measured { latency.value_at_quantile(0.99) } else { 0 },
-            max_micros: if measured { latency.max() } else { 0 },
+            p50_micros: if measured { self.latency.value_at_quantile(0.5) } else { 0 },
+            p90_micros: if measured { self.latency.value_at_quantile(0.9) } else { 0 },
+            p99_micros: if measured { self.latency.value_at_quantile(0.99) } else { 0 },
+            max_micros: if measured { self.latency.max() } else { 0 },
             ..Default::default()
-        })
+        }
     }
 }
 
 /// Per-mode socket state, created once before the send loop.
 enum Sender {
     Udp { sock: UdpSocket, payload: Vec<u8> },
-    /// TCP full-handshake connect flood. `held` is a **bounded** FIFO of open
-    /// connections: the flood keeps up to `cap` handshakes established at once to
-    /// apply connection-table pressure, and admitting attempt `cap + 1` closes
-    /// the oldest first. That bound is the whole point — the footprint is a
-    /// function of `cap`, never of how long the run lasts.
-    Tcp { held: VecDeque<TcpStream>, cap: usize, timeout: Duration },
+    /// TCP full-handshake connect flood, driven by a [`ConnectPool`] of blocking
+    /// worker threads so the offered rate is not pinned to one handshake per RTT.
+    Tcp(ConnectPool),
     /// TCP data (PSH-ACK) flood: a bounded pool of established connections that we
     /// write application data into. `idx` round-robins writes across the pool;
     /// dead connections are dropped and replaced. `timeout` bounds both connect
@@ -587,6 +635,228 @@ const MAX_UDP_PAYLOAD: usize = 1472;
 /// segment — TCP handles segmentation — to push more bytes per write.
 const MAX_DATA_PAYLOAD: usize = 65_536;
 
+/// Upper bound on connect-flood worker threads. `--concurrency` sets the real
+/// ceiling; this only stops a very large `--concurrency` from spawning one OS
+/// thread per socket. 512 handshakes in flight is ~170k attempts/s against a
+/// 3 ms target, far above any rate this tool is meant to offer.
+const MAX_CONNECT_WORKERS: usize = 512;
+
+/// Stack size for a connect worker. The thread does nothing but block in
+/// `connect_timeout` and hand the result back, so the default 8 MiB reservation
+/// is pure waste at 512 threads.
+const CONNECT_WORKER_STACK: usize = 64 * 1024;
+
+/// How long [`ConnectPool::send`] will wait for an in-flight slot to free up
+/// before giving the run loop control back. Bounded so the kill switch is still
+/// polled promptly when the pool is saturated; under load a result almost always
+/// lands within microseconds and the wait returns early.
+const BACKPRESSURE_WAIT: Duration = Duration::from_millis(25);
+
+/// What one worker's connect attempt produced.
+enum ConnectOutcome {
+    /// Handshake completed. The stream is handed to the run thread, which owns
+    /// the FIFO of held connections — keeping a single owner for the descriptor
+    /// budget means no lock on the hot path.
+    Established { stream: TcpStream, latency: Duration },
+    Failed(ErrnoBucket),
+}
+
+/// TCP full-handshake connect flood, backed by a small pool of blocking workers.
+///
+/// ## Why a pool
+///
+/// A single-threaded blocking `connect()` loop cannot exceed **one handshake per
+/// RTT** — about 330 attempts/s against a 3 ms target — regardless of `--rate`,
+/// because the next attempt cannot start until the previous one resolves. That
+/// made the rate cap unreachable by construction and the achieved figure a
+/// measure of network latency rather than of anything about the target. With
+/// `parallelism` handshakes in flight the ceiling becomes `parallelism / RTT`
+/// and `--rate` is the binding constraint again.
+///
+/// ## The descriptor bound is unchanged
+///
+/// `cap` still means exactly what `--concurrency` always claimed: the number of
+/// **simultaneously open sockets**. Admission requires
+/// `held.len() + in_flight < cap`, so a socket mid-handshake now counts against
+/// the same ceiling established ones always did. The footprint therefore remains
+/// a function of `cap` alone, never of `--duration` or `--rate`.
+///
+/// ## Abortive close on eviction
+///
+/// Evicted connections are closed with `SO_LINGER 0`, i.e. RST rather than FIN,
+/// so the local socket skips `TIME_WAIT`. This is not cosmetic: a graceful close
+/// parks each ephemeral port for 60 s, and at any rate above roughly 450/s a
+/// single source address exhausts the default ~28k-port range within the run and
+/// the flood starts failing on `EADDRNOTAVAIL` instead of testing the target.
+/// Steady-state pressure is unaffected — it comes from the `cap` connections
+/// held established, not from the ones already closed.
+struct ConnectPool {
+    /// Dispatch queue. Dropping it is the shutdown signal for every worker.
+    work: Option<mpsc::SyncSender<SocketAddr>>,
+    /// Unbounded so a worker can never block reporting a result — which would
+    /// deadlock against the run thread waiting on that same worker to free a slot.
+    results: mpsc::Receiver<ConnectOutcome>,
+    workers: Vec<thread::JoinHandle<()>>,
+    /// Established connections held open to keep pressure on the target's
+    /// connection table. FIFO: the oldest is evicted to make room.
+    held: VecDeque<TcpStream>,
+    /// Ceiling on open descriptors, covering `held` *and* in-flight handshakes.
+    cap: usize,
+    /// Attempts dispatched but not yet reaped.
+    in_flight: usize,
+    /// Maximum concurrent handshakes (the worker count).
+    parallelism: usize,
+}
+
+impl ConnectPool {
+    fn new(cap: usize, timeout: Duration) -> Result<Self, L34Error> {
+        // Never more workers than the descriptor budget: a worker that can never
+        // be admitted is a thread that only ever sleeps.
+        let parallelism = cap.clamp(1, MAX_CONNECT_WORKERS);
+        let (work_tx, work_rx) = mpsc::sync_channel::<SocketAddr>(parallelism);
+        let (res_tx, res_rx) = mpsc::channel::<ConnectOutcome>();
+        // `mpsc::Receiver` is Send but not Sync, so the workers share one behind a
+        // mutex. The lock is held only across `recv`, which is orders of magnitude
+        // cheaper than the handshake it hands out.
+        let work_rx = Arc::new(Mutex::new(work_rx));
+
+        let mut workers = Vec::with_capacity(parallelism);
+        for _ in 0..parallelism {
+            let work_rx = Arc::clone(&work_rx);
+            let res_tx = res_tx.clone();
+            let handle = thread::Builder::new()
+                .name("jinrai-connect".into())
+                .stack_size(CONNECT_WORKER_STACK)
+                .spawn(move || loop {
+                    // Take one address, then release the lock before the blocking
+                    // connect so the other workers are not serialised behind it.
+                    let addr = match work_rx.lock() {
+                        Ok(rx) => match rx.recv() {
+                            Ok(a) => a,
+                            // The run thread dropped the dispatch queue: shut down.
+                            Err(_) => break,
+                        },
+                        // A poisoned lock means another worker panicked mid-run;
+                        // stop rather than fabricate attempts.
+                        Err(_) => break,
+                    };
+                    let began = Instant::now();
+                    let outcome = match TcpStream::connect_timeout(&addr, timeout) {
+                        Ok(stream) => {
+                            let latency = began.elapsed();
+                            set_abortive_close(&stream);
+                            ConnectOutcome::Established { stream, latency }
+                        }
+                        Err(e) => ConnectOutcome::Failed(classify_io(&e)),
+                    };
+                    if res_tx.send(outcome).is_err() {
+                        break;
+                    }
+                })
+                .map_err(|e| L34Error::Setup(format!("cannot spawn connect worker: {e}")))?;
+            workers.push(handle);
+        }
+
+        Ok(Self {
+            work: Some(work_tx),
+            results: res_rx,
+            workers,
+            held: VecDeque::with_capacity(cap),
+            cap,
+            in_flight: 0,
+            parallelism,
+        })
+    }
+
+    /// Fold every result that has already arrived into `tally`. Non-blocking.
+    fn reap(&mut self, tally: &mut Tally) {
+        while let Ok(outcome) = self.results.try_recv() {
+            self.absorb(outcome, tally);
+        }
+    }
+
+    fn absorb(&mut self, outcome: ConnectOutcome, tally: &mut Tally) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        match outcome {
+            ConnectOutcome::Established { stream, latency } => {
+                self.held.push_back(stream);
+                tally.record(Emission::Sent { latency: Some(latency) });
+            }
+            ConnectOutcome::Failed(bucket) => tally.record(Emission::Failed(bucket)),
+        }
+    }
+
+    /// True once there is room for one more open socket *and* a free worker.
+    fn has_slot(&self) -> bool {
+        self.in_flight < self.parallelism && self.held.len() + self.in_flight < self.cap
+    }
+
+    /// Dispatch one attempt, evicting held connections as needed to stay inside
+    /// `cap`. Returns [`Emission::Deferred`]: the outcome is counted when the
+    /// worker reports back, or — if the pool was saturated and nothing could be
+    /// admitted — not at all, which is the honest record of load we could not offer.
+    fn send(&mut self, addr: SocketAddr, tally: &mut Tally) -> Emission {
+        // Close established connections to make room *before* dispatching, so the
+        // descriptor count never exceeds `cap` even momentarily. Dropping the
+        // stream closes it (RST, per `set_abortive_close`).
+        while !self.has_slot() && !self.held.is_empty() {
+            self.held.pop_front();
+        }
+        if !self.has_slot() {
+            // Every slot is a handshake in flight and there is nothing left to
+            // evict: wait (briefly) for one to resolve rather than spin.
+            if let Ok(outcome) = self.results.recv_timeout(BACKPRESSURE_WAIT) {
+                self.absorb(outcome, tally);
+            }
+            while !self.has_slot() && !self.held.is_empty() {
+                self.held.pop_front();
+            }
+            if !self.has_slot() {
+                return Emission::Deferred;
+            }
+        }
+        match self.work.as_ref() {
+            Some(work) => match work.try_send(addr) {
+                Ok(()) => {
+                    self.in_flight += 1;
+                    Emission::Deferred
+                }
+                // The queue is momentarily full (a worker has not yet returned to
+                // `recv`); skip this tick rather than block the pacer.
+                Err(mpsc::TrySendError::Full(_)) => Emission::Deferred,
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    Emission::Failed(ErrnoBucket::Internal)
+                }
+            },
+            None => Emission::Failed(ErrnoBucket::Internal),
+        }
+    }
+
+    /// Stop dispatching, wait for the workers to finish what they hold, and fold
+    /// every remaining result into `tally`.
+    fn finish(&mut self, tally: &mut Tally) {
+        // Dropping the dispatch queue is what tells the workers to exit; they can
+        // still report the attempt in hand because `results` is unbounded.
+        self.work = None;
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
+        // Every worker (and so every result sender) is gone: this drains to
+        // completion and terminates.
+        while let Ok(outcome) = self.results.recv() {
+            self.absorb(outcome, tally);
+        }
+    }
+}
+
+/// Close this socket abortively (RST, no `TIME_WAIT`) when it is dropped.
+///
+/// Best-effort: a stack that refuses the option simply gets the default graceful
+/// close, which is slower to recycle ports but not incorrect.
+fn set_abortive_close(stream: &TcpStream) {
+    let _ = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO));
+}
+
 impl Sender {
     fn setup(config: &L34Config) -> Result<Self, L34Error> {
         let L34Config { mode, payload_size, connect_timeout, .. } = *config;
@@ -598,11 +868,7 @@ impl Sender {
                 let payload = vec![0u8; payload_size.min(MAX_UDP_PAYLOAD)];
                 Ok(Sender::Udp { sock, payload })
             }
-            L4Mode::TcpConnect => Ok(Sender::Tcp {
-                held: VecDeque::with_capacity(cap),
-                cap,
-                timeout: connect_timeout,
-            }),
+            L4Mode::TcpConnect => Ok(Sender::Tcp(ConnectPool::new(cap, connect_timeout)?)),
             L4Mode::Data => Ok(Sender::TcpData {
                 conns: Vec::with_capacity(cap),
                 // Non-zero, bounded payload for each PSH-ACK write.
@@ -635,7 +901,22 @@ impl Sender {
         }
     }
 
-    fn send(&mut self, ip: IpAddr, port: u16) -> Result<Emission, L34Error> {
+    /// Fold any deferred results into `tally`. A no-op for every mode that
+    /// resolves its attempts inline.
+    fn reap(&mut self, tally: &mut Tally) {
+        if let Sender::Tcp(pool) = self {
+            pool.reap(tally);
+        }
+    }
+
+    /// Retire any background workers and account for attempts still outstanding.
+    fn finish(&mut self, tally: &mut Tally) {
+        if let Sender::Tcp(pool) = self {
+            pool.finish(tally);
+        }
+    }
+
+    fn send(&mut self, ip: IpAddr, port: u16, tally: &mut Tally) -> Result<Emission, L34Error> {
         match self {
             Sender::Udp { sock, payload } => Ok(
                 match sock.send_to(payload, SocketAddr::new(ip, port)) {
@@ -645,30 +926,10 @@ impl Sender {
                 },
             ),
 
-            Sender::Tcp { held, cap, timeout } => {
-                // Evict *before* connecting, so the number of open descriptors
-                // never exceeds `cap` even momentarily. Dropping the stream closes
-                // it — this is the completion path the flood previously lacked,
-                // and why the footprint no longer tracks the run's duration.
-                while held.len() >= *cap {
-                    held.pop_front();
-                }
-                // Blocking connect: it returns only once the handshake has
-                // resolved (or the timeout expired), so the elapsed time either
-                // side of it *is* attempt-initiation-to-resolution. There is no
-                // EINPROGRESS to mis-measure here.
-                let began = Instant::now();
-                match TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout) {
-                    Ok(stream) => {
-                        let elapsed = began.elapsed();
-                        // Hold the established connection to keep pressure on the
-                        // target's connection table, but only up to `cap`.
-                        held.push_back(stream);
-                        Ok(Emission::Sent { latency: Some(elapsed) })
-                    }
-                    Err(e) => Ok(Emission::Failed(classify_io(&e))),
-                }
-            }
+            // The handshake runs on a worker, which times it from initiation to
+            // resolution — a blocking `connect_timeout` has no EINPROGRESS to
+            // mis-measure, so the semantics are unchanged from the serial path.
+            Sender::Tcp(pool) => Ok(pool.send(SocketAddr::new(ip, port), tally)),
 
             Sender::TcpData { conns, payload, cap, timeout, idx } => {
                 // Below the pool cap, each send opens a new connection and primes
@@ -1593,6 +1854,129 @@ mod tests {
             "every failure must carry an OS attribution, got {buckets:?}"
         );
         assert!(!buckets.is_empty(), "failures must be bucketed: {report:?}");
+    }
+
+    /// ACCEPTANCE: handshakes must overlap. A blocking `connect()` loop with no
+    /// parallelism cannot start attempt N+1 until attempt N resolves, which
+    /// caps it at `duration / attempt-cost` — the bug that made a 10000/s run
+    /// against a 3 ms target achieve 320/s and report "3% of the cap".
+    ///
+    /// The listener here has a backlog of 1 and never accepts, so once the
+    /// accept queue overflows Linux silently drops further SYNs and every
+    /// subsequent connect hangs until *our* timeout expires. That fixes the
+    /// per-attempt cost at a known constant, which makes the serial ceiling
+    /// arithmetic rather than a guess about network conditions.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn connect_flood_overlaps_handshakes_instead_of_one_per_rtt() {
+        let _fd = fd_guard();
+        const TIMEOUT: Duration = Duration::from_millis(250);
+        const SECS: u64 = 2;
+        const CONCURRENCY: usize = 32;
+
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        listener
+            .bind(&SockAddr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
+            .unwrap();
+        listener.listen(1).unwrap();
+        let port = listener.local_addr().unwrap().as_socket().unwrap().port();
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(L34Config {
+            concurrency: CONCURRENCY,
+            connect_timeout: TIMEOUT,
+            ..config(L4Mode::TcpConnect, port, 16)
+        });
+        // A rate cap far above what either implementation can reach, so the
+        // limiter is not what this test measures.
+        let report = engine.execute(&plan(vec![t], 10_000, SECS));
+
+        let attempts = report.units_sent + report.errors;
+        let serial_ceiling = (SECS as f64 / TIMEOUT.as_secs_f64()).ceil() as u64;
+        assert!(
+            attempts > serial_ceiling * 3,
+            "connect flood is still serialised: {attempts} attempts in {SECS}s at a \
+             {TIMEOUT:?} timeout, against a one-at-a-time ceiling of {serial_ceiling} \
+             (report: {report:?})"
+        );
+        // Every attempt still has to be accounted for, deferred or not.
+        assert_eq!(
+            report.errno.total(),
+            report.errors,
+            "deferred results must still be bucketed: {:?}",
+            report.errno.iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// ACCEPTANCE: an evicted connection is closed abortively (RST), not with a
+    /// graceful FIN. This is what keeps our own ephemeral ports out of the 60 s
+    /// `TIME_WAIT` parking lot — without it a sustained flood exhausts the
+    /// default ~28k-port range and starts failing on EADDRNOTAVAIL instead of
+    /// testing the target. The peer-observable consequence is ECONNRESET where a
+    /// graceful close would have delivered end-of-stream.
+    #[test]
+    fn connect_flood_evictions_reset_rather_than_parking_ports_in_time_wait() {
+        let _fd = fd_guard();
+        use std::io::{ErrorKind, Read};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resets = Arc::new(AtomicUsize::new(0));
+        let graceful = Arc::new(AtomicUsize::new(0));
+
+        let acceptor = {
+            let (resets, graceful) = (resets.clone(), graceful.clone());
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut streams: Vec<std::net::TcpStream> = Vec::new();
+                while Instant::now() < deadline {
+                    while let Ok((s, _)) = listener.accept() {
+                        s.set_nonblocking(true).ok();
+                        streams.push(s);
+                    }
+                    let mut buf = [0u8; 64];
+                    streams.retain_mut(|s| match s.read(&mut buf) {
+                        // Orderly shutdown: the FIN path this test exists to rule out.
+                        Ok(0) => {
+                            graceful.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                        Ok(_) => true,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+                        Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                            resets.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                        Err(_) => false,
+                    });
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        // A cap of 1 forces an eviction on essentially every attempt, so the
+        // close path is what the test exercises.
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine =
+            L34Engine::new(L34Config { concurrency: 1, ..config(L4Mode::TcpConnect, port, 16) });
+        let report = engine.execute(&plan(vec![t], 200, 1));
+        assert!(report.units_sent > 1, "flood should have connected repeatedly: {report:?}");
+
+        acceptor.join().unwrap();
+        let (resets, graceful) = (resets.load(Ordering::Relaxed), graceful.load(Ordering::Relaxed));
+        assert!(
+            resets > 0,
+            "evicted connections must be reset (SO_LINGER 0), but the peer saw \
+             {graceful} graceful close(s) and {resets} reset(s)"
+        );
+        assert!(
+            resets > graceful,
+            "resets must be the rule, not the exception: {resets} reset(s) vs \
+             {graceful} graceful close(s)"
+        );
     }
 
     #[test]
