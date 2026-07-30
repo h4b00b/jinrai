@@ -48,6 +48,24 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   cookbook, and all 34 documented method/mode names, were executed against the
   built binary to confirm the CLI accepts them as written.
 
+- **The README is now one document in three parts, with each fact stated once.**
+  The 101 had been bolted onto a reference manual that already carried its own
+  examples, so eleven commands existed twice (POST, `--max-connections`,
+  slowloris, slow-read, `h2-continuation`, both `--http-version` forms, both SLO
+  forms, `udp`, `xmas`, `tcp`, `data`, `tcp-options`, `icmp`) and the
+  fail-closed rule and the no-spoofing guarantee were each stated three times.
+  Examples now live only in the cookbook and the reference keeps only the prose
+  that explains *why* — the `auto` ALPN trap, the `TIME_WAIT`/`SO_LINGER`
+  reasoning, the errno buckets, the `--concurrency / RTT` bound. The order
+  follows the operator instead of the build history: **Part I — Operating**
+  (install → anatomy of a run → layer → catalogue → knobs → cookbook → first
+  four runs → choosing numbers → reading the result → audit log → what the tool
+  will not do), **Part II — Reference** (per-flag semantics), **Part III — About
+  the project** (Rust rationale, architecture, team, roadmap). `Build & test`
+  became `Install` and moved to the top, since it was previously documented
+  *after* the section telling operators to run things. Adds a linked table of
+  contents; all 21 internal links verified to resolve.
+
 ## [0.23.0] — 2026-07-30
 
 Operator-feedback release. A technician ran `tcp-connect-flood` against a lab
