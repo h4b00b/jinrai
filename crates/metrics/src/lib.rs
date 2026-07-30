@@ -102,6 +102,15 @@ pub struct RunContext {
     /// Extra operator-relevant settings worth restating, e.g. `"HTTP/1.1 forced"`
     /// or `"max 50 concurrent connections"`.
     pub notes: Vec<String>,
+    /// In-flight ceiling for the modes that have one (`--concurrency` /
+    /// `--max-connections`), or `None` for the stateless floods.
+    ///
+    /// Present so the summary can tell an operator *why* a run fell short of its
+    /// rate cap. Offered load is bounded by `concurrency / latency` (Little's
+    /// law), and when that product lands below the cap the run was never capable
+    /// of reaching it — a fact no counter in the report can express on its own,
+    /// and one that otherwise reads as "the target absorbed it".
+    pub concurrency: Option<usize>,
 }
 
 /// Render the end-of-run block an operator reads: what was fired, what came back,
@@ -202,6 +211,9 @@ pub fn render_summary(
             ),
         ));
     }
+    if let Some(note) = concurrency_bound_note(effective, report, ctx) {
+        out.push_str(&row("bound by", &note));
+    }
     if let Some(k) = report.knee {
         out.push_str(&row(
             "knee",
@@ -280,6 +292,42 @@ fn achieved_hint(effective: f64, ctx: &RunContext) -> String {
     }
     let pct = effective / ctx.rate_per_sec as f64 * 100.0;
     format!(" ({pct:.0}% of the {}/s cap)", ctx.rate_per_sec)
+}
+
+/// Explain a run that fell short of its rate cap because it could not have
+/// reached it, rather than because the target pushed back.
+///
+/// Offered load is bounded by Little's law: with `N` attempts in flight and a
+/// median attempt taking `L`, the most a run can offer is `N / L` per second. If
+/// that product is below the cap, the cap was unreachable from the start and the
+/// achieved percentage says nothing about the target — the operator needs to
+/// raise the concurrency ceiling, not read the result as absorbed load. Silent
+/// when the run got near its cap, when latency was never measured (the stateless
+/// floods), or when the ceiling was not the binding constraint.
+fn concurrency_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) -> Option<String> {
+    let concurrency = ctx.concurrency?;
+    if ctx.rate_per_sec == 0 || report.p50_micros == 0 || concurrency == 0 {
+        return None;
+    }
+    let cap = ctx.rate_per_sec as f64;
+    // Within reach of the cap: the pacer was in charge, which is the healthy case.
+    if effective >= cap * 0.9 {
+        return None;
+    }
+    let median = report.p50_micros as f64 / 1_000_000.0;
+    let ceiling = concurrency as f64 / median;
+    if ceiling >= cap {
+        // The run had the headroom to reach the cap and did not — that is a
+        // finding about the target, not about this knob. Say nothing.
+        return None;
+    }
+    Some(format!(
+        "concurrency, not the target: {concurrency} in flight at a {} median \
+         attempt tops out near {ceiling:.0}/s, below the {}/s cap — raise \
+         --concurrency to offer more load",
+        fmt_micros(report.p50_micros),
+        ctx.rate_per_sec
+    ))
 }
 
 /// `"(99.9%)"` of a total, or empty when the total is zero.
@@ -474,6 +522,7 @@ mod tests {
             planned: Duration::from_secs(30),
             elapsed: Duration::from_secs(30),
             notes: vec!["HTTP/1.1 forced".into()],
+            concurrency: None,
         }
     }
 
@@ -502,6 +551,76 @@ mod tests {
         assert!(out.contains("ran to completion"), "{out}");
         // Percentages, not just counts — the point of the block.
         assert!(out.contains("2xx 5900 (98.4%)"), "{out}");
+    }
+
+    /// The reading that used to be a mystery: "320/s achieved (3% of the 10000/s
+    /// cap)" with zero failures. The block must say the ceiling was ours.
+    #[test]
+    fn summary_attributes_a_short_run_to_the_concurrency_ceiling() {
+        let r = RunReport {
+            layer_label: "L4 tcp-connect-flood".into(),
+            units_sent: 3204,
+            p50_micros: 3_000,
+            ..Default::default()
+        };
+        let c = RunContext {
+            layer: "L4".into(),
+            mode: "tcp-connect-flood".into(),
+            target: "198.51.100.7".into(),
+            rate_per_sec: 10_000,
+            planned: Duration::from_secs(10),
+            elapsed: Duration::from_secs(10),
+            notes: vec![],
+            concurrency: Some(1),
+        };
+        let out = render_summary(&r, &c, None);
+        assert!(out.contains("bound by"), "{out}");
+        assert!(out.contains("concurrency, not the target"), "{out}");
+        // The arithmetic, so the operator can see where the number came from.
+        // (Assert on fragments that survive the block's line wrapping.)
+        assert!(out.contains("tops out near 333/s"), "{out}");
+        assert!(out.contains("--concurrency to offer more load"), "{out}");
+    }
+
+    /// The same shortfall with headroom to spare is a finding about the target,
+    /// so the note must stay quiet rather than blame the wrong thing.
+    #[test]
+    fn summary_stays_quiet_when_concurrency_had_the_headroom() {
+        let r = RunReport {
+            units_sent: 3204,
+            p50_micros: 3_000,
+            ..Default::default()
+        };
+        let c = RunContext {
+            // 256 in flight at a 3ms median is ~85k/s — far above the cap, so
+            // falling short is not this knob's fault.
+            concurrency: Some(256),
+            ..ctx_l4()
+        };
+        let out = render_summary(&r, &c, None);
+        assert!(!out.contains("bound by"), "{out}");
+    }
+
+    /// A stateless flood measures no latency, so there is no bound to compute
+    /// and the summary must not invent one.
+    #[test]
+    fn summary_omits_the_bound_without_measured_latency() {
+        let r = RunReport { units_sent: 900, p50_micros: 0, ..Default::default() };
+        let out = render_summary(&r, &RunContext { concurrency: Some(4), ..ctx_l4() }, None);
+        assert!(!out.contains("bound by"), "{out}");
+    }
+
+    fn ctx_l4() -> RunContext {
+        RunContext {
+            layer: "L4".into(),
+            mode: "tcp-connect-flood".into(),
+            target: "198.51.100.7".into(),
+            rate_per_sec: 10_000,
+            planned: Duration::from_secs(10),
+            elapsed: Duration::from_secs(10),
+            notes: vec![],
+            concurrency: None,
+        }
     }
 
     #[test]

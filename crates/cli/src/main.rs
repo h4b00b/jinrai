@@ -169,6 +169,11 @@ OPTIONS:
                           --concurrency is how many connections are held at once,
                           --duration is only wall-clock length. Once N are open,
                           admitting a new attempt closes the oldest connection.
+                          For l4-mode tcp the count covers sockets mid-handshake
+                          too, so N is also how many handshakes run in parallel:
+                          the reachable rate is about N / round-trip-time. If a
+                          run reports far less than the --rate cap, this is the
+                          knob to raise (the summary says so when it applies).
     --connect-timeout-ms <MS>  How long one l4 connection attempt may stay
                           unresolved before it is abandoned and counted in the
                           `timeout` errno bucket (default: 500)
@@ -653,6 +658,13 @@ fn run_l7(
             planned: duration,
             elapsed,
             notes,
+            // Only the bounded fast flood has an in-flight ceiling; 0 means
+            // unbounded, which cannot be the binding constraint.
+            concurrency: if is_fast && args.max_connections > 0 {
+                Some(args.max_connections)
+            } else {
+                None
+            },
         },
     );
 
@@ -841,6 +853,12 @@ fn run_l4(
             planned: duration,
             elapsed,
             notes,
+            // Only the connect flood paces against an in-flight ceiling; the
+            // stateless floods measure no latency for the bound to apply to.
+            concurrency: match args.l4_mode {
+                L4Mode::TcpConnect => Some(args.concurrency),
+                _ => None,
+            },
         },
     );
     audit_record(&mut audit, AuditEvent::completed(&report, None))?;
