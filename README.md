@@ -358,11 +358,16 @@ instead (stable for scripts and log scraping):
 ==========================================================================
 ```
 
-Three things the block is there to make unmissable:
+Four things the block is there to make unmissable:
 
 * **Offered vs. achieved load** — `attempts … achieved (…% of the cap)` says
   whether the tool actually produced the load that was asked for, so a result is
   never read as "the target coped" when the generator never reached the rate.
+* **Why it fell short, when it did** — a low percentage with **zero failures** is
+  the single most misreadable line the tool can print: it looks exactly like a
+  target absorbing the difference. So when the run did not reach its cap, a
+  `bound by` line names the constraint rather than leaving the percentage to be
+  guessed at. See [when the run falls short of its cap](#when-the-run-falls-short-of-its-cap).
 * **Whose failure it was** — L7 failures are bucketed like the L3/L4 ones:
   `ECONNREFUSED` (the target refused), `timeout` (nobody answered),
   `protocol` (the exchange failed above the socket — typically a forced
@@ -371,6 +376,33 @@ Three things the block is there to make unmissable:
 * **A run that tested nothing** — 0 completions with only failures prints an
   explicit warning **and exits non-zero**, so "6000 attempts, 0 responses" can no
   longer be mistaken for a successful test in a pipeline.
+
+### When the run falls short of its cap
+
+`--rate` is a ceiling, and a run reaching only part of it is normal. What matters
+is *why*, because two of the three reasons say nothing at all about the target:
+
+```
+ attempts   86335 total, 28769.5/s achieved (14% of the 200000/s cap)
+ failed     0
+ bound by   the generator, not the target: nothing failed and there was no
+            in-flight ceiling, so 28769/s is what this host could emit — the
+            shortfall against the 200000/s cap is jinrai's own limit, NOT load
+            the target absorbed. Treat 28769/s as the load actually offered
+```
+
+| `bound by` says | what it means | what to do |
+| --- | --- | --- |
+| `concurrency, not the target` | the in-flight ceiling made the cap unreachable: `--concurrency / RTT` lands below `--rate` (Little's law) | raise `--concurrency` / `--max-connections` |
+| `the generator, not the target` | this host could not emit any faster — nothing failed and no ceiling applied | treat the achieved rate as the real offered load; run from more hosts if you need more |
+| *(nothing printed)* | the run had the headroom and still fell short, or it got within 90% of the cap | **this one is about the target** — read it as a finding |
+
+The stateless floods (`udp`, the raw flag/anomaly floods, `icmp*`) pace one unit
+at a time and top out in the tens of thousands per second regardless of what
+`--rate` will accept, so the second row is the common case for them. The
+generator note is deliberately narrow: it appears only when nothing failed, no
+in-flight ceiling applied, and the run ran to completion — with any failure on
+the board the errno breakdown is the story instead.
 
 ## The audit log
 
