@@ -158,6 +158,18 @@ OPTIONS:
                           busy — the controlled form of keep-alive connection
                           exhaustion (probe a server's connection-slot / worker
                           limit); --rate still caps the request rate on top
+    --request-timeout-ms <MS>  How long one l7 request may stay unresolved before
+                          it is abandoned and counted in the `timeout` errno
+                          bucket (default: 10000). Applies to the fast
+                          get/post/head flood.
+    --drain-timeout-ms <MS>  How long to wait for still-in-flight l7 requests once
+                          --duration expires, before cancelling them (default:
+                          1000). --duration bounds the TRAFFIC, not just the
+                          dispatching of it: without this bound a run's real
+                          window would be --duration plus the request timeout.
+                          Requests cancelled here are counted in the `abandoned`
+                          errno bucket, never silently dropped. 0 = cancel at the
+                          deadline itself.
     --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
     --drip-ms <MS>        Per-tick interval for slow modes (default: 10000): the
                           keep-alive write interval for slowloris/slowbody, or the
@@ -295,6 +307,8 @@ struct Args {
     slow_connections: usize,
     drip_ms: u64,
     max_connections: usize,
+    request_timeout_ms: u64,
+    drain_timeout_ms: u64,
     layer: Layer,
     l4_mode: L4Mode,
     port: Option<u16>,
@@ -518,8 +532,11 @@ fn run_l7(
                 cache_bust: args.cache_bust,
                 http_version: args.http_version,
             };
-            let mut engine =
-                L7Engine::new(gate, spec).with_slo(args.slo).with_max_connections(args.max_connections);
+            let mut engine = L7Engine::new(gate, spec)
+                .with_slo(args.slo)
+                .with_max_connections(args.max_connections)
+                .with_request_timeout(Duration::from_millis(args.request_timeout_ms))
+                .with_drain_grace(Duration::from_millis(args.drain_timeout_ms));
             if let Some(p) = l7_profile(args, rate_cap, duration) {
                 engine = engine.with_profile(p);
             }
@@ -899,6 +916,8 @@ fn parse_args() -> Result<Args, String> {
     let mut slow_connections = 100usize;
     let mut drip_ms = 10_000u64;
     let mut max_connections = 0usize;
+    let mut request_timeout_ms = jinrai_l7::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64;
+    let mut drain_timeout_ms = jinrai_l7::DEFAULT_DRAIN_GRACE.as_millis() as u64;
     let mut layer = Layer::L7;
     let mut l4_mode = L4Mode::Udp;
     let mut port = None;
@@ -1004,6 +1023,16 @@ fn parse_args() -> Result<Args, String> {
                 max_connections = next_val(&mut it, "--max-connections")?
                     .parse()
                     .map_err(|_| "invalid --max-connections".to_string())?;
+            }
+            "--request-timeout-ms" => {
+                request_timeout_ms = next_val(&mut it, "--request-timeout-ms")?
+                    .parse()
+                    .map_err(|_| "invalid --request-timeout-ms".to_string())?;
+            }
+            "--drain-timeout-ms" => {
+                drain_timeout_ms = next_val(&mut it, "--drain-timeout-ms")?
+                    .parse()
+                    .map_err(|_| "invalid --drain-timeout-ms".to_string())?;
             }
             "--l4-mode" => {
                 l4_mode = match next_val(&mut it, "--l4-mode")?.as_str() {
@@ -1157,6 +1186,8 @@ fn parse_args() -> Result<Args, String> {
         slow_connections,
         drip_ms,
         max_connections,
+        request_timeout_ms,
+        drain_timeout_ms,
         layer,
         l4_mode,
         port,

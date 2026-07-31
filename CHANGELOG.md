@@ -14,6 +14,74 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-07-31
+
+`--duration` now bounds the **traffic**, not just the dispatching of it.
+
+Measured on the bench: `--duration 3` against a slow target generated traffic
+for **13.0 seconds** — a window the operator never declared, and one the audit
+log recorded as three seconds. The dispatch loop did stop at the deadline, but
+the run then waited out every request still in flight, and the per-request
+timeout was a hard-coded 10 s, so the real window was `--duration` plus that
+timeout. The same run now finishes in 4.7 s, and a healthy target's run in 3.1 s
+against a 3.0 s window.
+
+For a tool whose whole premise is that the operator's declared limits are real,
+a duration that silently means "three seconds, plus up to ten more" is a safety
+defect, not a performance one — which is why it is listed under **Security**
+below as well.
+
+### Security
+
+- **The run window is now enforced on the traffic itself.** Dispatch still stops
+  at the deadline; what changed is the tail. In-flight requests get a bounded
+  grace period to land, and whatever is still outstanding is **cancelled**, so
+  no request can outlive the run by more than that grace. An operator abort
+  (Ctrl-C / watchdog) skips the grace entirely and cancels immediately, as it
+  always did. The audit log's recorded duration and the traffic actually emitted
+  now describe the same window.
+
+- **Cancelled attempts are counted, never dropped.** A silently discarded
+  in-flight request would understate the offered load and flatter the target, so
+  every attempt cancelled at the deadline is tallied in a new `abandoned` errno
+  bucket and shows up in the run summary with its own explanation. It is
+  deliberately kept apart from `timeout`: the cause is the *run's* shape (the
+  target was answering slower than the offered load), so the fix is a longer
+  `--duration` or a lower `--rate`, not a longer per-attempt timeout.
+
+### Added
+
+- **`--request-timeout-ms <MS>`** (default `10000`) — how long one L7 request may
+  stay unresolved before it is abandoned and counted in the `timeout` bucket.
+  Previously hard-coded, with no way for an operator to say that a target which
+  takes eight seconds to answer has already failed the test.
+
+- **`--drain-timeout-ms <MS>`** (default `1000`) — how long to wait for
+  still-in-flight requests once `--duration` expires, before cancelling them.
+  `0` cancels at the deadline itself, the strictest reading of the flag. One
+  second is long enough that a responsive target abandons nothing (there is a
+  regression test asserting exactly that) and short enough that the declared
+  window still means something.
+
+### Fixed
+
+- **The achieved-rate figure no longer charges teardown to the run.** Dropping
+  the L7 engine's multi-thread runtime *blocks* until its worker threads wind
+  down, and that time was being counted as part of the run window — a clean
+  500/s run reported "4.0s elapsed of 3.0s planned, 75% of the cap" when it had
+  in fact held 98% of the cap for its full three seconds. The runtime is now
+  released in the background once every traffic task is joined or cancelled.
+
+### Known limitation
+
+A run that ends with tens of thousands of requests still in flight spends
+measurable time cancelling them (~6.4 s wall for a 3 s run that left 24 000
+outstanding). No new traffic is generated during that tail — dispatch has
+stopped and the cancelled connections are closing — but it is still charged to
+the reported elapsed time, which dilutes the achieved-rate percentage. The
+`abandoned` count is the signal that this happened, and `--max-connections`
+bounds the pile-up at its source.
+
 ### Documentation
 
 - **"jinrai 101" opening section in the README.** Operator feedback: the README
@@ -843,7 +911,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/h4b00b/jinrai/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/h4b00b/jinrai/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/h4b00b/jinrai/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/h4b00b/jinrai/compare/v0.20.0...v0.21.0
