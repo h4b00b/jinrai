@@ -678,7 +678,7 @@ fn now_unix() -> u64 {
 /// Format a Unix timestamp (seconds) as an RFC 3339 UTC string, e.g.
 /// `2026-07-08T12:34:56Z`. Uses the standard days-from-civil algorithm so the
 /// audit log carries a human-readable time without pulling in a date crate.
-fn format_rfc3339(secs: u64) -> String {
+pub(crate) fn format_rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);

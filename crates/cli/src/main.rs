@@ -66,6 +66,11 @@ OPTIONS:
                                                  spoofed). urg/cwr/ece send an
                                                  otherwise-empty segment carrying
                                                  only that (rarely-standalone) bit
+                            syn-ack              raw unsolicited SYN-ACK flood: a
+                                                 legal handshake *response* to a SYN
+                                                 the target never sent, so each one
+                                                 must be matched against connection
+                                                 state or answered with an RST
                             syn-fin | syn-rst | xmas | null
                                                  raw TCP anomalous-flag floods:
                                                  syn-fin/syn-rst set contradictory
@@ -650,6 +655,7 @@ fn run_l7(
     let plan = RunPlan { targets, rate_cap, duration, kill };
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let started = std::time::Instant::now();
+    let started_unix = now_unix();
     let report = engine.execute(&plan);
     let elapsed = started.elapsed();
 
@@ -683,6 +689,7 @@ fn run_l7(
             rate_per_sec: args.rate,
             planned: duration,
             elapsed,
+            started_unix,
             notes,
             // Only the bounded fast flood has an in-flight ceiling; 0 means
             // unbounded, which cannot be the binding constraint.
@@ -713,6 +720,16 @@ fn run_l7(
 
     audit_record(&mut audit, AuditEvent::completed(&report, verdict.as_ref()))?;
     check_l7_outcome(&report, verdict.as_ref())
+}
+
+/// Wall-clock seconds since the Unix epoch, for stamping the run's start. A
+/// clock set before the epoch is not a reason to fail a run, so it yields
+/// `None` and the summary simply omits the timestamps rather than claiming 1970.
+fn now_unix() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Print the end-of-run report in the operator's chosen form.
@@ -854,6 +871,7 @@ fn run_l4(
     }
     println!("running module '{}' ({:?})...", module.name(), module.layer());
     let started = std::time::Instant::now();
+    let started_unix = now_unix();
     let report = module.execute(&plan);
     let elapsed = started.elapsed();
 
@@ -878,6 +896,7 @@ fn run_l4(
             rate_per_sec: args.rate,
             planned: duration,
             elapsed,
+            started_unix,
             notes,
             // Only the connect flood paces against an in-flight ceiling; the
             // stateless floods measure no latency for the bound to apply to.
@@ -1075,6 +1094,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     "urg" => L4Mode::Urg,
                     "cwr" => L4Mode::Cwr,
                     "ece" => L4Mode::Ece,
+                    "syn-ack" => L4Mode::SynAck,
                     "syn-fin" => L4Mode::SynFin,
                     "syn-rst" => L4Mode::SynRst,
                     "xmas" => L4Mode::Xmas,
@@ -1087,8 +1107,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     other => {
                         return Err(format!(
                             "unknown --l4-mode: {other} \
-                             (want udp|tcp|syn|ack|fin|rst|urg|cwr|ece|syn-fin|syn-rst|\
-                              xmas|null|data|tcp-options|icmp|icmp-timestamp|icmp-address-mask)"
+                             (want udp|tcp|syn|ack|fin|rst|urg|cwr|ece|syn-ack|syn-fin|\
+                              syn-rst|xmas|null|data|tcp-options|icmp|icmp-timestamp|\
+                              icmp-address-mask)"
                         ))
                     }
                 }
@@ -1383,6 +1404,28 @@ mod tests {
         assert!(USAGE.contains("--layer <l3|l4|l7>"), "help must document the l3 spelling");
         let a = args_of(&["--allow", "1.2.3.4", "--l4-mode", "icmp-timestamp"]);
         assert!(matches!(a.l4_mode, L4Mode::IcmpTimestamp));
+        // Every raw-TCP flag mode the help text lists must actually parse — a mode
+        // documented but not wired is indistinguishable, to an operator, from one
+        // that "doesn't work".
+        for (spelling, expected) in [
+            ("syn", L4Mode::Syn),
+            ("ack", L4Mode::Ack),
+            ("fin", L4Mode::Fin),
+            ("rst", L4Mode::Rst),
+            ("urg", L4Mode::Urg),
+            ("cwr", L4Mode::Cwr),
+            ("ece", L4Mode::Ece),
+            ("syn-ack", L4Mode::SynAck),
+            ("syn-fin", L4Mode::SynFin),
+            ("syn-rst", L4Mode::SynRst),
+            ("xmas", L4Mode::Xmas),
+            ("null", L4Mode::Null),
+            ("tcp-options", L4Mode::TcpOptions),
+        ] {
+            let a = args_of(&["--allow", "1.2.3.4", "--l4-mode", spelling]);
+            assert_eq!(a.l4_mode, expected, "--l4-mode {spelling}");
+            assert!(USAGE.contains(spelling), "help must document --l4-mode {spelling}");
+        }
     }
 
     /// `--help` must be a successful no-op, not an error and not a run.

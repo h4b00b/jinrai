@@ -99,6 +99,14 @@ pub struct RunContext {
     pub planned: Duration,
     /// Wall-clock time the run actually took (shorter when aborted early).
     pub elapsed: Duration,
+    /// Unix time (UTC seconds) at which the first unit was emitted, or `None`
+    /// when the caller cannot say.
+    ///
+    /// `elapsed` alone answers "how long", never "when" — and "when" is what a
+    /// reader needs to line the run up against the target's own logs, graphs and
+    /// alerts. The finish time is derived from this plus `elapsed`, so the two
+    /// timestamps can never disagree with the window they bracket.
+    pub started_unix: Option<u64>,
     /// Extra operator-relevant settings worth restating, e.g. `"HTTP/1.1 forced"`
     /// or `"max 50 concurrent connections"`.
     pub notes: Vec<String>,
@@ -148,6 +156,21 @@ pub fn render_summary(
             ctx.rate_per_sec
         ),
     ));
+    // When the window was, not just how long it was — without this the block
+    // cannot be lined up against the target's own logs or dashboards. Derived
+    // from one instant plus `elapsed` so the pair always brackets the window
+    // above it.
+    if let Some(started) = ctx.started_unix {
+        out.push_str(&row("started", &audit::format_rfc3339(started)));
+        out.push_str(&row(
+            "finished",
+            // Rounded, not truncated: a 1.9 s run finished at +2 s, and reporting
+            // +1 s would put the finish inside the window it closes.
+            &audit::format_rfc3339(
+                started.saturating_add(ctx.elapsed.as_secs_f64().round() as u64),
+            ),
+        ));
+    }
 
     // Offered load: what actually left the tool, against what was asked for.
     let effective = if secs > 0.0 { attempts as f64 / secs } else { 0.0 };
@@ -649,6 +672,8 @@ mod tests {
             elapsed: Duration::from_secs(30),
             notes: vec!["HTTP/1.1 forced".into()],
             concurrency: None,
+            // 2026-07-10T00:00:00Z
+            started_unix: Some(1_783_641_600),
         }
     }
 
@@ -698,6 +723,7 @@ mod tests {
             elapsed: Duration::from_secs(10),
             notes: vec![],
             concurrency: Some(1),
+            started_unix: Some(1_783_641_600),
         };
         let out = render_summary(&r, &c, None);
         assert!(out.contains("bound by"), "{out}");
@@ -854,6 +880,35 @@ mod tests {
         assert!(!out.contains("the generator, not the target"), "{out}");
     }
 
+    /// `elapsed` says how long the run was, never *when* it was — and "when" is
+    /// what lines the block up against the target's own logs. Both ends must be
+    /// on screen, and the finish must bracket the window rather than fall inside
+    /// it (a 10.4 s run that started at :00 finished at :10, not at :00).
+    #[test]
+    fn summary_brackets_the_run_with_wall_clock_timestamps() {
+        let r = RunReport { units_sent: 100, ..Default::default() };
+        let c = RunContext {
+            elapsed: Duration::from_millis(10_400),
+            started_unix: Some(1_783_641_600), // 2026-07-10T00:00:00Z
+            ..ctx_l4()
+        };
+        let out = render_summary(&r, &c, None);
+        assert!(out.contains("started"), "{out}");
+        assert!(out.contains("2026-07-10T00:00:00Z"), "{out}");
+        assert!(out.contains("finished"), "{out}");
+        assert!(out.contains("2026-07-10T00:00:10Z"), "{out}");
+    }
+
+    /// A caller that cannot say when the run began must get no timestamps at all
+    /// rather than a confident 1970.
+    #[test]
+    fn summary_omits_timestamps_when_the_caller_has_none() {
+        let r = RunReport { units_sent: 100, ..Default::default() };
+        let out = render_summary(&r, &RunContext { started_unix: None, ..ctx_l4() }, None);
+        assert!(!out.contains("1970"), "{out}");
+        assert!(!out.contains("finished"), "{out}");
+    }
+
     fn ctx_l4() -> RunContext {
         RunContext {
             layer: "L4".into(),
@@ -864,6 +919,7 @@ mod tests {
             elapsed: Duration::from_secs(10),
             notes: vec![],
             concurrency: None,
+            started_unix: Some(1_783_641_600),
         }
     }
 

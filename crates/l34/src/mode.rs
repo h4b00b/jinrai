@@ -38,6 +38,14 @@ pub enum L4Mode {
     /// TCP ECE flood (raw socket, ECE flag only) — a lone ECN-Echo bit, likewise
     /// standalone rather than part of an established/negotiating connection.
     Ece,
+    /// TCP SYN+ACK flood (raw socket) — an *unsolicited* handshake response: the
+    /// second segment of a three-way handshake arriving at a host that never sent
+    /// the first. Unlike the flag combinations below it this one is perfectly
+    /// legal on the wire; what makes it a test is that it matches no connection,
+    /// so the target must either allocate/consult connection-tracking state or
+    /// answer each packet with an RST — the classic SYN-ACK reflection load a
+    /// firewall or load balancer sees during a spoofed flood elsewhere.
+    SynAck,
     /// TCP SYN+FIN flood (raw socket) — a classic illegal combination (open and
     /// close at once) long used to probe firewall/IDS flag handling.
     SynFin,
@@ -146,6 +154,7 @@ impl L4Mode {
             L4Mode::Urg => "tcp-urg-flood",
             L4Mode::Cwr => "tcp-cwr-flood",
             L4Mode::Ece => "tcp-ece-flood",
+            L4Mode::SynAck => "tcp-syn-ack-flood",
             L4Mode::SynFin => "tcp-syn-fin-flood",
             L4Mode::SynRst => "tcp-syn-rst-flood",
             L4Mode::Xmas => "tcp-xmas-flood",
@@ -186,6 +195,8 @@ impl L4Mode {
             L4Mode::Urg => Some(TcpFlags { urg: true, ..TcpFlags::NONE }),
             L4Mode::Cwr => Some(TcpFlags { cwr: true, ..TcpFlags::NONE }),
             L4Mode::Ece => Some(TcpFlags { ece: true, ..TcpFlags::NONE }),
+            // Legal flags, illegal *state*: a handshake response nobody asked for.
+            L4Mode::SynAck => Some(TcpFlags { syn: true, ack: true, ..TcpFlags::NONE }),
             // Illegal open+close / open+reset combinations.
             L4Mode::SynFin => Some(TcpFlags { syn: true, fin: true, ..TcpFlags::NONE }),
             L4Mode::SynRst => Some(TcpFlags { syn: true, rst: true, ..TcpFlags::NONE }),
@@ -294,6 +305,7 @@ mod tests {
             L4Mode::Urg,
             L4Mode::Cwr,
             L4Mode::Ece,
+            L4Mode::SynAck,
             L4Mode::SynFin,
             L4Mode::SynRst,
             L4Mode::Xmas,
@@ -311,6 +323,7 @@ mod tests {
         assert_eq!(L4Mode::Urg.label(), "tcp-urg-flood");
         assert_eq!(L4Mode::Cwr.label(), "tcp-cwr-flood");
         assert_eq!(L4Mode::Ece.label(), "tcp-ece-flood");
+        assert_eq!(L4Mode::SynAck.label(), "tcp-syn-ack-flood");
         assert_eq!(L4Mode::SynFin.label(), "tcp-syn-fin-flood");
         assert_eq!(L4Mode::SynRst.label(), "tcp-syn-rst-flood");
         assert_eq!(L4Mode::Xmas.label(), "tcp-xmas-flood");

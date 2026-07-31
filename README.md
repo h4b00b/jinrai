@@ -162,6 +162,7 @@ reacts to control flags it should never see.
 |---|---|
 | Half-open state exhaustion | `syn` |
 | Out-of-state segments — does the tracker create state it shouldn't? | `ack`, `fin`, `rst`, `urg`, `cwr`, `ece` |
+| Unsolicited handshake response — a SYN-ACK answering a SYN nobody sent | `syn-ack` |
 | Illegal flag combinations (contradictory / all-set / none-set) | `syn-fin`, `syn-rst`, `xmas`, `null` |
 | Maximal 40-byte TCP option block on every SYN | `tcp-options` |
 
@@ -278,6 +279,7 @@ jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 --target 10.1.2.3 --port 80 
 # Raw SYN flood — needs CAP_NET_RAW/root, IPv4 only. Same shape for every raw
 # flag flood; only --l4-mode changes:
 #   syn  ack  fin  rst  urg  cwr  ece          (one flag each)
+#   syn-ack                                    (unsolicited handshake response)
 #   syn-fin  syn-rst  xmas  null               (illegal combinations)
 #   tcp-options                                (SYN + maximal 40-byte option block)
 sudo -E jinrai --layer l4 --l4-mode syn --allow 10.0.0.0/8 --target 10.1.2.3 \
@@ -346,6 +348,8 @@ instead (stable for scripts and log scraping):
  target     https://api.staging.internal/health
  module     L7 / l7-http-get  (HTTP/1.1 forced)
  window     30.0s elapsed of 30.0s planned, rate cap 200/s
+ started    2026-07-10T09:14:02Z
+ finished   2026-07-10T09:14:32Z
  attempts   6000 total, 199.4/s achieved (100% of the 200/s cap)
  completed  5994 (99.9%)
    status   2xx 5900 (98.4%)   3xx 0 (0.0%)   4xx 40 (0.7%)   5xx 54 (0.9%)
@@ -358,8 +362,11 @@ instead (stable for scripts and log scraping):
 ==========================================================================
 ```
 
-Four things the block is there to make unmissable:
+Five things the block is there to make unmissable:
 
+* **When the run happened** — `started` / `finished` (RFC 3339 UTC) bracket the
+  window, so the block can be lined up against the target's own logs, graphs and
+  alerts without reconstructing the clock time from `elapsed`.
 * **Offered vs. achieved load** — `attempts … achieved (…% of the cap)` says
   whether the tool actually produced the load that was asked for, so a result is
   never read as "the target coped" when the generator never reached the rate.
@@ -562,15 +569,18 @@ ever stop traffic, never generate it, and it is inert without at least one
 Requires raw target IPs matching a CIDR `--allow`, an explicit `--ack-l34-lab`
 acknowledgement, and a `--port` (except the ICMP modes). `udp`/`tcp`/`data` need
 no privilege, and `tcp`/`data` work over IPv4 **and** IPv6; the raw-socket modes
-(`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-fin`/`syn-rst`/`xmas`/`null`/
-`tcp-options`/`icmp`/`icmp-timestamp`/`icmp-address-mask`) need `CAP_NET_RAW`/root
+(`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-ack`/`syn-fin`/`syn-rst`/`xmas`/
+`null`/`tcp-options`/`icmp`/`icmp-timestamp`/`icmp-address-mask`) need `CAP_NET_RAW`/root
 and are IPv4-only.
 
 ### The flag and anomaly floods
 
 The raw-TCP flag floods set control flags directly: `syn`/`ack`/`fin`/`rst`/`urg`/
 `cwr`/`ece` each set exactly one (the last three send an otherwise-empty segment
-carrying only the urgent or an ECN congestion bit), while the **anomaly floods**
+carrying only the urgent or an ECN congestion bit). `syn-ack` is the odd one out:
+its flags are perfectly legal — it is the *second* segment of a handshake — but it
+answers a SYN the target never sent, so every packet must be matched against
+connection state or answered with an RST. The **anomaly floods**
 set flag fields that match no RFC-legal state — `syn-fin` and `syn-rst` set
 mutually-contradictory combinations, `xmas` sets `FIN+PSH+URG` at once, and `null`
 sets none — to probe how a stateful firewall / IDS / connection-tracker / TCP

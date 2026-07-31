@@ -321,6 +321,23 @@ mod tests {
         assert_ne!(tcp.checksum, 0, "checksum must be computed");
     }
 
+    /// A SYN-ACK flood is the one combination whose flags are *legal* — it is the
+    /// second segment of a handshake, arriving unsolicited. It must therefore
+    /// carry a real acknowledgement number, not just the two bits.
+    #[test]
+    fn syn_ack_flood_sets_both_bits_and_carries_an_ack_number() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let pkt =
+            build_tcp_packet(src, dst, 40000, 80, 5, L4Mode::SynAck.raw_tcp_flags().unwrap())
+                .unwrap();
+        let (_, tcp) = parse_tcp(&pkt);
+        assert!(tcp.syn && tcp.ack, "SYN+ACK must set both");
+        assert!(!tcp.fin && !tcp.rst && !tcp.psh && !tcp.urg, "SYN+ACK sets nothing else");
+        assert_eq!(tcp.acknowledgment_number, 6, "ACK number accompanies the ACK bit");
+        assert_ne!(tcp.checksum, 0, "checksum must be computed");
+    }
+
     #[test]
     fn null_flood_sets_no_flags_at_all() {
         let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
