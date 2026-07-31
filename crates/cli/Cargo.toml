@@ -21,7 +21,11 @@ jinrai-metrics = { workspace = true }
 # Ctrl-C -> kill-switch. A cross-platform signal hook is impossible under this
 # crate's forbid(unsafe); `ctrlc` is the minimal, widely-audited handler crate,
 # and a working abort control is safety-critical for a live traffic generator.
-ctrlc = "3"
+# `termination` extends the same handler to SIGTERM/SIGHUP: an automated run is
+# stopped by `systemctl stop` / `docker stop` / a K8s eviction, none of which send
+# SIGINT. Without it those kill the process outright — traffic stops, but the
+# graceful drain never runs and no RunCompleted record reaches the audit log.
+ctrlc = { version = "3", features = ["termination"] }
 
 # setrlimit(RLIMIT_NOFILE) at startup. A shell's `ulimit -n` is shell-local and
 # absent under systemd/cron, so descriptor headroom cannot be left to the caller's

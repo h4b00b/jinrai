@@ -15,7 +15,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use jinrai_core::{
-    Layer, LoadProfile, RateCap, RunPlan, RunReport, SloSpec, SloVerdict, StressModule,
+    Layer, LoadProfile, ModuleError, RateCap, RunPlan, RunReport, SloSpec, SloVerdict,
+    StressModule,
 };
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
@@ -203,10 +204,10 @@ OPTIONS:
                           `timeout` errno bucket (default: 500)
     --payload-size <N>    Payload bytes per unit (default: 64) — UDP datagram size
                           (l4-mode udp) or PSH-ACK write size (l4-mode data)
-    --rate <N>            Rate cap, units/sec (default: 100). This is a hard
-                          SAFETY CEILING: every load profile shapes traffic only
-                          UP TO this rate, never above it.
-    --duration <SECS>     Run duration (default: 10)
+    --rate <N>            Rate cap, units/sec (default: 100, max 10000000). This
+                          is a hard SAFETY CEILING: every load profile shapes
+                          traffic only UP TO this rate, never above it.
+    --duration <SECS>     Run duration (default: 10, max 86400)
     --header <K: V>       Extra request header for l7 (repeatable). Also the hook
                           for header-profile tests (User-Agent, Cookie, Referer…)
 
@@ -218,7 +219,9 @@ OPTIONS:
     --ramp-start <N>      Ramp starting rate, units/sec (default: 0)
     --ramp-steps <N>      Number of equal-length ramp stages (default: 10)
     --spike-base <N>      Spike baseline rate (default: ceiling/5)
-    --spike-secs <SECS>   Spike peak duration (default: 10)
+    --spike-secs <SECS>   Spike peak duration (default: 10). Carved OUT of
+                          --duration, never added to it: the baseline fills the
+                          rest of the window.
     --discover-knee       Breaking-point discovery: ramp to the ceiling and stop
                           at the first stage that breaches the SLO, reporting the
                           capacity knee. Requires a --slo-max-*-rate to detect the
@@ -395,7 +398,21 @@ fn run() -> Result<(), String> {
         // on its own; what the log is for is reading what was fired at whom.
         let records = jinrai_metrics::verify_and_read(path).map_err(|e| e.to_string())?;
         println!("audit log {path}");
-        println!("hash chain: INTACT ({} record(s))\n", records.len());
+        // Report the sequence range, not just "INTACT". A hash chain proves the
+        // records present are unaltered and in order; it cannot prove that none
+        // were cut off the end, because a record links backwards only. Showing
+        // the range is what lets an operator who knows how many runs happened
+        // notice that the log stops short.
+        match (records.first(), records.last()) {
+            (Some(f), Some(l)) => println!(
+                "hash chain: INTACT ({} record(s), seq {}..={})\n\
+                 note: a chain cannot detect records removed from the END of the file.\n",
+                records.len(),
+                f.seq,
+                l.seq
+            ),
+            _ => println!("hash chain: INTACT (0 records)\n"),
+        }
         for r in &records {
             println!("  #{:<4} {}  {:<16} {}", r.seq, r.ts, r.operator, r.summary);
         }
@@ -418,22 +435,38 @@ fn run() -> Result<(), String> {
     };
 
     // 1. Build the allowlist from operator parameters (mixed CIDRs + DNS names).
-    let allowlist = Allowlist::from_patterns(&args.allow)
-        .map_err(|e| format!("bad --allow value: {e}"))?;
-    if allowlist.is_empty() {
-        return Err("no --allow rules given; refusing to run (fail-closed)".into());
-    }
+    //    A malformed or missing allowlist is a safety-relevant refusal like any
+    //    other, so it is recorded before returning: an audit trail that only
+    //    contains the refusals reaching the gate would suggest nothing else was
+    //    ever attempted.
+    let allowlist = match Allowlist::from_patterns(&args.allow) {
+        Ok(a) if !a.is_empty() => a,
+        other => {
+            let reason = match other {
+                Ok(_) => "no --allow rules given; refusing to run (fail-closed)".to_string(),
+                Err(e) => format!("bad --allow value: {e}"),
+            };
+            audit_record(
+                &mut audit.as_mut(),
+                AuditEvent::RunRefused { stage: "allowlist".into(), reason: reason.clone() },
+            )?;
+            return Err(reason);
+        }
+    };
 
     // 2. The gate. Kill switch is shared with the run plan.
     let kill = KillSwitch::new();
 
-    // Wire Ctrl-C to the shared kill-switch so an operator can abort a live run
-    // gracefully: workers poll it and stop within ~50ms, and the run reports what
-    // it managed to send. Without this, the advertised abort control is inert.
+    // Wire the termination signals to the shared kill-switch so a live run can be
+    // aborted gracefully: workers poll it and stop within ~50ms, and the run
+    // reports what it managed to send. Without this, the advertised abort control
+    // is inert. This covers Ctrl-C (SIGINT) *and* SIGTERM/SIGHUP — an unattended
+    // run under systemd, docker or K8s is stopped by SIGTERM, and that is exactly
+    // the case where an audited, drained shutdown matters most.
     {
         let kill = kill.clone();
         if let Err(e) = ctrlc::set_handler(move || kill.trip()) {
-            eprintln!("warning: could not install Ctrl-C abort handler: {e}");
+            eprintln!("warning: could not install the abort (SIGINT/SIGTERM) handler: {e}");
         }
     }
 
@@ -468,6 +501,41 @@ fn target_label(t: &AuthorizedTarget) -> String {
     }
 }
 
+/// Record a refusal decided before the gate was ever consulted (a missing
+/// acknowledgement, a missing target) and produce its operator-facing message.
+///
+/// Same shape as [`audit_module_failure`]: `Ok` carries the message to fail with,
+/// `Err` means the audit write itself failed and the run must abort on that.
+fn audit_refusal(
+    audit: &mut Option<&mut AuditLog>,
+    stage: &str,
+    reason: &str,
+) -> Result<String, String> {
+    audit_record(
+        audit,
+        AuditEvent::RunRefused { stage: stage.into(), reason: reason.to_string() },
+    )?;
+    Ok(reason.to_string())
+}
+
+/// Audit a module that refused or could not start, and produce the operator-facing
+/// error for it.
+///
+/// The `Ok` type is the error message because every caller is on its way out:
+/// `return Err(audit_module_failure(...)?)` propagates an audit-write failure
+/// (fail-closed) and otherwise hands back the message to fail the run with.
+fn audit_module_failure(
+    audit: &mut Option<&mut AuditLog>,
+    layer: &str,
+    e: ModuleError,
+) -> Result<String, String> {
+    audit_record(
+        audit,
+        AuditEvent::RunRefused { stage: e.stage().into(), reason: format!("{layer}: {e}") },
+    )?;
+    Ok(format!("{layer} run did not start — {e}"))
+}
+
 /// Record an event if auditing is on; a write failure aborts (fail-closed on the
 /// trail — we do not want traffic that outran its own audit record).
 fn audit_record(audit: &mut Option<&mut AuditLog>, event: AuditEvent) -> Result<(), String> {
@@ -494,11 +562,17 @@ fn l7_profile(args: &Args, rate_cap: RateCap, duration: Duration) -> Option<Load
         ProfileKind::Spike => {
             // Base defaults to a fifth of the peak (>=1) when unspecified.
             let base = args.spike_base.unwrap_or((rate_cap.per_second / 5).max(1));
+            // The spike is carved *out of* --duration, not added to it: the
+            // baseline fills what is left around it. Passing the full duration as
+            // `base_total` made a 30s run generate 40s of traffic — an undeclared
+            // window, which is precisely what the drain accounting exists to
+            // prevent. A spike at least as long as the run is the whole run.
+            let spike = Duration::from_secs(args.spike_secs).min(duration);
             Some(LoadProfile::Spike {
                 base: RateCap::new(base),
                 peak: rate_cap,
-                base_total: duration,
-                spike: Duration::from_secs(args.spike_secs),
+                base_total: duration - spike,
+                spike,
             })
         }
         // Constant / Soak: flat at the ceiling — use the engine default.
@@ -519,10 +593,12 @@ fn run_l7(
     duration: Duration,
     mut audit: Option<&mut AuditLog>,
 ) -> Result<(), String> {
-    let url = args
-        .url
-        .clone()
-        .ok_or("--layer l7 requires --url <URL>")?;
+    let url = match args.url.clone() {
+        Some(u) => u,
+        None => {
+            return Err(audit_refusal(&mut audit, "arguments", "--layer l7 requires --url <URL>")?)
+        }
+    };
 
     // Phase-6 profile validation, fail-closed before any traffic: knee discovery
     // is meaningless without a rate SLO to detect the breaking point against.
@@ -656,7 +732,12 @@ fn run_l7(
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let started = std::time::Instant::now();
     let started_unix = now_unix();
-    let report = engine.execute(&plan);
+    // A module that could not run says so, and that is audited as a refusal —
+    // not as a run that happened to send nothing.
+    let report = match engine.execute(&plan) {
+        Ok(r) => r,
+        Err(e) => return Err(audit_module_failure(&mut audit, "l7", e)?),
+    };
     let elapsed = started.elapsed();
 
     // Evaluate the SLO verdict (only when the operator declared one, and only for
@@ -797,22 +878,38 @@ fn run_l4(
     duration: Duration,
     mut audit: Option<&mut AuditLog>,
 ) -> Result<(), String> {
-    // Explicit, mandatory acknowledgement — in addition to the allowlist.
+    // Explicit, mandatory acknowledgement — in addition to the allowlist. These
+    // three pre-gate refusals are audited like every other refusal: a missing
+    // lab acknowledgement is exactly the event a reviewer wants to see attempted.
     if !args.ack_l34_lab {
-        return Err(
+        return Err(audit_refusal(
+            &mut audit,
+            "acknowledgement",
             "refusing L3/L4 run: pass --ack-l34-lab to confirm this targets an \
-             authorized, isolated-lab network"
-                .into(),
-        );
+             authorized, isolated-lab network",
+        )?);
     }
     if args.targets.is_empty() {
-        return Err("--layer l3/l4 requires at least one --target <IP>".into());
+        return Err(audit_refusal(
+            &mut audit,
+            "arguments",
+            "--layer l3/l4 requires at least one --target <IP>",
+        )?);
     }
     // ICMP is portless; every other mode targets a port.
     let port = if args.l4_mode.is_icmp() {
         args.port.unwrap_or(0)
     } else {
-        args.port.ok_or("--layer l3/l4 requires --port <N> (except the icmp* modes)")?
+        match args.port {
+            Some(p) => p,
+            None => {
+                return Err(audit_refusal(
+                    &mut audit,
+                    "arguments",
+                    "--layer l3/l4 requires --port <N> (except the icmp* modes)",
+                )?)
+            }
+        }
     };
 
     let authorized = match gate.authorize_all(args.targets.iter().copied()) {
@@ -872,7 +969,13 @@ fn run_l4(
     println!("running module '{}' ({:?})...", module.name(), module.layer());
     let started = std::time::Instant::now();
     let started_unix = now_unix();
-    let report = module.execute(&plan);
+    // Preflight catches most of these earlier, but a setup failure can still
+    // surface here (a route that disappears, a bind that fails). It is recorded
+    // as a refusal with its cause, not as a completed run with zero units.
+    let report = match module.execute(&plan) {
+        Ok(r) => r,
+        Err(e) => return Err(audit_module_failure(&mut audit, "l3/l4", e)?),
+    };
     let elapsed = started.elapsed();
 
     let mut notes = if args.l4_mode.is_icmp() {
@@ -1059,19 +1162,32 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             "--body" => body = Some(next_val(&mut it, "--body")?),
             "--cache-bust" => cache_bust = true,
             "--slow-connections" => {
-                slow_connections = next_val(&mut it, "--slow-connections")?
-                    .parse()
-                    .map_err(|_| "invalid --slow-connections".to_string())?;
+                slow_connections =
+                    parse_capped(&mut it, "--slow-connections", MAX_CONNECTIONS as u64)? as usize;
+                // 0 would open nothing and report a clean run that tested
+                // nothing — and it means the opposite ("no limit") on
+                // --max-connections, so it must not quietly mean "none" here.
+                if slow_connections == 0 {
+                    return Err("--slow-connections must be at least 1 \
+                                (0 would hold no connections and test nothing)"
+                        .to_string());
+                }
             }
             "--drip-ms" => {
-                drip_ms = next_val(&mut it, "--drip-ms")?
-                    .parse()
-                    .map_err(|_| "invalid --drip-ms".to_string())?;
+                drip_ms = parse_capped(&mut it, "--drip-ms", MAX_DURATION_SECS * 1000)?;
+                // The drip interval is what makes a slow attack slow. At 0 the
+                // per-connection write loop is unpaced — a byte-at-a-time write
+                // flood on every held connection, which is not the primitive the
+                // operator selected and is not bounded by --rate.
+                if drip_ms == 0 {
+                    return Err("--drip-ms must be at least 1 \
+                                (0 turns the drip into an unpaced write flood)"
+                        .to_string());
+                }
             }
             "--max-connections" => {
-                max_connections = next_val(&mut it, "--max-connections")?
-                    .parse()
-                    .map_err(|_| "invalid --max-connections".to_string())?;
+                max_connections =
+                    parse_capped(&mut it, "--max-connections", MAX_CONNECTIONS as u64)? as usize;
             }
             "--request-timeout-ms" => {
                 request_timeout_ms = next_val(&mut it, "--request-timeout-ms")?
@@ -1127,9 +1243,8 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     .map_err(|_| "invalid --payload-size".to_string())?;
             }
             "--concurrency" => {
-                concurrency = next_val(&mut it, "--concurrency")?
-                    .parse()
-                    .map_err(|_| "invalid --concurrency".to_string())?;
+                concurrency =
+                    parse_capped(&mut it, "--concurrency", MAX_CONNECTIONS as u64)? as usize
             }
             "--connect-timeout-ms" => {
                 connect_timeout_ms = next_val(&mut it, "--connect-timeout-ms")?
@@ -1152,15 +1267,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     other => return Err(format!("unknown --layer: {other}")),
                 }
             }
-            "--rate" => {
-                rate = next_val(&mut it, "--rate")?
-                    .parse()
-                    .map_err(|_| "invalid --rate".to_string())?;
-            }
+            "--rate" => rate = parse_capped(&mut it, "--rate", MAX_RATE)?,
             "--duration" => {
-                duration_secs = next_val(&mut it, "--duration")?
-                    .parse()
-                    .map_err(|_| "invalid --duration".to_string())?;
+                duration_secs = parse_capped(&mut it, "--duration", MAX_DURATION_SECS)?
             }
             "--profile" => {
                 profile = match next_val(&mut it, "--profile")?.as_str() {
@@ -1175,27 +1284,16 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     }
                 }
             }
-            "--ramp-start" => {
-                ramp_start = next_val(&mut it, "--ramp-start")?
-                    .parse()
-                    .map_err(|_| "invalid --ramp-start".to_string())?;
-            }
+            "--ramp-start" => ramp_start = parse_capped(&mut it, "--ramp-start", MAX_RATE)?,
             "--ramp-steps" => {
-                ramp_steps = next_val(&mut it, "--ramp-steps")?
-                    .parse()
-                    .map_err(|_| "invalid --ramp-steps".to_string())?;
+                ramp_steps =
+                    parse_capped(&mut it, "--ramp-steps", MAX_RAMP_STEPS as u64)? as u32
             }
             "--spike-base" => {
-                spike_base = Some(
-                    next_val(&mut it, "--spike-base")?
-                        .parse()
-                        .map_err(|_| "invalid --spike-base".to_string())?,
-                );
+                spike_base = Some(parse_capped(&mut it, "--spike-base", MAX_RATE)?)
             }
             "--spike-secs" => {
-                spike_secs = next_val(&mut it, "--spike-secs")?
-                    .parse()
-                    .map_err(|_| "invalid --spike-secs".to_string())?;
+                spike_secs = parse_capped(&mut it, "--spike-secs", MAX_DURATION_SECS)?
             }
             "--discover-knee" => discover_knee = true,
             "--slo-max-error-rate" => slo.max_error_rate = Some(parse_rate(&mut it, "--slo-max-error-rate")?),
@@ -1265,6 +1363,48 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
 
 fn next_val(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     it.next().ok_or_else(|| format!("{flag} requires a value"))
+}
+
+/// Upper bound on `--rate`. No single host emits ten million units a second —
+/// the syscall path gives out two orders of magnitude below this — so anything
+/// above it is a typo, and typos here are expensive: the pacing interval shrinks
+/// to a nanosecond and each tick tries to emit a batch nothing can drain.
+const MAX_RATE: u64 = 10_000_000;
+
+/// Upper bound on `--duration` (24 hours). Anything longer belongs in a
+/// scheduler, and unbounded values overflow `Instant::now() + duration`, which
+/// panics rather than refusing.
+const MAX_DURATION_SECS: u64 = 86_400;
+
+/// Upper bound on `--concurrency` / `--slow-connections` / `--max-connections`.
+/// A million sockets is already far past any reachable descriptor ceiling; the
+/// value is also used as an allocation size, so an unbounded one aborts the
+/// process on a capacity overflow before a single packet is sent.
+const MAX_CONNECTIONS: usize = 1_048_576;
+
+/// Upper bound on `--ramp-steps`. Each step is a materialised stage in a `Vec`,
+/// so an unbounded count is an allocation request, not a load shape.
+const MAX_RAMP_STEPS: u32 = 10_000;
+
+/// Parse a numeric flag and refuse — loudly — anything above `max`.
+///
+/// Every one of these values is a size or a rate that something downstream
+/// allocates against, divides by, or adds to an `Instant`. Refusing at the front
+/// door keeps that arithmetic total: a fat-fingered `--rate 1000000000` is an
+/// operator error the parser can name, not a panic three layers down with the
+/// raw socket already open. The limits are deliberately far above any real run,
+/// so they never shape a legitimate test — they only catch typos.
+fn parse_capped(
+    it: &mut impl Iterator<Item = String>,
+    flag: &str,
+    max: u64,
+) -> Result<u64, String> {
+    let raw = next_val(it, flag)?;
+    let v: u64 = raw.parse().map_err(|_| format!("invalid {flag}: {raw}"))?;
+    if v > max {
+        return Err(format!("{flag} must be at most {max} (got {raw})"));
+    }
+    Ok(v)
 }
 
 /// Parse an SLO rate as a fraction in `[0.0, 1.0]`; anything outside is refused
@@ -1353,6 +1493,95 @@ mod tests {
     }
 
     // ---- values that must not be silently accepted ----------------------
+
+    /// Every numeric flag that something downstream allocates against, divides
+    /// by, or adds to an `Instant` is bounded here. Unbounded, each of these
+    /// reached a panic or an allocation the machine cannot serve — after the
+    /// gate had passed and, for L3/L4, after the raw socket was open.
+    #[test]
+    fn absurd_numeric_flags_are_refused_at_the_front_door() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"];
+        for (flag, value) in [
+            ("--rate", "99999999999"),
+            ("--duration", "999999999999"),
+            ("--concurrency", "99999999999"),
+            ("--ramp-steps", "4000000000"),
+            ("--slow-connections", "99999999999"),
+            ("--max-connections", "99999999999"),
+            ("--spike-secs", "999999999999"),
+            ("--ramp-start", "99999999999"),
+        ] {
+            let mut argv = base.to_vec();
+            argv.extend([flag, value]);
+            let err = parse(&argv).unwrap_err();
+            assert!(
+                err.contains(flag) && err.contains("at most"),
+                "{flag} {value} should be refused with a limit, got: {err}"
+            );
+        }
+    }
+
+    /// The limits are ceilings on typos, not on real runs: values an operator
+    /// might plausibly want must still parse.
+    #[test]
+    fn realistic_numeric_flags_still_parse() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--rate", "500000", "--duration", "3600", "--concurrency", "65536",
+            "--ramp-steps", "500",
+        ]);
+        assert_eq!(a.rate, 500_000);
+        assert_eq!(a.duration_secs, 3600);
+        assert_eq!(a.concurrency, 65_536);
+        assert_eq!(a.ramp_steps, 500);
+    }
+
+    /// Zero means "no pacing" for a drip and "hold nothing" for a slow-mode
+    /// connection count — one turns a slow attack into an unpaced write flood,
+    /// the other reports a clean run that tested nothing. Neither is what the
+    /// operator meant, and 0 already means "unlimited" on `--max-connections`,
+    /// so it must not be silently reinterpreted here.
+    #[test]
+    fn zero_is_refused_where_it_would_change_the_primitive() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"];
+        for flag in ["--drip-ms", "--slow-connections"] {
+            let mut argv = base.to_vec();
+            argv.extend([flag, "0"]);
+            let err = parse(&argv).unwrap_err();
+            assert!(err.contains(flag) && err.contains("at least 1"), "{flag}: {err}");
+        }
+    }
+
+    // ---- load profiles fit inside the declared window -------------------
+
+    /// `--duration` is the whole traffic window, including the spike. Adding the
+    /// spike on top of it generated 40 seconds of traffic for a 30-second run —
+    /// an undeclared window, which is exactly what the drain accounting exists
+    /// to rule out.
+    #[test]
+    fn a_spike_is_carved_out_of_the_duration_not_added_to_it() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--profile", "spike", "--duration", "30", "--spike-secs", "10",
+        ]);
+        let duration = Duration::from_secs(a.duration_secs);
+        let profile = l7_profile(&a, RateCap::new(a.rate), duration).expect("spike profile");
+        let total: Duration = profile.stages().iter().map(|s| s.duration).sum();
+        assert_eq!(total, duration, "the stages must sum to exactly --duration");
+    }
+
+    /// A spike at least as long as the run is the whole run — never longer.
+    #[test]
+    fn an_oversized_spike_cannot_stretch_the_run() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--profile", "spike", "--duration", "5", "--spike-secs", "600",
+        ]);
+        let duration = Duration::from_secs(a.duration_secs);
+        let profile = l7_profile(&a, RateCap::new(a.rate), duration).expect("spike profile");
+        let total: Duration = profile.stages().iter().map(|s| s.duration).sum();
+        assert_eq!(total, duration);
+    }
 
     /// The fat-finger guard: `--slo-max-5xx-rate 50` meaning "50%" must not
     /// become an unreachable 5000% threshold that can never fail. A run whose

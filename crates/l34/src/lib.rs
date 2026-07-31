@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use jinrai_core::{ErrnoBucket, ErrnoTally, Layer, RunPlan, RunReport, StressModule};
+use jinrai_core::{ErrnoBucket, ErrnoTally, Layer, ModuleError, RunPlan, RunReport, StressModule};
 
 use crate::mode::{IcmpQuery, TcpFlags};
 use crate::pace::{batch_for, interruptible_sleep};
@@ -204,15 +204,22 @@ impl StressModule for L34Engine {
         self.config.mode.label()
     }
 
-    fn execute(&mut self, plan: &RunPlan) -> RunReport {
-        match self.run(plan) {
-            Ok(report) => report,
-            Err(e) => RunReport {
-                layer_label: format!("{} {} ERROR: {e}", layer_tag(self.config.mode), self.config.mode.label()),
-                aborted_early: true,
-                ..Default::default()
-            },
-        }
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
+        self.run(plan).map_err(|e| {
+            let what = format!("{} {}: {e}", layer_tag(self.config.mode), self.config.mode.label());
+            match e {
+                // The plan itself is unreachable for this primitive — a gate-level
+                // no, decided before any socket exists.
+                L34Error::NoIpTargets
+                | L34Error::Ipv6Unsupported { .. }
+                | L34Error::Ipv6RawTcpUnsupported(_) => ModuleError::Refused(what),
+                // The host could not give us what the run needs: privilege, a
+                // socket, a route.
+                L34Error::RawSocket(_) | L34Error::Setup(_) | L34Error::Build(_) => {
+                    ModuleError::Setup(what)
+                }
+            }
+        })
     }
 }
 
@@ -280,7 +287,16 @@ impl L34Engine {
                 idx += 1;
                 match sender.send(ip, self.config.port, &mut tally) {
                     Ok(e) => tally.record(e),
-                    Err(_) => tally.record(Emission::Failed(ErrnoBucket::Internal)),
+                    // An `Err` here is never a per-packet failure: the send path
+                    // classifies those into `Emission::Failed(bucket)` itself.
+                    // Reaching this arm means the run is impossible — no route to
+                    // the target, an address family this primitive cannot build
+                    // for — and the condition is constant, so it would recur for
+                    // every remaining unit. Bucketing it as `Internal` and
+                    // carrying on produced the exact shape `check_targets` exists
+                    // to prevent: a "completed" run, 100% errors, all of them
+                    // blamed on jinrai's internals instead of the dead route.
+                    Err(e) => return Err(e),
                 }
                 // A batch is a burst by design, so the deadline and the abort
                 // signal are re-checked inside it: a large `--rate` must not buy
@@ -976,7 +992,7 @@ mod tests {
         // Rate 0 must be honoured deterministically, without opening a socket.
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(config(L4Mode::Udp, 9, 64));
-        let report = engine.execute(&plan(vec![t], 0, 1));
+        let report = engine.execute(&plan(vec![t], 0, 1)).expect("the run should execute");
         assert_eq!(report.units_sent, 0);
         assert_eq!(report.errors, 0);
         assert!(!report.aborted_early);
@@ -991,10 +1007,12 @@ mod tests {
         );
         let host_target = gate.authorize_host("api.staging.internal").unwrap();
         let mut engine = L34Engine::new(config(L4Mode::Udp, 9, 64));
-        let report = engine.execute(&plan(vec![host_target], 100, 1));
-        assert_eq!(report.units_sent, 0);
-        assert!(report.aborted_early);
-        assert!(report.layer_label.contains("ERROR"), "got: {}", report.layer_label);
+        // A refusal is an error, not a run that happened to send nothing: the
+        // caller (and the audit log) must be able to tell the two apart.
+        match engine.execute(&plan(vec![host_target], 100, 1)) {
+            Err(ModuleError::Refused(msg)) => assert!(msg.contains("no IP targets"), "got: {msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1030,12 +1048,14 @@ mod tests {
                 }
                 other => panic!("{mode:?}: expected Ipv6Unsupported, got {other:?}"),
             }
-            // And execute() is fail-closed on its own (aborted, nothing sent).
+            // And execute() is fail-closed on its own: a refusal, not a report.
             let mut engine = engine;
-            let report = engine.execute(&p);
-            assert_eq!(report.units_sent, 0);
-            assert!(report.aborted_early);
-            assert!(report.layer_label.contains("ERROR"), "got: {}", report.layer_label);
+            match engine.execute(&p) {
+                Err(ModuleError::Refused(msg)) => {
+                    assert!(msg.contains("IPv6"), "{mode:?}: got {msg}")
+                }
+                other => panic!("{mode:?}: expected a refusal, got {other:?}"),
+            }
         }
     }
 
@@ -1127,7 +1147,7 @@ mod tests {
             concurrency,
             ..config(L4Mode::TcpConnect, port, 16)
         });
-        let report = engine.execute(&plan(vec![t], rate, secs));
+        let report = engine.execute(&plan(vec![t], rate, secs)).expect("the run should execute");
 
         stop.store(true, Ordering::Relaxed);
         sampler.join().unwrap();
@@ -1213,7 +1233,7 @@ mod tests {
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine =
             L34Engine::new(L34Config { concurrency: 16, ..config(L4Mode::TcpConnect, port, 16) });
-        let report = engine.execute(&plan(vec![t], 300, 1));
+        let report = engine.execute(&plan(vec![t], 300, 1)).expect("the run should execute");
 
         assert!(report.units_sent > 0, "should have completed handshakes: {report:?}");
         assert!(report.max_micros > 0, "handshake latency must be measured, not left at 0");
@@ -1267,7 +1287,7 @@ mod tests {
         };
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(config(L4Mode::TcpConnect, closed_port, 16));
-        let report = engine.execute(&plan(vec![t], 100, 1));
+        let report = engine.execute(&plan(vec![t], 100, 1)).expect("the run should execute");
 
         assert_eq!(report.units_sent, 0, "a refusing port completes nothing: {report:?}");
         assert!(report.errors > 0, "and must record the refusals: {report:?}");
@@ -1291,7 +1311,7 @@ mod tests {
         };
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(config(L4Mode::TcpConnect, closed_port, 16));
-        let report = engine.execute(&plan(vec![t], 100, 1));
+        let report = engine.execute(&plan(vec![t], 100, 1)).expect("the run should execute");
 
         assert!(report.errors > 0, "connecting to a closed port must fail: {report:?}");
         assert_eq!(
@@ -1326,7 +1346,7 @@ mod tests {
             connect_timeout: Duration::from_millis(50),
             ..config(L4Mode::TcpConnect, 443, 16)
         });
-        let report = engine.execute(&plan(vec![t], 20, 1));
+        let report = engine.execute(&plan(vec![t], 20, 1)).expect("the run should execute");
 
         assert_eq!(report.units_sent, 0, "an unroutable target cannot complete a handshake");
         assert_eq!(report.errno.total(), report.errors);
@@ -1375,7 +1395,7 @@ mod tests {
         });
         // A rate cap far above what either implementation can reach, so the
         // limiter is not what this test measures.
-        let report = engine.execute(&plan(vec![t], 10_000, SECS));
+        let report = engine.execute(&plan(vec![t], 10_000, SECS)).expect("the run should execute");
 
         let attempts = report.units_sent + report.errors;
         let serial_ceiling = (SECS as f64 / TIMEOUT.as_secs_f64()).ceil() as u64;
@@ -1448,7 +1468,7 @@ mod tests {
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine =
             L34Engine::new(L34Config { concurrency: 1, ..config(L4Mode::TcpConnect, port, 16) });
-        let report = engine.execute(&plan(vec![t], 200, 1));
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
         assert!(report.units_sent > 1, "flood should have connected repeatedly: {report:?}");
 
         acceptor.join().unwrap();
@@ -1506,7 +1526,7 @@ mod tests {
 
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(config(L4Mode::Data, port, 512));
-        let report = engine.execute(&plan(vec![t], 200, 1));
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
         acceptor.join().unwrap();
 
         assert!(report.units_sent > 0, "data flood should have sent writes");
@@ -1537,7 +1557,7 @@ mod tests {
 
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
-        let report = engine.execute(&plan(vec![t], 200, 1));
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
         assert!(report.units_sent > 0, "should have sent datagrams");
         assert_eq!(report.errors, 0);
 
@@ -1562,7 +1582,7 @@ mod tests {
         let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
         let requested = 200_000u64;
         let secs = 2u64;
-        let report = engine.execute(&plan(vec![t], requested, secs));
+        let report = engine.execute(&plan(vec![t], requested, secs)).expect("the run should execute");
 
         assert_eq!(report.errors, 0, "loopback UDP should not fail: {:?}", report.errno);
         // Deliberately well under the requested rate: this asserts the sleep
@@ -1595,7 +1615,7 @@ mod tests {
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
         let wall = Instant::now();
-        let _ = engine.execute(&plan(vec![t], 500_000, 1));
+        let _ = engine.execute(&plan(vec![t], 500_000, 1)).expect("the run should execute");
         let elapsed = wall.elapsed();
         assert!(
             elapsed < Duration::from_millis(1400),

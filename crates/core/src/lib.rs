@@ -38,11 +38,25 @@ impl RateCap {
 
     /// Minimum spacing between two emissions to honour this cap.
     /// `None` when the cap is zero (nothing should be sent).
+    ///
+    /// Integer ceiling division, floored at 1ns, because both alternatives are
+    /// unsafe here. Float division (`from_secs_f64`) rounds to *nearest*, so it
+    /// rounds the interval **down** for most rates — at 3 000 000/s the exact
+    /// 333.33ns becomes 333ns, an effective 3 003 003/s, and `--rate` stops
+    /// being a ceiling. Worse, above ~2×10⁹/s the interval rounds all the way to
+    /// zero, and a zero interval is not merely wrong: it is a division by zero in
+    /// [`batch_for`](../../l34/pace.rs) and a panic inside `tokio::time::interval`,
+    /// i.e. the process dies mid-run with the sockets already open.
+    ///
+    /// Rounding up can only ever under-deliver the requested rate, which is the
+    /// side a safety ceiling must err on.
     pub fn min_interval(&self) -> Option<Duration> {
         if self.per_second == 0 {
             None
         } else {
-            Some(Duration::from_secs_f64(1.0 / self.per_second as f64))
+            Some(Duration::from_nanos(
+                1_000_000_000u64.div_ceil(self.per_second).max(1),
+            ))
         }
     }
 
@@ -574,6 +588,48 @@ impl SloSpec {
     }
 }
 
+/// Why a module produced no run at all.
+///
+/// A [`RunReport`] describes traffic that happened; these describe traffic that
+/// never started. Keeping them in separate types is an auditability requirement,
+/// not a stylistic one: when a module could only report, every failure had to be
+/// dressed up as a run — a missing `CAP_NET_RAW` became "0 units sent, aborted
+/// early", which in the audit log is indistinguishable from a legitimate `--rate 0`
+/// run or an operator's Ctrl-C. A reviewer reading that log months later cannot
+/// recover which one it was. Now a failure is recorded as `RunRefused`, with the
+/// reason, and `aborted_early` means only what it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleError {
+    /// The safety gate, or the module's own fail-closed checks, refused the plan:
+    /// a target the module cannot reach, an unauthorized datum, a missing
+    /// acknowledgement. Nothing was sent because nothing was allowed.
+    Refused(String),
+    /// The run could not be set up: no raw-socket privilege, a bind or route
+    /// failure, no async runtime. Nothing was sent because nothing could be.
+    Setup(String),
+}
+
+impl std::fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleError::Refused(m) => write!(f, "refused: {m}"),
+            ModuleError::Setup(m) => write!(f, "setup failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ModuleError {}
+
+impl ModuleError {
+    /// The audit `stage` label for this failure.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            ModuleError::Refused(_) => "authorization",
+            ModuleError::Setup(_) => "setup",
+        }
+    }
+}
+
 /// The contract every traffic module implements.
 ///
 /// Kept synchronous-signature for now; the async L7 engine will wrap its
@@ -588,8 +644,10 @@ pub trait StressModule {
 
     /// Execute the plan and return a report. Implementations MUST:
     ///  - poll `plan.kill` and stop promptly when tripped,
-    ///  - never exceed `plan.rate_cap`.
-    fn execute(&mut self, plan: &RunPlan) -> RunReport;
+    ///  - never exceed `plan.rate_cap`,
+    ///  - return [`ModuleError`] rather than a zeroed report when the run could
+    ///    not happen, so a failure is auditable as a failure.
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError>;
 }
 
 #[cfg(test)]
@@ -600,6 +658,32 @@ mod tests {
     fn rate_cap_interval() {
         assert_eq!(RateCap::new(0).min_interval(), None);
         assert_eq!(RateCap::new(1000).min_interval(), Some(Duration::from_millis(1)));
+    }
+
+    /// The interval must never be zero: every engine either divides by it
+    /// (`batch_for`) or hands it to `tokio::time::interval`, and both panic on
+    /// `Duration::ZERO`. A `--rate` typo must not kill a run mid-flight.
+    #[test]
+    fn a_nonzero_rate_never_yields_a_zero_interval() {
+        for per_sec in [1u64, 1_000, 1_000_000_000, 2_000_000_001, 10_000_000_000, u64::MAX] {
+            let interval = RateCap::new(per_sec).min_interval().expect("nonzero rate paces");
+            assert!(!interval.is_zero(), "{per_sec}/s produced a zero interval");
+        }
+    }
+
+    /// `--rate` is a ceiling, so the interval must round *up*. Rounding to
+    /// nearest (what float division does) lets 3 000 000/s pace at 333ns and
+    /// deliver 3 003 003/s — above the declared cap.
+    #[test]
+    fn the_interval_never_paces_above_the_cap() {
+        for per_sec in [1u64, 3, 7, 1_000, 3_000_000, 700_000_000, 1_000_000_000] {
+            let interval = RateCap::new(per_sec).min_interval().unwrap();
+            let effective = 1.0 / interval.as_secs_f64();
+            assert!(
+                effective <= per_sec as f64,
+                "{per_sec}/s paces at {interval:?} = {effective:.1}/s, above the cap"
+            );
+        }
     }
 
     #[test]

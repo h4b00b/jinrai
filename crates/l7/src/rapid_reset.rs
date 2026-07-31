@@ -28,7 +28,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
+use jinrai_core::{Layer, ModuleError, RunPlan, RunReport, StressModule};
 use jinrai_safety::{Authorization, AuthorizedTarget, KillSwitch};
 
 use crate::{authorize_datum, resolve_addrs, wait_for_kill, L7Error};
@@ -69,12 +69,10 @@ impl H2RapidResetEngine {
         Ok(Prepared { addr, uri, tls })
     }
 
-    fn refusal_report(&self, e: L7Error) -> RunReport {
-        RunReport {
-            layer_label: format!("L7 h2-rapid-reset REFUSED: {e}"),
-            aborted_early: true,
-            ..Default::default()
-        }
+    /// This primitive could not start. See [`crate::module_error`] for why the
+    /// distinction between a refusal and a setup failure is kept.
+    fn refusal(&self, e: L7Error) -> ModuleError {
+        crate::module_error("L7 h2-rapid-reset".to_string(), e)
     }
 }
 
@@ -93,24 +91,24 @@ impl StressModule for H2RapidResetEngine {
         "l7-h2-rapid-reset"
     }
 
-    fn execute(&mut self, plan: &RunPlan) -> RunReport {
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
         let Prepared { addr, uri, tls } = match self.prepare() {
             Ok(p) => p,
-            Err(e) => return self.refusal_report(e),
+            Err(e) => return Err(self.refusal(e)),
         };
 
         // Rate cap: min spacing between resets. `None` => send nothing.
         let Some(interval) = plan.rate_cap.min_interval() else {
-            return RunReport {
+            return Ok(RunReport {
                 layer_label: format!("L7 h2-rapid-reset {} (rate cap 0 — sent nothing)", self.url),
                 aborted_early: false,
                 ..Default::default()
-            };
+            });
         };
 
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
-            Err(e) => return self.refusal_report(L7Error::Client(e.to_string())),
+            Err(e) => return Err(self.refusal(L7Error::Client(e.to_string()))),
         };
 
         let sent = Arc::new(AtomicU64::new(0));
@@ -121,7 +119,7 @@ impl StressModule for H2RapidResetEngine {
         let duration = plan.duration;
 
         rt.block_on(async move {
-            let deadline = Instant::now() + duration;
+            let deadline = crate::deadline_in(duration);
             let tcp = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
                 Ok(Ok(s)) => s,
                 _ => {
@@ -154,7 +152,7 @@ impl StressModule for H2RapidResetEngine {
         });
 
         let aborted = plan.kill.is_tripped();
-        RunReport {
+        Ok(RunReport {
             layer_label: format!(
                 "L7 h2-rapid-reset {} ({} stream{} reset)",
                 self.url,
@@ -165,7 +163,7 @@ impl StressModule for H2RapidResetEngine {
             errors: errors.load(Ordering::Relaxed),
             aborted_early: aborted,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -210,13 +208,20 @@ async fn drive<IO>(
             break;
         }
 
-        // Wait for a stream slot (a reset frees one immediately).
-        send_request = match send_request.ready().await {
-            Ok(sr) => sr,
-            Err(_) => {
-                errors.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        // Wait for a stream slot (a reset frees one immediately) — but only until
+        // the run is over. A server that stops granting capacity (the very
+        // mitigation this primitive probes for) would otherwise park the loop here
+        // indefinitely, past `--duration` and deaf to Ctrl-C.
+        send_request = tokio::select! {
+            r = send_request.ready() => match r {
+                Ok(sr) => sr,
+                Err(_) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            },
+            _ = wait_for_kill(kill.clone()) => break,
+            _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => break,
         };
         let req = match Request::builder().method(Method::GET).uri(uri.clone()).body(()) {
             Ok(r) => r,

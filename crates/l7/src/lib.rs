@@ -58,8 +58,8 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
 use jinrai_core::{
-    ErrnoBucket, ErrnoTally, Knee, Layer, LoadProfile, LoadStage, RunPlan, RunReport, SloSpec,
-    StressModule,
+    ErrnoBucket, ErrnoTally, Knee, Layer, LoadProfile, LoadStage, ModuleError, RunPlan, RunReport,
+    SloSpec, StressModule,
 };
 use jinrai_safety::{AuthorizedTarget, Authorization, KillSwitch, SafetyError};
 
@@ -479,12 +479,10 @@ impl L7Engine {
         Ok((client, datum.url))
     }
 
-    fn refusal_report(&self, e: L7Error) -> RunReport {
-        RunReport {
-            layer_label: format!("L7 REFUSED: {e}"),
-            aborted_early: true,
-            ..Default::default()
-        }
+    /// This primitive could not start. See [`crate::module_error`] for why the
+    /// distinction between a refusal and a setup failure is kept.
+    fn refusal(&self, e: L7Error) -> ModuleError {
+        crate::module_error(format!("L7 {}", self.spec.method.label()), e)
     }
 }
 
@@ -497,17 +495,17 @@ impl StressModule for L7Engine {
         self.spec.method.label()
     }
 
-    fn execute(&mut self, plan: &RunPlan) -> RunReport {
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
         // Re-authorize the datum + resolve-once + build the pinned client. The
         // gate is the sole authority even if a caller hand-built the plan.
         let (client, url) = match self.prepare() {
             Ok(pair) => pair,
-            Err(e) => return self.refusal_report(e),
+            Err(e) => return Err(self.refusal(e)),
         };
 
         // Rate cap 0 => refuse to send, whatever the profile asks for.
         if plan.rate_cap.min_interval().is_none() {
-            return RunReport {
+            return Ok(RunReport {
                 layer_label: format!(
                     "L7 {} {} (rate cap 0 — sent nothing)",
                     self.spec.method.label(),
@@ -515,7 +513,7 @@ impl StressModule for L7Engine {
                 ),
                 aborted_early: false,
                 ..Default::default()
-            };
+            });
         }
 
         // Compile the load profile into constant-rate stages (default: one flat
@@ -536,7 +534,7 @@ impl StressModule for L7Engine {
         // Build the runtime here so `core` stays runtime-agnostic.
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
-            Err(e) => return self.refusal_report(L7Error::Client(e.to_string())),
+            Err(e) => return Err(self.refusal(L7Error::Client(e.to_string()))),
         };
 
         let sent = Arc::new(AtomicU64::new(0));
@@ -649,11 +647,18 @@ impl StressModule for L7Engine {
             let mut stage_start = snapshot(&sent_w, &errors_w, &s5xx_w, &s4xx_w);
             let mut sustained: u64 = 0;
 
+            // `--duration` bounds the whole run, not each stage: a profile whose
+            // stages happen to sum to more than the plan asked for gets cut here
+            // rather than generating an undeclared extra window of traffic. The
+            // profile builders keep their stages inside the duration, but this is
+            // the layer that owns the operator's promise, so it enforces it.
+            let run_deadline = deadline_in(plan.duration);
+
             // Run each constant-rate stage back-to-back, re-pacing at each
             // boundary. One mechanism executes every profile shape.
             'stages: for stage in stages {
                 let Some(interval_dur) = stage.rate.min_interval() else { continue };
-                let stage_deadline = Instant::now() + stage.duration;
+                let stage_deadline = deadline_in(stage.duration).min(run_deadline);
                 let mut interval = tokio::time::interval(interval_dur);
                 // Never exceed the cap: on a missed tick, delay rather than burst.
                 interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -861,7 +866,7 @@ impl StressModule for L7Engine {
         let units_sent = sent.load(Ordering::Relaxed);
         let errors = errors.load(Ordering::Relaxed);
         let resolved = units_sent + errors;
-        RunReport {
+        Ok(RunReport {
             layer_label: label,
             units_sent,
             errors,
@@ -880,7 +885,7 @@ impl StressModule for L7Engine {
             mean_micros: residency.load(Ordering::Relaxed).checked_div(resolved).unwrap_or(0),
             knee,
             http_versions,
-        }
+        })
     }
 }
 
@@ -967,6 +972,91 @@ fn classify_reqwest(e: &reqwest::Error) -> ErrnoBucket {
     ErrnoBucket::Protocol
 }
 
+/// The instant `d` from now, saturating instead of panicking.
+///
+/// `Instant + Duration` panics on overflow, and every engine here computes its
+/// deadline that way. The CLI caps `--duration` long before that is reachable,
+/// but `RunPlan` is a public type: a library caller with an outsized duration
+/// should get a run that never voluntarily ends (the kill switch still stops it),
+/// not a panic with sockets already open.
+pub(crate) fn deadline_in(d: Duration) -> Instant {
+    Instant::now().checked_add(d).unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400))
+}
+
+/// Map a prepare-time L7 failure onto the module contract's error, keeping the
+/// primitive's own name (`what`) in the message.
+///
+/// The split matters to whoever reads the audit log: `Refused` is jinrai saying
+/// no to what was asked for (an unauthorized datum, a scheme it will not drive),
+/// `Setup` is the host or the network failing to provide what the run needed.
+/// The first is a policy event, the second an operational one.
+pub(crate) fn module_error(what: String, e: L7Error) -> ModuleError {
+    let msg = format!("{what}: {e}");
+    match e {
+        L7Error::Refused(_)
+        | L7Error::InvalidUrl(_)
+        | L7Error::UnsupportedScheme(_)
+        | L7Error::MissingHost
+        | L7Error::BadHeader(_) => ModuleError::Refused(msg),
+        L7Error::Dns(_) | L7Error::NoAddresses | L7Error::Client(_) => ModuleError::Setup(msg),
+    }
+}
+
+/// How long one frame write may make no progress before the raw-frame engines
+/// give up on the connection. Long enough that ordinary backpressure on a busy
+/// target is not mistaken for a stall, short enough that a wedged connection is
+/// reported rather than sat on for the rest of the run.
+pub(crate) const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What became of one frame write.
+pub(crate) enum FrameWrite {
+    /// The bytes went out.
+    Wrote,
+    /// The write errored, or made no progress for [`WRITE_STALL_TIMEOUT`].
+    /// Both mean the connection is finished; both are the peer's doing, so both
+    /// count as an error against the run.
+    Failed,
+    /// The run ended underneath the write — kill switch or deadline. Not an
+    /// error: the write simply did not get to finish.
+    Stopped,
+}
+
+/// Write `buf`, but never let a stalled peer own the run.
+///
+/// `write_all` on a socket whose peer has stopped reading pends forever once the
+/// kernel send buffer fills, and that is not hypothetical here: several of these
+/// primitives exist *precisely* to make a server stop draining. Awaiting it bare
+/// inside a loop body parks the task outside the `select!` — past `--duration`,
+/// deaf to Ctrl-C — which would make the peer, not the operator, the authority on
+/// when a run ends. Racing the write against both keeps that authority where it
+/// belongs.
+pub(crate) async fn write_or_stop<IO>(
+    io: &mut IO,
+    buf: &[u8],
+    kill: &KillSwitch,
+    deadline: Instant,
+) -> FrameWrite
+where
+    IO: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let till_deadline = deadline.saturating_duration_since(Instant::now());
+    // Whichever comes first bounds the wait; remember which one it was, so a
+    // wedged connection is reported as a failure while a run that simply reached
+    // its deadline mid-write is not.
+    let stalling = WRITE_STALL_TIMEOUT < till_deadline;
+    let wait = WRITE_STALL_TIMEOUT.min(till_deadline);
+    tokio::select! {
+        r = io.write_all(buf) => {
+            if r.is_ok() { FrameWrite::Wrote } else { FrameWrite::Failed }
+        }
+        _ = wait_for_kill(kill.clone()) => FrameWrite::Stopped,
+        _ = tokio::time::sleep(wait) => {
+            if stalling { FrameWrite::Failed } else { FrameWrite::Stopped }
+        }
+    }
+}
+
 /// Resolve when the kill switch trips. Polled at a fine granularity so a run
 /// stops promptly even when the dispatch interval is coarse (low rates).
 pub(crate) async fn wait_for_kill(kill: jinrai_safety::KillSwitch) {
@@ -1037,7 +1127,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1068,7 +1158,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1103,7 +1193,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1135,7 +1225,7 @@ mod tests {
             duration: Duration::from_millis(300),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
 
         assert_eq!(report.units_sent, 0);
         assert!(report.errors > 0);
@@ -1157,7 +1247,7 @@ mod tests {
             duration: Duration::from_millis(300),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1185,7 +1275,7 @@ mod tests {
             kill: KillSwitch::new(),
         };
         let start = Instant::now();
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         let elapsed = start.elapsed();
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1211,7 +1301,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1321,7 +1411,7 @@ mod tests {
             duration: Duration::from_millis(50),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         assert_eq!(report.units_sent, 0);
         assert_eq!(report.errors, 0);
         assert!(!report.aborted_early);
@@ -1340,7 +1430,7 @@ mod tests {
             duration: Duration::from_secs(30),
             kill,
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         assert_eq!(report.units_sent, 0);
         assert!(report.aborted_early);
     }
@@ -1398,7 +1488,7 @@ mod tests {
         let mut engine =
             L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
         let plan = loopback_plan(&engine, 1000, 600);
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1428,7 +1518,7 @@ mod tests {
             .with_profile(profile)
             .discover_knee(true);
         let plan = loopback_plan(&engine, 1000, 900);
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1458,7 +1548,7 @@ mod tests {
             .with_profile(profile)
             .discover_knee(true);
         let plan = loopback_plan(&engine, 1000, 600);
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1481,7 +1571,7 @@ mod tests {
         let mut engine =
             L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
         let plan = loopback_plan(&engine, 1000, 400);
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1505,7 +1595,7 @@ mod tests {
         let mut engine =
             L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
         let plan = loopback_plan(&engine, 50, 300);
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1570,7 +1660,7 @@ mod tests {
             duration: Duration::from_millis(700),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
@@ -1633,7 +1723,7 @@ mod tests {
         };
 
         let wall = Instant::now();
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         let elapsed = wall.elapsed();
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1678,7 +1768,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 

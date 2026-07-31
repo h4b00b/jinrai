@@ -50,7 +50,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
+use jinrai_core::{Layer, ModuleError, RunPlan, RunReport, StressModule};
 use jinrai_safety::Authorization;
 
 use crate::{authorize_datum, resolve_addrs, wait_for_kill, L7Error};
@@ -146,12 +146,10 @@ impl L7SlowEngine {
         Ok(Prepared { addr, target, host_header, tls })
     }
 
-    fn refusal_report(&self, e: L7Error) -> RunReport {
-        RunReport {
-            layer_label: format!("L7 {} REFUSED: {e}", self.cfg.mode.label()),
-            aborted_early: true,
-            ..Default::default()
-        }
+    /// This primitive could not start. See [`crate::module_error`] for why the
+    /// distinction between a refusal and a setup failure is kept.
+    fn refusal(&self, e: L7Error) -> ModuleError {
+        crate::module_error(format!("L7 {}", self.cfg.mode.label()), e)
     }
 }
 
@@ -181,15 +179,15 @@ impl StressModule for L7SlowEngine {
         self.cfg.mode.label()
     }
 
-    fn execute(&mut self, plan: &RunPlan) -> RunReport {
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
         let Prepared { addr, target, host_header, tls } = match self.prepare() {
             Ok(p) => p,
-            Err(e) => return self.refusal_report(e),
+            Err(e) => return Err(self.refusal(e)),
         };
 
         // Rate cap: min spacing between opening connections. `None` => send nothing.
         let Some(open_interval) = plan.rate_cap.min_interval() else {
-            return RunReport {
+            return Ok(RunReport {
                 layer_label: format!(
                     "L7 {} {} (rate cap 0 — opened nothing)",
                     self.cfg.mode.label(),
@@ -197,12 +195,12 @@ impl StressModule for L7SlowEngine {
                 ),
                 aborted_early: false,
                 ..Default::default()
-            };
+            });
         };
 
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
-            Err(e) => return self.refusal_report(L7Error::Client(e.to_string())),
+            Err(e) => return Err(self.refusal(L7Error::Client(e.to_string()))),
         };
 
         let established = Arc::new(AtomicU64::new(0));
@@ -220,7 +218,7 @@ impl StressModule for L7SlowEngine {
         let host_header = Arc::new(host_header);
 
         let aborted = rt.block_on(async move {
-            let deadline = Instant::now() + duration;
+            let deadline = crate::deadline_in(duration);
             let mut opener = tokio::time::interval(open_interval);
             opener.set_missed_tick_behavior(MissedTickBehavior::Delay);
             let mut tasks: JoinSet<()> = JoinSet::new();
@@ -269,7 +267,7 @@ impl StressModule for L7SlowEngine {
             aborted
         });
 
-        RunReport {
+        Ok(RunReport {
             layer_label: format!(
                 "L7 {} {} ({} connection{} held)",
                 self.cfg.mode.label(),
@@ -281,7 +279,7 @@ impl StressModule for L7SlowEngine {
             errors: errors.load(Ordering::Relaxed),
             aborted_early: aborted,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -480,7 +478,7 @@ mod tests {
     fn rate_zero_opens_nothing() {
         let g = gate_cidrs(&["127.0.0.0/8"]);
         let mut engine = L7SlowEngine::new(g.clone(), "http://127.0.0.1:9/", cfg(SlowMode::Headers));
-        let report = engine.execute(&plan(&g, "http://127.0.0.1:9/", 0, 100));
+        let report = engine.execute(&plan(&g, "http://127.0.0.1:9/", 0, 100)).expect("the run should execute");
         assert_eq!(report.units_sent, 0);
         assert!(!report.aborted_early);
         assert!(report.layer_label.contains("opened nothing"));
@@ -512,7 +510,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/");
         let g = gate_cidrs(&["127.0.0.0/8"]);
         let mut engine = L7SlowEngine::new(g.clone(), url.clone(), cfg(SlowMode::Headers));
-        let report = engine.execute(&plan(&g, &url, 50, 700));
+        let report = engine.execute(&plan(&g, &url, 50, 700)).expect("the run should execute");
 
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
@@ -562,7 +560,7 @@ mod tests {
             url.clone(),
             SlowConfig { mode: SlowMode::Read, max_conns: 2, drip: Duration::from_millis(50) },
         );
-        let report = engine.execute(&plan(&g, &url, 50, 600));
+        let report = engine.execute(&plan(&g, &url, 50, 600)).expect("the run should execute");
 
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
