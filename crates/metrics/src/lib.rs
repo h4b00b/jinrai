@@ -273,7 +273,15 @@ fn errno_meaning(bucket: ErrnoBucket) -> &'static str {
         ErrnoBucket::Etimedout => "the TARGET never answered (kernel connect timeout)",
         ErrnoBucket::Econnreset => "the TARGET reset the connection mid-handshake",
         ErrnoBucket::Eunreach => "no route to the target — routing/firewall, nothing was delivered",
-        ErrnoBucket::Timeout => "our own attempt timeout expired first (tune --connect-timeout-ms)",
+        ErrnoBucket::Timeout => {
+            "our own attempt timeout expired first (tune --request-timeout-ms for \
+             l7, --connect-timeout-ms for l4)"
+        }
+        ErrnoBucket::Abandoned => {
+            "still in flight when the run's window closed, so we cancelled it — \
+             the target was answering slower than the offered load (raise --duration \
+             or lower --rate; --drain-timeout-ms sets the grace)"
+        }
         ErrnoBucket::Protocol => {
             "the socket worked but the protocol exchange failed (most often the \
              target does not speak the forced --http-version)"

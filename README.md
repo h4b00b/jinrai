@@ -174,7 +174,7 @@ reinterpreted per family, and a flag belonging to another family is inert
 
 | Family | `--rate` counts | Bound the footprint with | Does **not** read |
 |---|---|---|---|
-| `get` / `post` / `head` | requests/sec | `--max-connections` (0 = unbounded) | — |
+| `get` / `post` / `head` | requests/sec | `--max-connections` (0 = unbounded), `--request-timeout-ms`, `--drain-timeout-ms` | — |
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
 | `tls-handshake` | handshakes/sec | *nothing* — concurrency follows the rate | same as above |
 | every `h2-*` | frames/sec (cycles/sec for `h2-made-you-reset`) | *nothing* — one connection, frames paced by `--rate` | same as above |
@@ -321,6 +321,11 @@ new target:
 * **Concurrency is your own footprint.** `--concurrency` / `--slow-connections` /
   `--max-connections` bound the sockets held open *by jinrai*, independently of
   `--duration`. Doubling the duration does not double the footprint.
+* **`--duration` bounds the traffic, not just the dispatching of it.** Dispatch
+  stops at the deadline; requests still in flight then get `--drain-timeout-ms`
+  (default 1000) to land, and whatever is still outstanding is cancelled and
+  counted in the `abandoned` bucket. So a run cannot keep generating traffic past
+  its declared window while waiting for a slow target to answer.
 * **`--watchdog` is the automatic brake**: it aborts the run after
   `--watchdog-breaches` consecutive breaching windows. It can only ever *stop*
   traffic, never generate it. Use it on anything long or unattended.
@@ -449,6 +454,39 @@ counts as a unit of `--rate`, see
 The slow modes support https targets (slow-TLS; the handshake accepts any server
 certificate). All the `h2-*` primitives negotiate h2 via ALPN for `https` and
 prior-knowledge h2c for `http`.
+
+### Timeouts and the end of the run
+
+Two flags bound the fast `get`/`post`/`head` flood in time, and they answer
+different questions:
+
+| flag | default | bounds |
+| --- | --- | --- |
+| `--request-timeout-ms` | 10000 | how long **one request** may stay unresolved before it is given up on and counted in the `timeout` bucket |
+| `--drain-timeout-ms` | 1000 | how long the **run** waits for requests still in flight once `--duration` expires, before cancelling them |
+
+The second one exists because `--duration` has to bound the traffic, not merely
+the dispatching of it. Dispatch stops at the deadline either way — but requests
+already on the wire have not resolved, and waiting all of them out makes the
+real window `--duration + --request-timeout-ms`. With the defaults that is a
+three-second run that keeps generating traffic for thirteen seconds: a window the
+operator never declared, and one the audit log records as three seconds.
+
+So the tail is bounded. Whatever is still outstanding after the grace period is
+cancelled and counted in the **`abandoned`** bucket — never silently dropped,
+which would understate the offered load and flatter the target:
+
+```
+ failed     12172 (86.1%)
+            12172 x abandoned — still in flight when the run's window closed
+```
+
+A non-zero `abandoned` count means the target was answering more slowly than the
+load being offered. The fix is a longer `--duration` or a lower `--rate` — not a
+longer `--request-timeout-ms`, which is why the bucket is kept separate from
+`timeout`. `--max-connections` prevents the pile-up at its source by capping how
+many requests can be in flight at once. An operator Ctrl-C or a watchdog abort
+skips the grace entirely and cancels immediately: an abort must be prompt.
 
 ### HTTP/1.1 vs HTTP/2 (`--http-version`)
 

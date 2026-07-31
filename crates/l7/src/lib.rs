@@ -317,7 +317,35 @@ pub struct L7Engine {
     /// probe a server's connection-slot / worker-pool limit by holding a fixed
     /// number of connections busy rather than an unbounded rate-driven fan-out.
     max_conns: Option<usize>,
+    /// How long one request may stay unresolved before the client gives up and
+    /// counts it in the `timeout` bucket.
+    request_timeout: Duration,
+    /// How long the engine waits for still-in-flight requests *after* the run's
+    /// window closes, before cancelling them. See [`DEFAULT_DRAIN_GRACE`].
+    drain_grace: Duration,
 }
+
+/// Default per-request timeout: how long one request may stay unresolved before
+/// the client abandons it. Deliberately generous — a target slow enough to hit
+/// this is itself the finding.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default drain grace: how long the engine waits for in-flight requests after
+/// the run's window closes.
+///
+/// This exists because `--duration` is a **safety control**, not a hint. Dispatch
+/// stops at the deadline, but requests already on the wire have not resolved, and
+/// waiting all of them out means a run's real traffic window is
+/// `duration + request_timeout` — for the defaults, a 3-second run that keeps
+/// generating traffic for 13. That is a window the operator never declared and
+/// the audit log never recorded.
+///
+/// So the drain is bounded: in-flight requests get this long to land, and
+/// whatever is still outstanding is cancelled and counted under
+/// [`ErrnoBucket::Abandoned`]. One second is long enough that a healthy target
+/// abandons nothing, and short enough that the declared window still means
+/// something.
+pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 impl L7Engine {
     pub fn new(gate: Authorization, spec: RequestSpec) -> Self {
@@ -329,6 +357,8 @@ impl L7Engine {
             profile: None,
             discover_knee: false,
             max_conns: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            drain_grace: DEFAULT_DRAIN_GRACE,
         }
     }
 
@@ -374,6 +404,27 @@ impl L7Engine {
         self
     }
 
+    /// How long one request may stay unresolved before it is abandoned and
+    /// counted in the `timeout` bucket (default: [`DEFAULT_REQUEST_TIMEOUT`]).
+    /// Zero is treated as "keep the default" rather than "give up instantly",
+    /// which would make every request fail.
+    pub fn with_request_timeout(mut self, d: Duration) -> Self {
+        if !d.is_zero() {
+            self.request_timeout = d;
+        }
+        self
+    }
+
+    /// How long to wait for in-flight requests once the run's window closes,
+    /// before cancelling them (default: [`DEFAULT_DRAIN_GRACE`]). Zero means
+    /// cancel immediately at the deadline — the strictest reading of
+    /// `--duration`, at the cost of counting every in-flight request as
+    /// abandoned.
+    pub fn with_drain_grace(mut self, d: Duration) -> Self {
+        self.drain_grace = d;
+        self
+    }
+
     /// Authorize the URL's host as a datum: IP literal against IP/CIDR rules, or
     /// DNS name against DNS rules. Public so the CLI can validate + report before
     /// building a plan. No DNS resolution happens here for name targets — the
@@ -412,7 +463,7 @@ impl L7Engine {
         let mut builder = reqwest::Client::builder()
             .resolve_to_addrs(&datum.host, &addrs)
             .default_headers(headers)
-            .timeout(Duration::from_secs(10));
+            .timeout(self.request_timeout);
         // Pin the protocol version when the operator asked for one. `Auto` leaves
         // reqwest's negotiation alone (h1 for http, ALPN for https).
         builder = match self.spec.http_version {
@@ -499,10 +550,12 @@ impl StressModule for L7Engine {
         let s4xx = Arc::new(AtomicU64::new(0));
         let s5xx = Arc::new(AtomicU64::new(0));
         let timeouts = Arc::new(AtomicU64::new(0));
-        // Bounds: 1 microsecond .. 60 seconds (well above the 10 s request
+        // Bounds: 1 microsecond .. 60 seconds (well above the default request
         // timeout), 3 significant figures. Explicit bounds so `saturating_record`
         // clamps only pathological values rather than a fresh histogram's tiny
-        // default ceiling.
+        // default ceiling. A `--request-timeout-ms` beyond 60 s would clamp the
+        // slowest samples to the ceiling; percentiles stay meaningful because a
+        // target that slow is the finding, not the measurement.
         let hist = Arc::new(Mutex::new(
             Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds"),
         ));
@@ -517,6 +570,7 @@ impl StressModule for L7Engine {
         let kill = plan.kill.clone();
         let discover_knee = self.discover_knee;
         let max_conns = self.max_conns;
+        let drain_grace = self.drain_grace;
         // The watchdog runs only when there is a config, a rate threshold for it
         // to evaluate (it ignores latency), AND we are not in knee-discovery — a
         // discovery run is meant to reach a breach and stop cleanly, not abort.
@@ -719,16 +773,59 @@ impl StressModule for L7Engine {
                 }
             }
 
-            // Stop promptly on kill: abort in-flight rather than waiting them out.
-            if aborted {
+            // The dispatch window is closed; now bound the tail.
+            //
+            // `--duration` is a safety control, so it has to bound the *traffic*,
+            // not merely the dispatching of it. Waiting every in-flight request
+            // out means the real window is `duration + request_timeout` — with the
+            // defaults, a 3-second run against a slow target keeps generating
+            // traffic for 13 seconds, a window the operator never declared and the
+            // audit log never recorded.
+            //
+            // So: on kill, cancel immediately (an abort must be prompt); otherwise
+            // give in-flight requests `drain_grace` to land, then cancel the rest.
+            // Either way the cancelled attempts are COUNTED, never dropped — a
+            // silently discarded attempt would understate the offered load and
+            // flatter the target.
+            // An abort must be prompt, so a killed run skips the grace entirely
+            // (short-circuit) and cancels straight away.
+            let all_landed = !aborted
+                && tokio::time::timeout(drain_grace, async {
+                    while tasks.join_next().await.is_some() {}
+                })
+                .await
+                .is_ok();
+            if !all_landed {
                 tasks.abort_all();
             }
-            while tasks.join_next().await.is_some() {}
+            let mut abandoned: u64 = 0;
+            while let Some(joined) = tasks.join_next().await {
+                // A task that finished on its own already recorded its outcome;
+                // only the ones we cancelled are unaccounted for.
+                if joined.is_err_and(|e| e.is_cancelled()) {
+                    abandoned += 1;
+                }
+            }
+            if abandoned > 0 {
+                errors_w.fetch_add(abandoned, Ordering::Relaxed);
+                let mut tally = errno_w.lock().unwrap_or_else(|p| p.into_inner());
+                for _ in 0..abandoned {
+                    tally.record(ErrnoBucket::Abandoned);
+                }
+            }
             if let Some(handle) = watchdog_task {
                 handle.abort();
             }
             (aborted, knee)
         });
+
+        // Every traffic task is joined or cancelled by now, so nothing is left to
+        // wait for — but dropping a multi-thread runtime *blocks* until its worker
+        // and blocking threads wind down, which for a run that ended with tens of
+        // thousands of cancelled requests is seconds of pure teardown charged to
+        // the run's wall clock. Release it in the background instead: the run is
+        // over, and the process either exits or moves on to reporting.
+        rt.shutdown_background();
 
         let hist = hist.lock().unwrap_or_else(|p| p.into_inner());
         let http_versions =
@@ -1459,5 +1556,116 @@ mod tests {
         assert!(report.units_sent > 0, "should complete some requests");
         let observed = peak.load(Ordering::SeqCst);
         assert!(observed > 0 && observed <= cap, "peak concurrency {observed} must be <= cap {cap}");
+    }
+
+    /// A server that accepts every connection and never answers, holding the
+    /// socket open until told to stop. Every request against it stays in flight
+    /// until the client's own timeout — which is exactly the condition that used
+    /// to stretch a run past its declared window.
+    fn spawn_blackhole_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let handle = thread::spawn(move || {
+            // Hold every accepted socket: dropping them would send a FIN and let
+            // the client resolve the request early, defeating the point.
+            let mut held = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => held.push(s),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, stop, handle)
+    }
+
+    /// `--duration` must bound the traffic, not just the dispatching of it.
+    ///
+    /// Against a target that never answers, every dispatched request sits in
+    /// flight until the request timeout. Draining them all would make the real
+    /// traffic window `duration + request_timeout`; the bounded drain caps the
+    /// overshoot at the grace period instead.
+    #[test]
+    fn run_does_not_outlive_its_window_when_the_target_never_answers() {
+        let (port, stop, handle) = spawn_blackhole_server();
+        let url = format!("http://127.0.0.1:{port}/");
+        let duration = Duration::from_millis(500);
+        let grace = Duration::from_millis(300);
+        // A request timeout far longer than the whole run: if the drain were
+        // unbounded, execute() could not return before it expires.
+        let request_timeout = Duration::from_secs(8);
+
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_request_timeout(request_timeout)
+            .with_drain_grace(grace);
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration,
+            kill: KillSwitch::new(),
+        };
+
+        let wall = Instant::now();
+        let report = engine.execute(&plan);
+        let elapsed = wall.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // Generous headroom for runtime shutdown, but nowhere near the 8s that an
+        // unbounded drain would have taken.
+        let ceiling = duration + grace + Duration::from_millis(1500);
+        assert!(
+            elapsed < ceiling,
+            "run took {elapsed:?}, must stay under {ceiling:?} (duration {duration:?} \
+             + grace {grace:?}); an unbounded drain would have waited {request_timeout:?}"
+        );
+
+        // Nothing could have completed against a blackhole, and every attempt the
+        // engine gave up on must still be accounted for.
+        assert_eq!(report.units_sent, 0, "a blackhole cannot complete a request");
+        assert!(report.attempts() > 0, "the run must have offered some load");
+        let abandoned = report
+            .errno
+            .iter()
+            .find(|(b, _)| *b == ErrnoBucket::Abandoned)
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        assert!(abandoned > 0, "cancelled attempts must be counted, not dropped: {:?}", report.errno);
+        assert_eq!(
+            report.errno.total(),
+            report.errors,
+            "the errno breakdown must still sum to the error count"
+        );
+    }
+
+    /// The bounded drain must not cost a healthy target anything: when responses
+    /// land well inside the grace period, nothing is abandoned.
+    #[test]
+    fn healthy_target_abandons_nothing_at_the_deadline() {
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "should complete requests against a live server");
+        assert!(
+            !report.errno.iter().any(|(b, _)| b == ErrnoBucket::Abandoned),
+            "a responsive target must not have attempts abandoned: {:?}",
+            report.errno
+        );
     }
 }

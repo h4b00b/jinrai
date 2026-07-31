@@ -193,6 +193,15 @@ pub enum ErrnoBucket {
     /// reported nothing, *we* gave up first, so the bucket size is a function of
     /// the configured timeout as much as of the target.
     Timeout,
+    /// The run's window closed while this attempt was still in flight, so it was
+    /// cancelled rather than waited out. Kept apart from
+    /// [`Timeout`](ErrnoBucket::Timeout) because the cause is the *run's* shape,
+    /// not the attempt's: the target was answering more slowly than the offered
+    /// load, and `--duration` (or an operator abort) ended the run first. The fix
+    /// is a longer run or a lower rate, not a longer per-attempt timeout. A
+    /// non-zero count here is also the honest disclosure that some offered load
+    /// never got an answer — those attempts are counted, never silently dropped.
+    Abandoned,
     /// The socket was fine but the exchange failed at the application-protocol
     /// level — most often a version mismatch (an HTTP/2-only client against a
     /// server that only speaks HTTP/1.1, a malformed/refused stream). No errno
@@ -275,6 +284,7 @@ impl std::fmt::Display for ErrnoBucket {
             ErrnoBucket::Econnreset => write!(f, "ECONNRESET"),
             ErrnoBucket::Eunreach => write!(f, "EUNREACH"),
             ErrnoBucket::Timeout => write!(f, "timeout"),
+            ErrnoBucket::Abandoned => write!(f, "abandoned"),
             ErrnoBucket::Protocol => write!(f, "protocol"),
             ErrnoBucket::Other(code) => write!(f, "os:{code}"),
             ErrnoBucket::Internal => write!(f, "internal"),
