@@ -14,6 +14,45 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-07-31
+
+The run summary now names **the generator** when the generator was the limit.
+
+`--rate 200000` on a UDP flood reports `28769.9/s achieved (14% of the 200000/s
+cap)` with **zero failures**. Read without help, that is the most dangerous line
+the tool prints: it looks exactly like a target absorbing 86% of the offered
+load. It is not. The load was never offered — a stateless flood paces itself one
+unit at a time and tops out around 29k/s on this host, whatever `--rate` accepts.
+
+0.22.0 added the mirror of this for the modes that have an in-flight ceiling
+(`bound by concurrency, not the target`, from Little's law). The modes that have
+no such ceiling — every stateless flood — were left with a bare percentage and
+nothing to interpret it with.
+
+### Added
+
+- **`bound by  the generator, not the target: …` in the run summary.** Fires only
+  when every other explanation is eliminated: nothing failed (so nothing was
+  refused, reset or timed out), there is no concurrency ceiling that could have
+  throttled dispatch, the run was not cut short, and the achieved rate is below
+  90% of the cap. What remains is this host's own pacing limit, so the note
+  restates the achieved rate as the **real** offered load and says explicitly not
+  to credit the target with the difference:
+
+  ```
+   attempts   86335 total, 28769.5/s achieved (14% of the 200000/s cap)
+   failed     0
+   bound by   the generator, not the target: nothing failed and there was no
+              in-flight ceiling, so 28769/s is what this host could emit — the
+              shortfall against the 200000/s cap is jinrai's own limit, NOT load
+              the target absorbed. Treat 28769/s as the load actually offered
+  ```
+
+  The two `bound by` notes are mutually exclusive by construction: the
+  concurrency note applies only where there is an in-flight ceiling to blame,
+  this one only where there is not. Where both could apply, concurrency wins —
+  it is the more specific, and actionable, answer.
+
 ## [0.24.0] — 2026-07-31
 
 `--duration` now bounds the **traffic**, not just the dispatching of it.
@@ -911,7 +950,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/h4b00b/jinrai/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/h4b00b/jinrai/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/h4b00b/jinrai/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/h4b00b/jinrai/compare/v0.21.0...v0.22.0

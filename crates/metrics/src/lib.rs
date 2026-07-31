@@ -211,7 +211,12 @@ pub fn render_summary(
             ),
         ));
     }
-    if let Some(note) = concurrency_bound_note(effective, report, ctx) {
+    // Why the run fell short of its cap, when it did. The two notes are mutually
+    // exclusive by construction: the first applies only where there is an
+    // in-flight ceiling to blame, the second only where there is not.
+    if let Some(note) =
+        concurrency_bound_note(effective, report, ctx).or_else(|| generator_bound_note(effective, report, ctx))
+    {
         out.push_str(&row("bound by", &note));
     }
     if let Some(k) = report.knee {
@@ -334,6 +339,54 @@ fn concurrency_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) 
          attempt tops out near {ceiling:.0}/s, below the {}/s cap — raise \
          --concurrency to offer more load",
         fmt_micros(report.p50_micros),
+        ctx.rate_per_sec
+    ))
+}
+
+/// Explain a run that fell short of its rate cap because **this host** could not
+/// emit any faster — the case where the low percentage says nothing whatsoever
+/// about the target.
+///
+/// This is the counterpart to [`concurrency_bound_note`], for the modes that have
+/// no in-flight ceiling to blame. A stateless flood paces itself one unit at a
+/// time and tops out well below what `--rate` will accept: ask for 200 000
+/// packets/s and the summary reports `14% of the 200000/s cap`, with **zero
+/// failures**. Read without help, that is the most dangerous line the tool can
+/// print — it looks exactly like a target absorbing 86% of the offered load,
+/// when in fact the load was never offered.
+///
+/// The inference is deliberately narrow. Nothing failed, so nothing was refused,
+/// reset or timed out; there is no concurrency ceiling that could have throttled
+/// dispatch; and the run was not cut short. With every external explanation
+/// eliminated, what remains is the generator's own pacing limit — so the note
+/// states the achieved rate as the *real* offered load and tells the operator not
+/// to credit the target with the difference.
+fn generator_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) -> Option<String> {
+    // An in-flight ceiling is a better explanation, and `concurrency_bound_note`
+    // owns that case.
+    if ctx.concurrency.is_some() || ctx.rate_per_sec == 0 || effective <= 0.0 {
+        return None;
+    }
+    // Any failure at all means the breakdown above is the story; do not talk over
+    // it with an inference that assumes a clean run.
+    if report.errors > 0 {
+        return None;
+    }
+    // A run stopped early is short for a reason the outcome line already gives.
+    if report.aborted_early || report.knee.is_some() {
+        return None;
+    }
+    let cap = ctx.rate_per_sec as f64;
+    // Within reach of the cap: the pacer delivered what was asked, which is the
+    // healthy case and needs no explanation.
+    if effective >= cap * 0.9 {
+        return None;
+    }
+    Some(format!(
+        "the generator, not the target: nothing failed and there was no in-flight \
+         ceiling, so {effective:.0}/s is what this host could emit — the shortfall \
+         against the {}/s cap is jinrai's own limit, NOT load the target absorbed. \
+         Treat {effective:.0}/s as the load actually offered",
         ctx.rate_per_sec
     ))
 }
@@ -616,6 +669,78 @@ mod tests {
         let r = RunReport { units_sent: 900, p50_micros: 0, ..Default::default() };
         let out = render_summary(&r, &RunContext { concurrency: Some(4), ..ctx_l4() }, None);
         assert!(!out.contains("bound by"), "{out}");
+    }
+
+    /// The most dangerous line the tool can print: a huge cap, a low percentage
+    /// and **zero failures**, which reads exactly like a target absorbing the
+    /// difference. Real numbers from a UDP flood on loopback: 200 000/s asked
+    /// for, ~27 800/s delivered, nothing failed.
+    #[test]
+    fn summary_names_the_generator_when_nothing_else_can_explain_the_shortfall() {
+        let r = RunReport {
+            layer_label: "L4 udp-flood".into(),
+            units_sent: 83_304,
+            ..Default::default()
+        };
+        let c = RunContext {
+            mode: "udp-flood".into(),
+            rate_per_sec: 200_000,
+            planned: Duration::from_secs(3),
+            elapsed: Duration::from_secs(3),
+            ..ctx_l4()
+        };
+        let out = render_summary(&r, &c, None);
+        assert!(out.contains("bound by"), "{out}");
+        assert!(out.contains("the generator, not the target"), "{out}");
+        // The achieved rate restated as the real offered load, and the explicit
+        // instruction not to credit the target with the gap.
+        assert!(out.contains("27768/s is what this host could emit"), "{out}");
+        assert!(out.contains("NOT load the target absorbed"), "{out}");
+    }
+
+    /// A run that delivered its cap needs no explaining.
+    #[test]
+    fn summary_stays_quiet_when_the_generator_kept_up() {
+        let r = RunReport { units_sent: 100_000, ..Default::default() };
+        let c = RunContext { rate_per_sec: 10_000, ..ctx_l4() };
+        let out = render_summary(&r, &c, None);
+        assert!(!out.contains("bound by"), "{out}");
+    }
+
+    /// With failures on the board the errno breakdown is the story. The
+    /// generator note assumes a clean run, so it must not talk over it.
+    #[test]
+    fn generator_note_defers_to_the_failure_breakdown() {
+        use jinrai_core::{ErrnoBucket, ErrnoTally};
+        let mut errno = ErrnoTally::default();
+        errno.record(ErrnoBucket::Econnrefused);
+        let r = RunReport {
+            units_sent: 900,
+            errors: errno.total(),
+            errno,
+            ..Default::default()
+        };
+        let out = render_summary(&r, &ctx_l4(), None);
+        assert!(!out.contains("the generator, not the target"), "{out}");
+    }
+
+    /// An aborted run is short for a reason the outcome line already gives.
+    #[test]
+    fn generator_note_stays_quiet_on_an_aborted_run() {
+        let r = RunReport { units_sent: 900, aborted_early: true, ..Default::default() };
+        let out = render_summary(&r, &ctx_l4(), None);
+        assert!(!out.contains("the generator, not the target"), "{out}");
+    }
+
+    /// Where there *is* an in-flight ceiling, that is the better explanation and
+    /// the two notes must not both fire.
+    #[test]
+    fn concurrency_note_wins_over_the_generator_note() {
+        let r = RunReport { units_sent: 3204, p50_micros: 3_000, ..Default::default() };
+        let c = RunContext { concurrency: Some(1), ..ctx_l4() };
+        let out = render_summary(&r, &c, None);
+        assert!(out.contains("concurrency, not the target"), "{out}");
+        assert!(!out.contains("the generator, not the target"), "{out}");
     }
 
     fn ctx_l4() -> RunContext {
