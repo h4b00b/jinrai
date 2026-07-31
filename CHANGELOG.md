@@ -14,6 +14,63 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-07-31
+
+The L3/L4 pacer no longer lets `thread::sleep` decide the rate.
+
+`--rate 200000` on a UDP flood delivered **28 769/s — 14% of the cap**. Not
+because the target or the network pushed back (nothing failed), but because the
+pacer emitted one packet per `thread::sleep`, and a sleep cannot resolve the 5 µs
+interval that rate implies: every nap overshot by an order of magnitude and the
+*sleep granularity*, not `--rate`, set the pace.
+
+The same run now delivers **199 969/s — 100% of the cap**, and the ceiling has
+moved from ~29 k/s to **~589 k/s**, where the limit is the cost of one send
+syscall per packet: a real property of the host rather than an artefact of how
+the loop was written.
+
+| `--rate` | before | after |
+|---|---|---|
+| 20 000/s | 16 986/s (85%) | **19 998/s (100%)** |
+| 200 000/s | 28 769/s (14%) | **199 969/s (100%)** |
+| ceiling | ~29 000/s | **~589 000/s** |
+
+### Changed
+
+- **Below one millisecond per unit, the tick replaces the unit as the scheduling
+  quantum.** The pacer emits `batch` units back-to-back and then sleeps off the
+  rest of the tick, with `batch` chosen so that `batch / tick` is exactly the
+  requested rate. Above one millisecond per unit nothing changes — the pacer
+  still sleeps once per unit, as it always did.
+
+  **`--rate` remains a hard ceiling.** No window of one tick or longer ever
+  carries more than the cap authorises; there is a test asserting the arithmetic
+  holds to within 0.1% across four decades of rate. The trade is explicit: within
+  a single tick the units leave as fast as the syscalls go, so a batch is a burst
+  of at most one millisecond of traffic — declared rather than accidental, and
+  the shape any rate-limited generator takes once the requested rate exceeds what
+  per-unit pacing can deliver.
+
+  The deadline and the kill-switch are re-checked **inside** the batch, so a
+  large `--rate` cannot buy traffic past `--duration` and Ctrl-C does not wait
+  for the batch to drain. Verified: a 1 s run at `--rate 5000000` still returns
+  in 1.01 s.
+
+### Not changed, and why
+
+The **L7 pacer was measured and left alone.** It has the same one-unit-per-tick
+shape, but it paces on `tokio::time::interval`, whose timer resolves sub-
+millisecond intervals far better than `thread::sleep` does: against a fast
+keep-alive target the fast flood holds **100% of its cap to 20 000 req/s**, and
+what breaks down past that is the sockets (54% failures), not the pacing. There
+was no artefact to remove.
+
+**Multi-threaded L3/L4 emission was considered and rejected.** With the batching
+fix the ceiling is the send-syscall rate at ~589 k packets/s, far past what a lab
+exercise calls for; parallelising the sender would chase diminishing returns
+against that floor while adding per-thread sockets, tally merging and abort
+coordination to the crate that most needs to stay auditable.
+
 ## [0.25.0] — 2026-07-31
 
 The run summary now names **the generator** when the generator was the limit.
@@ -950,7 +1007,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/h4b00b/jinrai/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/h4b00b/jinrai/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/h4b00b/jinrai/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/h4b00b/jinrai/compare/v0.22.0...v0.23.0

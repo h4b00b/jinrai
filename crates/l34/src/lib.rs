@@ -492,9 +492,14 @@ impl L34Engine {
         let mut aborted = false;
         let mut idx = 0usize;
 
+        // How many units share one tick, and how long that tick lasts. Below the
+        // resolution a sleep can actually deliver, one-unit-per-sleep makes the
+        // *sleep* set the rate instead of `--rate`; see `batch_for`.
+        let (batch, tick) = batch_for(interval);
+
         let start = Instant::now();
         let mut next = start;
-        while start.elapsed() < plan.duration {
+        'run: while start.elapsed() < plan.duration {
             if plan.kill.is_tripped() {
                 aborted = true;
                 break;
@@ -504,14 +509,30 @@ impl L34Engine {
             // this is a no-op.
             sender.reap(&mut tally);
 
-            let ip = ips[idx % ips.len()];
-            idx += 1;
-            match sender.send(ip, self.config.port, &mut tally) {
-                Ok(e) => tally.record(e),
-                Err(_) => tally.record(Emission::Failed(ErrnoBucket::Internal)),
+            // Emit this tick's units back-to-back, then sleep off the remainder
+            // of the tick. The ceiling is exact: at most `batch` units leave per
+            // `tick`, and `batch / tick == --rate` by construction.
+            for _ in 0..batch {
+                let ip = ips[idx % ips.len()];
+                idx += 1;
+                match sender.send(ip, self.config.port, &mut tally) {
+                    Ok(e) => tally.record(e),
+                    Err(_) => tally.record(Emission::Failed(ErrnoBucket::Internal)),
+                }
+                // A batch is a burst by design, so the deadline and the abort
+                // signal are re-checked inside it: a large `--rate` must not buy
+                // extra traffic past `--duration`, and Ctrl-C must not wait for
+                // the batch to drain.
+                if start.elapsed() >= plan.duration {
+                    break 'run;
+                }
+                if plan.kill.is_tripped() {
+                    aborted = true;
+                    break 'run;
+                }
             }
 
-            next += interval;
+            next += tick;
             let now = Instant::now();
             if next > now {
                 if interruptible_sleep(next - now, plan) {
@@ -1205,6 +1226,49 @@ fn icmp_checksum(data: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// The shortest tick worth sleeping on.
+///
+/// `thread::sleep` cannot resolve arbitrarily small durations: the syscall plus
+/// the scheduler round-trip costs tens of microseconds, so asking for a 5 µs nap
+/// yields something nearer 50 µs. One millisecond is comfortably above that floor
+/// on every platform jinrai targets, while still being a fine enough quantum that
+/// a batch is a millisecond of traffic rather than a visible slug.
+const MIN_TICK: Duration = Duration::from_millis(1);
+
+/// How many units to emit per tick, and how long that tick lasts, for a given
+/// per-unit interval.
+///
+/// One unit per sleep works while the interval is longer than a sleep can
+/// resolve. Below that the sleep, not `--rate`, sets the pace: at `--rate 200000`
+/// the interval is 5 µs, every nap overshoots by an order of magnitude, and the
+/// run tops out near 29 k/s while the summary reports "14% of the 200000/s cap" —
+/// a shortfall the operator can easily read as absorbed load.
+///
+/// So below [`MIN_TICK`] the *tick*, not the unit, becomes the scheduling
+/// quantum: emit `batch` units back-to-back, then sleep off the rest of the tick.
+/// The ceiling stays exact — `batch / tick` is the requested rate by
+/// construction, and no window of one tick or longer ever carries more than the
+/// cap allows.
+///
+/// The trade is deliberate and bounded: within a tick the units leave as fast as
+/// the syscalls go. That burst is at most one millisecond of traffic, it is
+/// declared rather than accidental, and it is the same shape any rate-limited
+/// generator produces once the requested rate exceeds what per-unit pacing can
+/// deliver.
+fn batch_for(interval: Duration) -> (u64, Duration) {
+    if interval >= MIN_TICK {
+        return (1, interval);
+    }
+    // interval > 0 here: a zero rate never reaches this code (`min_interval`
+    // returns `None` and the run ends before a socket is opened).
+    let batch = MIN_TICK.as_nanos().div_ceil(interval.as_nanos()).max(1);
+    let batch = u64::try_from(batch).unwrap_or(u64::MAX);
+    // Derive the tick from the batch rather than reusing MIN_TICK, so
+    // `batch / tick` is exactly the requested rate even when the division above
+    // rounded up.
+    (batch, interval * u32::try_from(batch).unwrap_or(u32::MAX))
 }
 
 /// Sleep for `dur` but wake early (and return `true`) if the kill switch trips,
@@ -2057,5 +2121,90 @@ mod tests {
 
         let mut buf = [0u8; 64];
         assert!(listener.recv_from(&mut buf).is_ok(), "listener should receive at least one datagram");
+    }
+
+    /// The batching arithmetic, which is what keeps `--rate` a hard ceiling.
+    #[test]
+    fn batching_holds_the_requested_rate_exactly() {
+        // Rates a sleep can pace one unit at a time are left alone.
+        for per_sec in [1u64, 10, 100, 1000] {
+            let interval = RateCap::new(per_sec).min_interval().unwrap();
+            let (batch, tick) = batch_for(interval);
+            assert_eq!(batch, 1, "{per_sec}/s should not batch");
+            assert_eq!(tick, interval, "{per_sec}/s tick should be the interval");
+        }
+
+        // Above that, the tick becomes the quantum — and `batch / tick` must
+        // still be the requested rate, or the cap would be a lie in either
+        // direction.
+        for per_sec in [2_000u64, 20_000, 200_000, 1_000_000] {
+            let interval = RateCap::new(per_sec).min_interval().unwrap();
+            let (batch, tick) = batch_for(interval);
+            assert!(batch > 1, "{per_sec}/s should batch");
+            assert!(tick >= MIN_TICK, "{per_sec}/s tick {tick:?} must be sleepable");
+            let effective = batch as f64 / tick.as_secs_f64();
+            let drift = (effective - per_sec as f64).abs() / per_sec as f64;
+            assert!(
+                drift < 0.001,
+                "{per_sec}/s batches to {batch} per {tick:?} = {effective:.1}/s"
+            );
+        }
+    }
+
+    /// The point of the batching: a rate whose per-unit interval is far below
+    /// what a sleep can resolve must actually be delivered, not silently capped
+    /// at the sleep granularity.
+    ///
+    /// One unit per `thread::sleep` tops out near 30k/s regardless of `--rate`,
+    /// so this asserts a floor an unbatched pacer cannot reach.
+    #[test]
+    fn high_rate_udp_flood_is_not_capped_by_sleep_granularity() {
+        let _fd = fd_guard();
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
+        let requested = 200_000u64;
+        let secs = 2u64;
+        let report = engine.execute(&plan(vec![t], requested, secs));
+
+        assert_eq!(report.errors, 0, "loopback UDP should not fail: {:?}", report.errno);
+        // Deliberately well under the requested rate: this asserts the sleep
+        // ceiling is gone, not that any particular host reaches 200k/s.
+        let floor = 60_000 * secs;
+        assert!(
+            report.units_sent > floor,
+            "sent {} in {secs}s at a {requested}/s cap — an unbatched pacer tops \
+             out near 30k/s, so this should clear {floor}",
+            report.units_sent
+        );
+        // And the ceiling still holds: a batch may burst within its tick, but the
+        // run as a whole must never exceed what --rate authorised.
+        let ceiling = requested * secs;
+        assert!(
+            report.units_sent <= ceiling,
+            "sent {} which exceeds the {requested}/s cap over {secs}s ({ceiling})",
+            report.units_sent
+        );
+    }
+
+    /// A batch is a burst, so the run must still stop at `--duration` rather than
+    /// finishing the batch it happens to be in.
+    #[test]
+    fn a_high_rate_run_still_ends_on_time() {
+        let _fd = fd_guard();
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
+        let wall = Instant::now();
+        let _ = engine.execute(&plan(vec![t], 500_000, 1));
+        let elapsed = wall.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1400),
+            "a 1s run at 500000/s took {elapsed:?}"
+        );
     }
 }

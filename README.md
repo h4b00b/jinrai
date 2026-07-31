@@ -397,12 +397,18 @@ is *why*, because two of the three reasons say nothing at all about the target:
 | `the generator, not the target` | this host could not emit any faster — nothing failed and no ceiling applied | treat the achieved rate as the real offered load; run from more hosts if you need more |
 | *(nothing printed)* | the run had the headroom and still fell short, or it got within 90% of the cap | **this one is about the target** — read it as a finding |
 
-The stateless floods (`udp`, the raw flag/anomaly floods, `icmp*`) pace one unit
-at a time and top out in the tens of thousands per second regardless of what
-`--rate` will accept, so the second row is the common case for them. The
-generator note is deliberately narrow: it appears only when nothing failed, no
-in-flight ceiling applied, and the run ran to completion — with any failure on
+The generator note is deliberately narrow: it appears only when nothing failed,
+no in-flight ceiling applied, and the run ran to completion — with any failure on
 the board the errno breakdown is the story instead.
+
+**Where the ceiling actually is.** On a modern host the stateless floods sustain
+roughly **half a million packets/second**, bounded by the cost of one send
+syscall per packet; the fast L7 flood holds its cap to around **20 000
+requests/second** before the sockets, not the pacer, become the limit. Both are
+well beyond what a lab test normally needs, so if a run reports `bound by the
+generator` at a rate below those figures, look for a local cause first — a busy
+testing host, a tiny `--payload-size` inflating the syscall count, or a `--rate`
+set higher than the exercise actually calls for.
 
 ## The audit log
 
