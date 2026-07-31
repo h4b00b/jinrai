@@ -16,8 +16,25 @@
 //! This gives **tamper-evidence**, not cryptographic non-repudiation: an actor
 //! who can rewrite the whole file can recompute a fresh consistent chain. Closing
 //! that gap needs a secret key (HMAC) or external anchoring and is out of scope
-//! here; the chain defeats casual edits, truncation, and selective deletion,
-//! which is what an on-host audit log is realistically up against.
+//! here; the chain defeats casual edits, mid-file deletion, reordering and
+//! insertion, which is what an on-host audit log is realistically up against.
+//!
+//! ## What it does *not* catch: a truncated tail
+//!
+//! Deleting the last *k* records leaves a chain that still verifies perfectly,
+//! and this is unavoidable in a self-contained file: a record can only link
+//! *backwards*, so nothing in what remains says how much came after it. Worse,
+//! [`AuditLog::open`] resumes from whatever record it finds last, chaining new
+//! entries onto the truncated tail — after which the gap is invisible even to a
+//! careful reader.
+//!
+//! So the property to rely on is precise: **the records still present are
+//! trustworthy and in order; their absence is not proven.** Detecting a truncated
+//! tail needs an anchor the local file cannot supply — shipping each record to
+//! syslog / a remote collector, or recording the high-water `seq` somewhere the
+//! same actor cannot reach. `--verify-audit` therefore reports the sequence range
+//! it found rather than only "INTACT", so an operator with an expectation about
+//! how many runs happened can notice the difference.
 //!
 //! The format is deliberately plain JSONL so it stays greppable / `jq`-able and
 //! needs no bespoke reader.
@@ -329,11 +346,18 @@ impl AuditLog {
             Err(e) => return Err(AuditError::io(&path, e)),
         };
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| AuditError::io(&path, e))?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // The log names every target a run was pointed at, and who pointed it.
+        // On a shared host the default umask would leave that world-readable; a
+        // file created for accountability should not be one anybody can read.
+        // (Only applies at creation — an existing log keeps its own mode.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path).map_err(|e| AuditError::io(&path, e))?;
 
         Ok(Self {
             file,
@@ -349,10 +373,16 @@ impl AuditLog {
         &self.path
     }
 
-    /// Append one record for `event`, extending the hash chain, and flush it to
-    /// disk before returning. A failure here is surfaced to the caller so an
+    /// Append one record for `event`, extending the hash chain, and get it onto
+    /// the disk before returning. A failure here is surfaced to the caller so an
     /// operator can treat "could not record the audit trail" as a reason to
     /// abort rather than emit untracked traffic.
+    ///
+    /// The `sync_data` is the point: `flush` only pushes the bytes out of the
+    /// process's buffer into the OS page cache, which a crash or a power loss
+    /// still discards — and the records worth having are exactly the ones written
+    /// just before a machine went down mid-run. Audit volume is a handful of lines
+    /// per run, so paying for durability per record costs nothing that matters.
     pub fn record(&mut self, event: &AuditEvent) -> Result<(), AuditError> {
         let ts_unix = now_unix();
         // Body = everything except the trailing hash field. The hash is computed
@@ -374,6 +404,9 @@ impl AuditLog {
             .map_err(|e| AuditError::io(&self.path, e))?;
         self.file
             .flush()
+            .map_err(|e| AuditError::io(&self.path, e))?;
+        self.file
+            .sync_data()
             .map_err(|e| AuditError::io(&self.path, e))?;
 
         self.seq += 1;

@@ -102,6 +102,42 @@ mod tests {
         }
     }
 
+    /// Rates that do not divide a second evenly cannot be paced exactly, because
+    /// the interval is a whole number of nanoseconds. What must still hold is the
+    /// *direction* of the residual error: the cap is approached from below and
+    /// never breached. (Float division rounded to nearest instead, so 3M/s paced
+    /// at 333ns and delivered 3.003M/s — above the ceiling the operator set.)
+    #[test]
+    fn awkward_rates_stay_under_the_ceiling() {
+        // Rates chosen where one nanosecond of rounding is still well under 1%;
+        // past ~10M/s the quantum itself dominates and only the ceiling holds.
+        for per_sec in [999_999u64, 3_000_000, 7_000_000] {
+            let interval = RateCap::new(per_sec).min_interval().unwrap();
+            let (batch, tick) = batch_for(interval);
+            let effective = batch as f64 / tick.as_secs_f64();
+            assert!(
+                effective <= per_sec as f64,
+                "{per_sec}/s batches to {batch} per {tick:?} = {effective:.1}/s, over the cap"
+            );
+            assert!(
+                effective > per_sec as f64 * 0.99,
+                "{per_sec}/s delivers only {effective:.1}/s — the shortfall is not rounding"
+            );
+        }
+    }
+
+    /// A `--rate` far above anything a machine can emit must still produce a
+    /// runnable schedule. Before the interval was floored at 1ns this divided by
+    /// zero, killing the process after the raw socket was already open.
+    #[test]
+    fn an_absurd_rate_paces_instead_of_panicking() {
+        for per_sec in [2_000_000_001u64, 10_000_000_000, u64::MAX] {
+            let interval = RateCap::new(per_sec).min_interval().unwrap();
+            let (batch, tick) = batch_for(interval);
+            assert!(batch > 0 && tick >= MIN_TICK, "{per_sec}/s must yield a sleepable tick");
+        }
+    }
+
     /// A tripped kill-switch must be noticed without waiting out the sleep.
     #[test]
     fn a_tripped_kill_switch_cuts_the_sleep_short() {

@@ -49,7 +49,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
+use jinrai_core::{Layer, ModuleError, RunPlan, RunReport, StressModule};
 use jinrai_safety::{Authorization, AuthorizedTarget, KillSwitch};
 
 use crate::h2_frames::{
@@ -178,12 +178,10 @@ impl H2StreamFloodEngine {
         Ok(Prepared { addr, https, host, tls })
     }
 
-    fn refusal_report(&self, e: L7Error) -> RunReport {
-        RunReport {
-            layer_label: format!("L7 {} REFUSED: {e}", self.kind.label()),
-            aborted_early: true,
-            ..Default::default()
-        }
+    /// This primitive could not start. See [`crate::module_error`] for why the
+    /// distinction between a refusal and a setup failure is kept.
+    fn refusal(&self, e: L7Error) -> ModuleError {
+        crate::module_error(format!("L7 {}", self.kind.label()), e)
     }
 }
 
@@ -212,24 +210,24 @@ impl StressModule for H2StreamFloodEngine {
         self.kind.label()
     }
 
-    fn execute(&mut self, plan: &RunPlan) -> RunReport {
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
         let Prepared { addr, https, host, tls } = match self.prepare() {
             Ok(p) => p,
-            Err(e) => return self.refusal_report(e),
+            Err(e) => return Err(self.refusal(e)),
         };
 
         // Rate cap: min spacing between units. `None` => send nothing.
         let Some(interval) = plan.rate_cap.min_interval() else {
-            return RunReport {
+            return Ok(RunReport {
                 layer_label: format!("L7 {} {} (rate cap 0 — sent nothing)", self.kind.label(), self.url),
                 aborted_early: false,
                 ..Default::default()
-            };
+            });
         };
 
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
-            Err(e) => return self.refusal_report(L7Error::Client(e.to_string())),
+            Err(e) => return Err(self.refusal(L7Error::Client(e.to_string()))),
         };
 
         let sent = Arc::new(AtomicU64::new(0));
@@ -242,7 +240,7 @@ impl StressModule for H2StreamFloodEngine {
         let plan_bits = FloodBits::build(kind, &host, https);
 
         rt.block_on(async move {
-            let deadline = Instant::now() + duration;
+            let deadline = crate::deadline_in(duration);
             let tcp = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
                 Ok(Ok(s)) => s,
                 _ => {
@@ -276,7 +274,7 @@ impl StressModule for H2StreamFloodEngine {
 
         let aborted = plan.kill.is_tripped();
         let n = sent.load(Ordering::Relaxed);
-        RunReport {
+        Ok(RunReport {
             layer_label: format!(
                 "L7 {} {} ({} {}{})",
                 self.kind.label(),
@@ -289,7 +287,7 @@ impl StressModule for H2StreamFloodEngine {
             errors: errors.load(Ordering::Relaxed),
             aborted_early: aborted,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -397,12 +395,20 @@ async fn drive<IO>(
         }
 
         // A write failure means the peer tore the connection down (e.g. it bounds
-        // resets / header memory and closed) — record and stop.
-        if io.write_all(&frame).await.is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
-            break;
+        // resets / header memory and closed) or stopped reading — record and stop.
+        // The write is raced against the kill switch and the deadline: these
+        // primitives aim to exhaust the server, so a peer that stops draining is
+        // the expected outcome, not an edge case.
+        match crate::write_or_stop(&mut io, &frame, &kill, deadline).await {
+            crate::FrameWrite::Wrote => {
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::FrameWrite::Failed => {
+                errors.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            crate::FrameWrite::Stopped => break,
         }
-        sent.fetch_add(1, Ordering::Relaxed);
     }
 
     let _ = io.shutdown().await;
@@ -507,7 +513,7 @@ mod tests {
             duration: Duration::from_millis(50),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         assert_eq!(report.units_sent, 0);
         assert!(!report.aborted_early);
         assert!(report.layer_label.contains("sent nothing"));
@@ -578,7 +584,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         thread::sleep(Duration::from_millis(100));
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -601,7 +607,7 @@ mod tests {
             duration: Duration::from_millis(400),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         thread::sleep(Duration::from_millis(100));
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();

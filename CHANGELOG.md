@@ -14,6 +14,97 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-07-31
+
+Hardening pass over the operator-input surface, from an external code review. The
+safety model itself held up — no allowlist bypass, no spoofing path, no way to
+forge an `AuthorizedTarget` — but extreme values of `--rate`, `--duration`,
+`--concurrency` and `--ramp-steps` reached panics, unbounded allocations and a
+breached rate ceiling, and several failures could report themselves as clean runs.
+
+### Fixed
+
+- **`--rate` is a ceiling again, and an absurd one no longer kills the process.**
+  The per-unit interval came from `Duration::from_secs_f64(1.0 / rate)`, which
+  rounds to *nearest*: at 3 000 000/s the exact 333.33ns became 333ns, pacing
+  3 003 003/s — half a percent above the declared hard ceiling — and above
+  ~2×10⁹/s it rounded all the way to zero. A zero interval is a division by zero
+  in the L3/L4 batcher and a panic inside `tokio::time::interval`, so a
+  fat-fingered `--rate` killed the process mid-run with the raw socket already
+  open. It is now an integer ceiling division floored at 1ns: rounding can only
+  ever under-deliver, which is the side a safety ceiling must err on.
+- **A spike no longer stretches the run past `--duration`.** `--profile spike`
+  passed the full duration as the baseline total and then added `--spike-secs` on
+  top, so `--duration 30 --spike-secs 10` generated 40 seconds of traffic. The
+  spike is now carved out of the window, and the L7 engine additionally clamps the
+  cumulative stage deadlines to `plan.duration`, so the promise holds regardless
+  of what a caller hands it.
+- **The raw HTTP/2 engines can no longer be pinned open by the target.** Their
+  frame writes sat outside the `select!`: on a peer that stops reading — the state
+  several of these primitives exist to induce — `write_all` pends forever, past
+  `--duration` and deaf to Ctrl-C, which put the *server* in charge of when a run
+  ends. Writes are now raced against the kill switch and the deadline, with a
+  5-second stall timeout that reports a wedged connection instead of sitting on
+  it. `h2-rapid-reset`'s wait for a stream slot got the same treatment.
+- **SIGTERM stops a run gracefully.** Only SIGINT was hooked, so `systemctl stop`,
+  `docker stop` and a Kubernetes eviction — i.e. every way an unattended run is
+  actually stopped — killed the process outright: no drain, and no `RunCompleted`
+  record in the audit log.
+- **Numeric flags are bounded at the front door.** `--rate`, `--duration`,
+  `--concurrency`, `--slow-connections`, `--max-connections`, `--ramp-steps`,
+  `--ramp-start` and `--spike-secs` are refused with a named limit instead of
+  reaching a capacity-overflow abort (`--concurrency` is an allocation size),
+  a ~100 GB `Vec` of ramp stages, or an `Instant` overflow panic. `--drip-ms 0`
+  and `--slow-connections 0` are refused too: the first turns a slow attack into
+  an unpaced write flood, the second reports a clean run that held nothing.
+- **A dead route no longer reports as a completed run.** In L3/L4 a structural
+  send failure (no route, an address family the primitive cannot build for) was
+  bucketed as `Internal` *per packet*, producing a "completed" run with 100%
+  misattributed errors — the hollow-success shape `check_targets` exists to
+  prevent. The first such error now ends the run as the failure it is.
+
+### Changed
+
+- **`StressModule::execute` returns `Result<RunReport, ModuleError>`.** A module
+  could previously only report, so every failure had to be dressed up as a run: a
+  missing `CAP_NET_RAW` became "0 units sent, aborted early", indistinguishable in
+  the audit log from a deliberate `--rate 0` or an operator's Ctrl-C. Failures are
+  now recorded as `RunRefused` with their stage and cause, `aborted_early` means
+  only what it says, and the eight near-identical `refusal_report` helpers are
+  gone.
+
+### Security
+
+- **Refusals decided before the gate are audited.** A malformed or empty
+  `--allow`, a missing `--ack-l34-lab`, a missing `--target` / `--port` / `--url`
+  all returned without a record even with the log open, while authorization and
+  preflight refusals were audited — an inconsistent trail on exactly the events a
+  reviewer looks for.
+- **Audit records are durable and private.** `flush` only moved bytes into the OS
+  page cache, which a crash discards — precisely losing the records written just
+  before a machine went down. Each record is now `sync_data`'d, and a newly
+  created log is `0600` rather than whatever the umask allowed, since it names
+  every target a run was pointed at and who pointed it.
+- **The audit log stops overclaiming.** The docs said the hash chain defeats
+  truncation; it does not, and cannot — a record links only backwards, so deleting
+  the last *k* records leaves a chain that verifies perfectly, and reopening the
+  log chains onto the truncated tail. The limitation is now documented, and
+  `--verify-audit` reports the sequence range it found with an explicit note,
+  instead of a bare "INTACT" that reads like proof of completeness.
+
+### Tests
+
+- Boundary tests for the pacing interval: no non-zero rate yields a zero interval
+  (up to `u64::MAX`), no rate paces above its cap, and awkward rates that cannot
+  divide a second evenly approach the ceiling only from below.
+- CLI tests for every new limit, for the zero-valued flags, and for the spike
+  fitting exactly inside `--duration`.
+- `scripts/demo_gate.sh` now asserts *why* each case failed, not just that it
+  did — cases 1 and 2 were exiting 1 for a missing `--url`, demonstrating the
+  argument parser rather than the gate. `scripts/verify_criteria.sh` passes
+  `--output line`, the format it has always parsed, instead of silently printing
+  a table of zeros.
+
 ## [0.30.0] — 2026-07-31
 
 ### Added
@@ -1200,7 +1291,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/h4b00b/jinrai/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/h4b00b/jinrai/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/h4b00b/jinrai/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/h4b00b/jinrai/compare/v0.27.0...v0.28.0

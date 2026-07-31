@@ -35,7 +35,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use jinrai_core::{Layer, RunPlan, RunReport, StressModule};
+use jinrai_core::{Layer, ModuleError, RunPlan, RunReport, StressModule};
 use jinrai_safety::{Authorization, AuthorizedTarget};
 
 use crate::{authorize_datum, resolve_addrs, wait_for_kill, L7Error};
@@ -62,10 +62,13 @@ impl TlsHandshakeEngine {
         let datum = authorize_datum(&self.gate, &self.url)?;
         // https-only: a plaintext target has no handshake to flood. Fail-closed.
         if datum.url.scheme() != "https" {
-            return Err(L7Error::Client(
-                "tls-handshake flood requires an https URL (there is no TLS handshake on http)"
-                    .to_string(),
-            ));
+            // A scheme refusal, not a client-build failure: this is jinrai
+            // declining what was asked for, and the audit log records the two
+            // under different stages.
+            return Err(L7Error::UnsupportedScheme(format!(
+                "{} — the tls-handshake flood needs https (there is no TLS handshake on http)",
+                datum.url.scheme()
+            )));
         }
         let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
         let connector = TlsConnector::from(crate::tls::client_config(vec![])?);
@@ -73,12 +76,10 @@ impl TlsHandshakeEngine {
         Ok(Prepared { addr, connector, server_name })
     }
 
-    fn refusal_report(&self, e: L7Error) -> RunReport {
-        RunReport {
-            layer_label: format!("L7 tls-handshake REFUSED: {e}"),
-            aborted_early: true,
-            ..Default::default()
-        }
+    /// This primitive could not start. See [`crate::module_error`] for why the
+    /// distinction between a refusal and a setup failure is kept.
+    fn refusal(&self, e: L7Error) -> ModuleError {
+        crate::module_error("L7 tls-handshake".to_string(), e)
     }
 }
 
@@ -97,24 +98,24 @@ impl StressModule for TlsHandshakeEngine {
         "l7-tls-handshake"
     }
 
-    fn execute(&mut self, plan: &RunPlan) -> RunReport {
+    fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
         let Prepared { addr, connector, server_name } = match self.prepare() {
             Ok(p) => p,
-            Err(e) => return self.refusal_report(e),
+            Err(e) => return Err(self.refusal(e)),
         };
 
         // Rate cap: min spacing between handshake attempts. `None` => send nothing.
         let Some(interval) = plan.rate_cap.min_interval() else {
-            return RunReport {
+            return Ok(RunReport {
                 layer_label: format!("L7 tls-handshake {} (rate cap 0 — sent nothing)", self.url),
                 aborted_early: false,
                 ..Default::default()
-            };
+            });
         };
 
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
-            Err(e) => return self.refusal_report(L7Error::Client(e.to_string())),
+            Err(e) => return Err(self.refusal(L7Error::Client(e.to_string()))),
         };
 
         let sent = Arc::new(AtomicU64::new(0));
@@ -125,7 +126,7 @@ impl StressModule for TlsHandshakeEngine {
         let duration = plan.duration;
 
         rt.block_on(async move {
-            let deadline = Instant::now() + duration;
+            let deadline = crate::deadline_in(duration);
             let mut ticker = tokio::time::interval(interval);
             // Never exceed the cap: on a missed tick, delay rather than burst.
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -161,7 +162,7 @@ impl StressModule for TlsHandshakeEngine {
 
         let aborted = plan.kill.is_tripped();
         let n = sent.load(Ordering::Relaxed);
-        RunReport {
+        Ok(RunReport {
             layer_label: format!(
                 "L7 tls-handshake {} ({} handshake{})",
                 self.url,
@@ -172,7 +173,7 @@ impl StressModule for TlsHandshakeEngine {
             errors: errors.load(Ordering::Relaxed),
             aborted_early: aborted,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -236,10 +237,12 @@ mod tests {
             duration: Duration::from_millis(100),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
-        assert_eq!(report.units_sent, 0);
-        assert!(report.aborted_early);
-        assert!(report.layer_label.contains("REFUSED"), "label: {}", report.layer_label);
+        match engine.execute(&plan) {
+            Err(ModuleError::Refused(msg)) => {
+                assert!(msg.contains("needs https"), "got: {msg}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -252,7 +255,7 @@ mod tests {
             duration: Duration::from_millis(50),
             kill: KillSwitch::new(),
         };
-        let report = engine.execute(&plan);
+        let report = engine.execute(&plan).expect("the run should execute");
         assert_eq!(report.units_sent, 0);
         assert!(!report.aborted_early);
         assert!(report.layer_label.contains("sent nothing"));

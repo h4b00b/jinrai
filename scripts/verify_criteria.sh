@@ -12,7 +12,11 @@ cd "$(dirname "$0")/.."
 . "$HOME/.cargo/env"
 
 BIN=target/release/jinrai
-GATE=(--layer l4 --l4-mode tcp --allow 127.0.0.0/8 --target 127.0.0.1 --ack-l34-lab)
+# `--output line` is not cosmetic here: every check below parses the single
+# `[L4 ...] sent=... errors=... latency_us(...) errno(...)` summary line, which
+# only the line format emits. Without it the greps match nothing and the script
+# prints a confident table of zeros instead of failing.
+GATE=(--layer l4 --l4-mode tcp --allow 127.0.0.0/8 --target 127.0.0.1 --ack-l34-lab --output line)
 PORT=${PORT:-19600}
 cargo build --offline --release -q || exit 1
 
@@ -40,6 +44,12 @@ flood_with_fds() {  # <jinrai args...>
 }
 
 report() {
+  # A missing summary line means the run failed or the output format moved.
+  # Say so — silently printing nothing reads like a clean run.
+  if ! grep -qE '^\[L4' /tmp/J.log; then
+    echo "  !! no [L4 ...] summary line; last lines of the run:"
+    tail -3 /tmp/J.log | sed 's/^/  !  /'
+  fi
   grep -E '^\[L4|^fd ceiling' /tmp/J.log | sed 's/^/  | /'
   if [ -s /tmp/F.log ]; then
     echo "  fd samples: $(tr '\n' ' ' < /tmp/F.log)"
@@ -83,6 +93,9 @@ for rate in 50 100 200 400 800 1600; do
     > /tmp/J.log 2>&1
   listen_down
   line=$(grep '^\[L4' /tmp/J.log)
+  # Fail loudly rather than reporting 0/0/0%: an unparsed summary means the
+  # output format moved, not that the tool sent nothing.
+  [ -n "$line" ] || { echo "  !! no [L4 ...] summary line in /tmp/J.log — output format changed?"; exit 1; }
   sent=$(printf '%s' "$line" | grep -o 'sent=[0-9]*' | cut -d= -f2)
   errs=$(printf '%s' "$line" | grep -o 'errors=[0-9]*' | cut -d= -f2)
   lat=$(printf '%s' "$line" | grep -o 'latency_us([^)]*)')
