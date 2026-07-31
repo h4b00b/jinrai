@@ -184,10 +184,15 @@ OPTIONS:
                           --duration is only wall-clock length. Once N are open,
                           admitting a new attempt closes the oldest connection.
                           For l4-mode tcp the count covers sockets mid-handshake
-                          too, so N is also how many handshakes run in parallel:
-                          the reachable rate is about N / round-trip-time. If a
-                          run reports far less than the --rate cap, this is the
-                          knob to raise (the summary says so when it applies).
+                          too, so N is also how many handshakes run in parallel
+                          (capped at 4096 threads): the reachable rate is about
+                          N / mean-attempt-time. That mean is NOT the round-trip:
+                          an attempt that times out holds its slot for the whole
+                          --connect-timeout-ms, so once a meaningful share of
+                          attempts fail, lowering that timeout raises the
+                          reachable rate far more than raising N does. When a run
+                          falls short of the --rate cap, the summary's `bound by`
+                          line says which of the two to reach for.
     --connect-timeout-ms <MS>  How long one l4 connection attempt may stay
                           unresolved before it is abandoned and counted in the
                           `timeout` errno bucket (default: 500)
@@ -876,8 +881,11 @@ fn run_l4(
             notes,
             // Only the connect flood paces against an in-flight ceiling; the
             // stateless floods measure no latency for the bound to apply to.
+            // Report the ceiling that actually applied: the pool clamps
+            // simultaneous handshakes, so a larger --concurrency than that buys
+            // sockets, not offered load, and the note must not imply otherwise.
             concurrency: match args.l4_mode {
-                L4Mode::TcpConnect => Some(args.concurrency),
+                L4Mode::TcpConnect => Some(jinrai_l34::effective_parallelism(args.concurrency)),
                 _ => None,
             },
         },

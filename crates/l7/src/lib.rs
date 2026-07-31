@@ -550,6 +550,14 @@ impl StressModule for L7Engine {
         let s4xx = Arc::new(AtomicU64::new(0));
         let s5xx = Arc::new(AtomicU64::new(0));
         let timeouts = Arc::new(AtomicU64::new(0));
+        // Total time attempts spent holding a concurrency slot, successes and
+        // failures alike. The histogram below sees only responses that arrived,
+        // but a request that times out holds its permit for the full
+        // `--request-timeout-ms` — so it is the failures, not the completions,
+        // that decide how much load the concurrency budget could offer. Summed
+        // here because the mean is what Little's law needs; see
+        // `RunReport::mean_micros`.
+        let residency = Arc::new(AtomicU64::new(0));
         // Bounds: 1 microsecond .. 60 seconds (well above the default request
         // timeout), 3 significant figures. Explicit bounds so `saturating_record`
         // clamps only pathological values rather than a fresh histogram's tiny
@@ -594,6 +602,7 @@ impl StressModule for L7Engine {
         let s4xx_w = s4xx.clone();
         let s5xx_w = s5xx.clone();
         let timeouts_w = timeouts.clone();
+        let residency_w = residency.clone();
         let hist_w = hist.clone();
         let protos_w = protos.clone();
         let errno_w = errno.clone();
@@ -683,6 +692,7 @@ impl StressModule for L7Engine {
                     let s4xx = s4xx_w.clone();
                     let s5xx = s5xx_w.clone();
                     let timeouts = timeouts_w.clone();
+                    let residency = residency_w.clone();
                     let hist = hist_w.clone();
                     let protos = protos_w.clone();
                     let errno = errno_w.clone();
@@ -714,6 +724,7 @@ impl StressModule for L7Engine {
                         match req.send().await {
                             Ok(resp) => {
                                 let micros = started.elapsed().as_micros() as u64;
+                                residency.fetch_add(micros, Ordering::Relaxed);
                                 // A response of ANY status is a completed unit; the
                                 // status class is what tells health from failure.
                                 sent.fetch_add(1, Ordering::Relaxed);
@@ -736,6 +747,12 @@ impl StressModule for L7Engine {
                                     .saturating_record(micros);
                             }
                             Err(e) => {
+                                // A failed request held its slot too — for the full
+                                // timeout, in the case that matters most.
+                                residency.fetch_add(
+                                    started.elapsed().as_micros() as u64,
+                                    Ordering::Relaxed,
+                                );
                                 errors.fetch_add(1, Ordering::Relaxed);
                                 if e.is_timeout() {
                                     timeouts.fetch_add(1, Ordering::Relaxed);
@@ -841,10 +858,13 @@ impl StressModule for L7Engine {
             (_, _, None) => String::new(),
         };
         let label = format!("L7 {} {}{note}", self.spec.method.label(), self.spec.url);
+        let units_sent = sent.load(Ordering::Relaxed);
+        let errors = errors.load(Ordering::Relaxed);
+        let resolved = units_sent + errors;
         RunReport {
             layer_label: label,
-            units_sent: sent.load(Ordering::Relaxed),
-            errors: errors.load(Ordering::Relaxed),
+            units_sent,
+            errors,
             aborted_early: aborted,
             status_2xx: s2xx.load(Ordering::Relaxed),
             status_3xx: s3xx.load(Ordering::Relaxed),
@@ -857,6 +877,7 @@ impl StressModule for L7Engine {
             p90_micros: hist.value_at_quantile(0.9),
             p99_micros: hist.value_at_quantile(0.99),
             max_micros: hist.max(),
+            mean_micros: residency.load(Ordering::Relaxed).checked_div(resolved).unwrap_or(0),
             knee,
             http_versions,
         }
