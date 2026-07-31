@@ -14,6 +14,59 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-07-31
+
+`crates/l34` split into modules. **No behaviour change** — this is code motion.
+
+`lib.rs` had reached 2070 lines holding the mode table, the packet builders, the
+pacing, the socket senders, the connect pool, the engine and every test. It is
+the file that grows with each new L4 primitive, and it is also where the crate's
+central safety claim lives — which was the actual motivation. The no-spoofing
+guarantee is a property of a handful of functions, and those functions were
+buried in the middle of two thousand lines of engine.
+
+### Changed
+
+- **`packet.rs` — the no-spoofing surface, now readable on its own.** Everything
+  that decides what goes on the wire below the socket API: the IPv4+TCP builders,
+  the options bomb, the ICMP query builder, the checksum, and `source_ipv4_for`.
+  Its module doc states the guarantee and how it holds in each of the two shapes
+  it takes — raw TCP crafts the IP header, so the source is an explicit argument
+  whose *only* producer is `source_ipv4_for` (which asks the OS which local
+  address routes to the target); ICMP crafts only the ICMP message, so the kernel
+  supplies the real source and a forged one is not even expressible. A reviewer
+  can now confirm the claim without reading an engine.
+
+- **`mode.rs`** — which primitive a run drives and its configuration. Pure
+  functions of the mode, no sockets, no counters: the table of eighteen
+  primitives now reads as a table.
+
+- **`pace.rs`** — turning `--rate` into a schedule the send loop can keep
+  (`MIN_TICK`, `batch_for`, `interruptible_sleep`), newly worth isolating after
+  the 0.26.0 batching change.
+
+- **`lib.rs`** keeps the engine, the socket senders, the connect pool and the
+  tally: **2070 → 1348 lines**, with a layout table at the top.
+
+### Added
+
+- Three tests that the split made natural to write:
+  - `packet::the_source_address_is_the_one_supplied_and_nothing_else` — the
+    builder carries the source address verbatim and never substitutes, derives or
+    randomises a different one. The no-spoofing guarantee had been asserted only
+    incidentally, as one line inside a SYN well-formedness test.
+  - `mode::icmp_query_modes_are_l3_raw_and_carry_no_tcp_flags` — the mode table's
+    own view of the ICMP modes, alongside the existing engine-level check.
+  - `pace::a_tripped_kill_switch_cuts_the_sleep_short` — an abort is noticed
+    without waiting out a long inter-packet sleep.
+
+### Verification
+
+Every moved test moved **verbatim**. l34 went 32 → 35 tests, which is exactly the
+32 that existed plus the 3 above; the full suite is 206 and clippy is clean. The
+release binary was re-measured on a loopback UDP flood at 20 k/s and 200 k/s and
+delivers 100% of cap in both, unchanged from 0.26.0.
+
 ## [0.27.0] — 2026-07-31
 
 The CLI gets its first tests.
@@ -1060,7 +1113,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/h4b00b/jinrai/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/h4b00b/jinrai/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/h4b00b/jinrai/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/h4b00b/jinrai/compare/v0.24.0...v0.25.0

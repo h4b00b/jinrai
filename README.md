@@ -687,6 +687,10 @@ jinrai/  (Cargo workspace)
 ├── crates/core     # engine vocabulary + StressModule contract
 ├── crates/safety   # ⚠ THE GATE: allowlist, kill-switch, authorization (std-only, zero deps)
 ├── crates/l34      # L3/L4 packet generation — lab/isolated nets only  (UDP / TCP-connect / SYN / flag & anomaly floods / data / ICMP)
+│   ├── mode.rs     #   which primitive, and its config — pure data, no sockets
+│   ├── packet.rs   #   ⚠ THE NO-SPOOFING SURFACE: every byte built below the socket API
+│   ├── pace.rs     #   turning --rate into a schedule the send loop can keep
+│   └── lib.rs      #   the engine: authorization, send loop, socket senders, tally
 ├── crates/l7       # L7 HTTP load: GET/POST/HEAD + Slowloris/slow-body  (tokio + reqwest/rustls)
 ├── crates/metrics  # reporting + tamper-evident audit log             (SHA-256 hash chain)
 └── crates/cli      # `jinrai` binary — orchestration + operator gate
