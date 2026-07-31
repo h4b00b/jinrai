@@ -21,8 +21,14 @@
 //! connection only ever goes there. This primitive is `https`-only (there is no
 //! TLS handshake to flood on a plaintext target). The run is bounded by
 //! `duration`, capped by the rate cap (reinterpreted as *handshakes per second*),
-//! and aborts promptly on the kill switch. It is a **direct** self-test — no
-//! spoofing, no reflection/amplification.
+//! bounded in *concurrency* by [`crate::DEFAULT_MAX_CONNS`], and aborts promptly
+//! on the kill switch. It is a **direct** self-test — no spoofing, no
+//! reflection/amplification.
+//!
+//! The concurrency bound matters as much as the rate one here: a handshake
+//! against a server that stalls mid-negotiation stays open for the rest of the
+//! run, so rate alone would let the socket count grow without limit until the
+//! *client* runs out of descriptors.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -46,11 +53,27 @@ use crate::{authorize_datum, resolve_addrs, wait_for_kill, L7Error};
 pub struct TlsHandshakeEngine {
     gate: Authorization,
     url: String,
+    /// Cap on handshakes in flight at once. `None` => unbounded. A handshake
+    /// against a stalling server can live for the whole run, so without this the
+    /// socket count is bounded by nothing but the descriptor limit — see
+    /// [`crate::DEFAULT_MAX_CONNS`].
+    max_conns: Option<usize>,
 }
 
 impl TlsHandshakeEngine {
     pub fn new(gate: Authorization, url: impl Into<String>) -> Self {
-        Self { gate, url: url.into() }
+        Self {
+            gate,
+            url: url.into(),
+            max_conns: Some(crate::DEFAULT_MAX_CONNS),
+        }
+    }
+
+    /// Cap concurrent handshakes. `0` means unbounded — the operator's explicit
+    /// choice, never the default.
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_conns = (n > 0).then_some(n);
+        self
     }
 
     /// Authorize the datum (public so the CLI can fail-closed before any run).
@@ -124,6 +147,7 @@ impl StressModule for TlsHandshakeEngine {
         let errors_w = errors.clone();
         let kill = plan.kill.clone();
         let duration = plan.duration;
+        let max_conns = self.max_conns;
 
         rt.block_on(async move {
             let deadline = crate::deadline_in(duration);
@@ -134,6 +158,12 @@ impl StressModule for TlsHandshakeEngine {
             // the dispatch rate — this is the concurrency that makes it a flood.
             let mut tasks: JoinSet<()> = JoinSet::new();
 
+            // In-flight cap. A tick that cannot get a permit is *skipped*, not
+            // queued: the flood holds at most `n` handshakes open rather than
+            // letting a stalling server convert the rate into an ever-growing
+            // socket count on our own box.
+            let sem = max_conns.map(|n| Arc::new(Semaphore::new(n)));
+
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {}
@@ -143,11 +173,22 @@ impl StressModule for TlsHandshakeEngine {
                     break;
                 }
 
+                // Saturated: skip this tick rather than pile on. The permit is
+                // held for the whole handshake and released when the task ends.
+                let permit = match &sem {
+                    Some(sem) => match sem.clone().try_acquire_owned() {
+                        Ok(p) => Some(p),
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
+
                 let connector = connector.clone();
                 let server_name = server_name.clone();
                 let sent = sent_w.clone();
                 let errors = errors_w.clone();
                 tasks.spawn(async move {
+                    let _permit = permit;
                     match one_handshake(addr, &connector, server_name).await {
                         Ok(()) => sent.fetch_add(1, Ordering::Relaxed),
                         Err(()) => errors.fetch_add(1, Ordering::Relaxed),

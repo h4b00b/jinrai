@@ -14,6 +14,77 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-07-31
+
+A second external review, this time of the safety *baseline* rather than the
+input surface. It found one real allowlist bypass — a target could redirect the
+client onto a host the gate never saw — and three baseline items that were
+implemented but optional, which for a dual-use tool means not implemented. The
+theme of this release: the controls that existed were good, and could be skipped.
+
+### Security
+
+- **A target can no longer redirect jinrai off its authorized host.** The L7
+  client pins the connect address for the authorized datum via `resolve_to_addrs`
+  — but `reqwest` follows up to 10 redirects by default, and a redirect to
+  another *host* goes through the system resolver, not the pin. A target
+  answering `301 Location: http://somewhere.else/` therefore steered traffic to
+  a host the gate never authorized, and carried the operator's `--header` values
+  along with it. Peer-controlled, and the one bypass in the model. Redirects are
+  now refused outright (`Policy::none()`); a `3xx` counts as the response it is.
+- **The lab acknowledgement covers every layer.** `--ack-l34-lab` gated the raw
+  socket layers only, leaving l7 — the *default* layer, the one needing no
+  privileges — able to put real load on a target with nothing but a URL and an
+  allowlist. It is now `--ack-lab` and applies to any run that emits traffic.
+  `--ack-l34-lab` is still accepted so existing runbooks keep working.
+- **A run without an audit trail is refused.** The audit machinery was already
+  fail-closed once a log was open — opened before any traffic, a write failure
+  aborts the run — but `--audit-log` was optional, and the command an operator
+  would rather not have on record is exactly the one that omits it. Pass
+  `--audit-log <PATH>`, or `--no-audit` to state that this run is untracked.
+- **A kill switch that could not be installed now stops the run.** A failure to
+  register the SIGINT/SIGTERM handler printed a warning and started the flood
+  anyway — leaving a live run whose only advertised stop control did not exist.
+- **`--dry-run`** does everything refusable — allowlist, gate, engine
+  construction, preflight — then prints the plan and sends nothing. Previously
+  the only way to check a command line was to run it.
+- **Concurrency is bounded, not just rate.** `--rate` never bounded how many
+  sockets a run holds open: at 5000/s against a target answering in 20s, the TLS
+  handshake flood had ~100 000 handshakes in flight, and the fast l7 flood
+  defaulted to unbounded fan-out. Both now cap in-flight work at
+  `--max-connections` (default 1024, `0` = unbounded as an explicit choice).
+- **The audit log takes an exclusive lock and verifies its own tail.** Two
+  processes appending to one log each recovered the same `(seq, prev)` and forked
+  the chain — after which `--verify-audit` reported an untampered log as
+  `Tampered`. `open` also trusted the tail's stored hash, so records appended
+  below an edited one chained cleanly onto the forgery. It now recomputes that
+  hash and refuses a broken chain.
+- **A v4 destination that yields a v6 local address refuses the run** instead of
+  substituting `127.0.0.1` as the packet source. Unreachable on `AF_INET` today,
+  but inventing a source address is precisely the spoofing path this crate
+  promises not to have.
+
+### Fixed
+
+- **`--payload-size`, `--request-timeout-ms`, `--drain-timeout-ms` and
+  `--connect-timeout-ms` are capped** like their siblings were in 0.31.0. The
+  first is allocated per unit (a ~100 GB request was a flag away); the other
+  three become `Instant::now() + duration`, which panics on overflow — and with
+  `panic = "abort"`, after sockets are already open.
+- **`--ramp-start` / `--spike-base` above `--rate` are refused at parse.** The
+  documented promise that profiles shape traffic only *up to* the ceiling rested
+  on a single `clamped_to` deep in the engine. A floor above the ceiling is a
+  contradiction only the operator can resolve.
+- **HPACK string lengths of 127+ are encoded properly** (RFC 7541 §5.1
+  continuation). A hostname may be 253 bytes; the single-octet prefix truncated
+  it into a header block the server parsed as something else — a test tool
+  silently measuring the wrong thing.
+- **An SLO threshold of `NaN` no longer reports `PASS`.** `observed > NaN` is
+  false, so a non-finite limit silently disabled the check. An unevaluable
+  threshold now counts as breached, and `SloSpec::validate` rejects it outright.
+- **The CLI's module doc no longer claims "no traffic is emitted yet."** It had
+  described the Phase 1 stubs since before the traffic modules existed.
+
 ## [0.31.0] — 2026-07-31
 
 Hardening pass over the operator-input surface, from an external code review. The
@@ -1291,7 +1362,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/h4b00b/jinrai/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/h4b00b/jinrai/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/h4b00b/jinrai/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/h4b00b/jinrai/compare/v0.28.0...v0.29.0

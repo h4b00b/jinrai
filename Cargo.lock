@@ -596,7 +596,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jinrai"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "ctrlc",
  "jinrai-core",
@@ -609,14 +609,14 @@ dependencies = [
 
 [[package]]
 name = "jinrai-core"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "jinrai-safety",
 ]
 
 [[package]]
 name = "jinrai-l34"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "etherparse",
  "hdrhistogram",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "jinrai-l7"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "h2",
  "hdrhistogram",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "jinrai-metrics"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "jinrai-core",
  "sha2",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "jinrai-safety"
-version = "0.31.0"
+version = "0.32.0"
 
 [[package]]
 name = "js-sys"

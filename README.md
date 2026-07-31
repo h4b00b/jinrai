@@ -68,12 +68,26 @@ same five decisions:
 | **How hard?** | `--rate`, plus a concurrency ceiling | `--rate` is a hard safety ceiling, never exceeded by anything. Which ceiling flag applies depends on the method — see [the knob table](#rate-concurrency-and-which-knobs-apply). |
 | **How long?** | `--duration`, optionally shaped by `--profile` | |
 
-Everything else — `--slo-*`, `--watchdog`, `--audit-log` — **judges** and
-**bounds** the run rather than generating traffic. The smallest useful command:
+Everything else — `--slo-*`, `--watchdog` — **judges** and **bounds** the run
+rather than generating traffic.
+
+Two more flags are **mandatory on any run that emits traffic**, at every layer:
+
+| Flag | Why it is not optional |
+|---|---|
+| `--ack-lab` | You state, per run, that the target is yours to hit. (Was `--ack-l34-lab`, L3/L4-only; the old spelling still works.) |
+| `--audit-log <PATH>` | The run leaves a trail. `--no-audit` runs without one — allowed, but it has to be said out loud rather than happening by omission. |
+
+Not sure about a command line? `--dry-run` does everything except send:
+allowlist, gate, preflight, then prints the run it was about to start. It needs
+neither of the two flags above, because it emits nothing.
+
+The smallest useful command:
 
 ```sh
 jinrai --layer l7 --allow '*.staging.internal' \
-       --url https://api.staging.internal/health --rate 50 --duration 10
+       --url https://api.staging.internal/health --rate 50 --duration 10 \
+       --ack-lab --audit-log runs.jsonl
 ```
 
 ## Which layer?
@@ -81,7 +95,7 @@ jinrai --layer l7 --allow '*.staging.internal' \
 | Layer | What it exercises | Requires | Where to run it |
 |---|---|---|---|
 | **L7** `--layer l7` | the service: request handlers, connection slots, TLS, HTTP/2 state machine | nothing special | staging / QA. Real requests, real responses — the only layer that yields a `PASS`/`FAIL` verdict |
-| **L4** `--layer l4` | the transport: accept backlog, connection tracking, firewall state, socket buffers | `--ack-l34-lab`; the raw modes also need `CAP_NET_RAW`/root (Linux, IPv4-only) | isolated lab only |
+| **L4** `--layer l4` | the transport: accept backlog, connection tracking, firewall state, socket buffers | the raw modes also need `CAP_NET_RAW`/root (Linux, IPv4-only) | isolated lab only |
 | **L3** `--layer l3` | the host's IP/ICMP handlers | same as L4 | isolated lab only |
 
 Rule of thumb: **L7 answers "can the service still serve?", L3/L4 answer "can
@@ -175,9 +189,9 @@ reinterpreted per family, and a flag belonging to another family is inert
 
 | Family | `--rate` counts | Bound the footprint with | Does **not** read |
 |---|---|---|---|
-| `get` / `post` / `head` | requests/sec | `--max-connections` (0 = unbounded), `--request-timeout-ms`, `--drain-timeout-ms` | — |
+| `get` / `post` / `head` | requests/sec | `--max-connections` (default 1024; `0` = unbounded), `--request-timeout-ms`, `--drain-timeout-ms` | — |
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
-| `tls-handshake` | handshakes/sec | *nothing* — concurrency follows the rate | same as above |
+| `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
 | every `h2-*` | frames/sec (cycles/sec for `h2-made-you-reset`) | *nothing* — one connection, frames paced by `--rate` | same as above |
 | l4 `tcp` | connection attempts/sec | `--concurrency` (open sockets), `--connect-timeout-ms` | `--slo-*`, `--profile` |
 | l4 `data` | writes/sec | `--concurrency`, `--payload-size` | same |
@@ -198,83 +212,91 @@ target, run — nothing is implied or omitted.
 ### L7 — no privilege required, safe to point at staging
 
 ```sh
+# Every run needs the lab acknowledgement and an audit destination. Kept in one
+# variable here so the commands below stay about the technique. Add --dry-run to
+# any of them to validate and print the plan without sending.
+REQ='--ack-lab --audit-log runs.jsonl'
+
 # Capacity, with a verdict: fails the run (exit != 0) if the target misses the SLO
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 200 --duration 60 \
        --slo-max-5xx-rate 0.01 --slo-max-p99-ms 250
 
 # Write path: POST with a body, cache-busted so a CDN cannot answer for the origin
-jinrai --layer l7 --allow '*.staging.internal' --l7-method post \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method post \
        --url https://api.staging.internal/ingest --body '{"probe":1}' \
        --cache-bust --rate 200 --duration 60
 
 # Breaking point: ramp to the ceiling, stop at the first stage that breaks the SLO
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 5000 --duration 300 \
        --profile ramp --ramp-start 100 --ramp-steps 20 \
        --discover-knee --slo-max-5xx-rate 0.01
 
 # Burst: hold a baseline, jump to the ceiling for 30s, fall back (autoscaling test)
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 2000 --duration 300 \
        --profile spike --spike-base 200 --spike-secs 30
 
 # Endurance: a long flat hold that surfaces leaks and slow degradation
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 300 --duration 3600 \
        --profile soak --slo-max-p99-ms 500 --watchdog --slo-max-error-rate 0.05
 
 # Same load over a pinned protocol version (auto would negotiate h2 on https)
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --http-version 1.1 \
        --rate 200 --duration 60
 
 # Connection-slot exhaustion: at most 50 keep-alive connections held busy
 # (the controlled form of GoldenEye/XerXes)
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/ --max-connections 50 \
        --cache-bust --rate 1000 --duration 60
 
 # Slowloris: 200 half-open connections, one header line each every 10s
 #   swap --l7-method for slowbody (trickled POST body, RUDY)
 #   or for slow-read (complete request, response drained one chunk per tick)
-jinrai --layer l7 --allow '*.staging.internal' --l7-method slowloris \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method slowloris \
        --url https://api.staging.internal/ --slow-connections 200 \
        --drip-ms 10000 --rate 50 --duration 300
 
 # TLS handshake flood (THC-SSL-DoS): full handshake, immediate drop, repeat
-jinrai --layer l7 --allow '*.staging.internal' --l7-method tls-handshake \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method tls-handshake \
        --url https://api.staging.internal/ --rate 200 --duration 60
 
 # HTTP/2 rapid reset (CVE-2023-44487). Every h2-* method takes this exact shape;
 # only the method name changes:
 #   h2-rapid-reset  h2-made-you-reset  h2-continuation  h2-bomb
 #   h2-settings     h2-ping            h2-window-update h2-priority  h2-empty-data
-jinrai --layer l7 --allow '*.staging.internal' --l7-method h2-rapid-reset \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method h2-rapid-reset \
        --url https://api.staging.internal/ --rate 500 --duration 60
 
 # Header-profile test (User-Agent, Cookie, Referer, …): --header is repeatable
-jinrai --layer l7 --allow '*.staging.internal' --l7-method get \
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/ --header 'User-Agent: jinrai/probe' \
        --header 'Cookie: session=x' --rate 100 --duration 30
 ```
 
-### L3/L4 — isolated lab only (`--ack-l34-lab` is mandatory)
+### L3/L4 — isolated lab only
 
 ```sh
+# As above: every run needs the acknowledgement and a trail.
+REQ='--ack-lab --audit-log runs.jsonl'
+
 # UDP datagram flood — no privilege needed
-jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 --target 10.1.2.3 --port 9 \
-       --ack-l34-lab --payload-size 1400 --rate 1000 --duration 30
+jinrai $REQ --layer l4 --l4-mode udp --allow 10.0.0.0/8 --target 10.1.2.3 --port 9 \
+       --payload-size 1400 --rate 1000 --duration 30
 
 # TCP connect flood: real handshakes held open against the accept backlog.
 # --concurrency is both the local footprint AND the parallelism; no privilege needed
-jinrai --layer l4 --l4-mode tcp --allow 10.0.0.0/8 --target 10.1.2.3 --port 443 \
-       --ack-l34-lab --rate 5000 --duration 60 \
+jinrai $REQ --layer l4 --l4-mode tcp --allow 10.0.0.0/8 --target 10.1.2.3 --port 443 \
+       --rate 5000 --duration 60 \
        --concurrency 512 --connect-timeout-ms 500
 
 # PSH-ACK data flood: real connections filled with application data
-jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 --target 10.1.2.3 --port 80 \
-       --ack-l34-lab --payload-size 4096 --concurrency 256 --rate 500 --duration 30
+jinrai $REQ --layer l4 --l4-mode data --allow 10.0.0.0/8 --target 10.1.2.3 --port 80 \
+       --payload-size 4096 --concurrency 256 --rate 500 --duration 30
 
 # Raw SYN flood — needs CAP_NET_RAW/root, IPv4 only. Same shape for every raw
 # flag flood; only --l4-mode changes:
@@ -282,13 +304,13 @@ jinrai --layer l4 --l4-mode data --allow 10.0.0.0/8 --target 10.1.2.3 --port 80 
 #   syn-ack                                    (unsolicited handshake response)
 #   syn-fin  syn-rst  xmas  null               (illegal combinations)
 #   tcp-options                                (SYN + maximal 40-byte option block)
-sudo -E jinrai --layer l4 --l4-mode syn --allow 10.0.0.0/8 --target 10.1.2.3 \
-       --port 80 --ack-l34-lab --rate 5000 --duration 30
+sudo -E jinrai $REQ --layer l4 --l4-mode syn --allow 10.0.0.0/8 --target 10.1.2.3 \
+       --port 80 --rate 5000 --duration 30
 
 # ICMP query flood — portless, needs CAP_NET_RAW/root. Swap --l4-mode for
 # icmp-timestamp (type 13) or icmp-address-mask (type 17)
-sudo -E jinrai --layer l3 --l4-mode icmp --allow 10.0.0.0/8 --target 10.1.2.3 \
-       --ack-l34-lab --rate 1000 --duration 30
+sudo -E jinrai $REQ --layer l3 --l4-mode icmp --allow 10.0.0.0/8 --target 10.1.2.3 \
+       --rate 1000 --duration 30
 ```
 
 `sudo -E` preserves `$JINRAI_OPERATOR` so [the audit log](#the-audit-log) still
@@ -299,11 +321,18 @@ records who ran it.
 Order matters more than the individual commands. Do these in sequence against a
 new target:
 
+0. **Prove the command line** without sending anything. `--dry-run` walks the
+   whole refusable path — allowlist, gate, preflight — and prints the run it was
+   about to start.
+   ```sh
+   jinrai --layer l7 --allow '*.staging.internal' --dry-run \
+          --url https://api.staging.internal/health --rate 10 --duration 5
+   ```
 1. **Prove the gate and the path** with trivial load. If the allowlist or the
    URL is wrong, this refuses instead of sending — which is the whole point of
    run #1.
    ```sh
-   jinrai --layer l7 --allow '*.staging.internal' \
+   jinrai --layer l7 --allow '*.staging.internal' --ack-lab --audit-log runs.jsonl \
           --url https://api.staging.internal/health --rate 10 --duration 5
    ```
 2. **Get a verdict at steady state** — the first cookbook command. Now you know
@@ -311,9 +340,9 @@ new target:
    fails on its own.
 3. **Find the capacity knee** — the `--discover-knee` command. Now you know the
    load you *cannot* choose. Finding the knee is a success (exit 0).
-4. **Put it on the record** — repeat the run that mattered with
-   [`--audit-log`](#the-audit-log) and `--watchdog`, so the result is
-   accountable and the run can stop itself.
+4. **Let it stop itself** — repeat the run that mattered with `--watchdog`, so a
+   target that starts failing ends the run instead of enduring it. The trail is
+   already there: [`--audit-log`](#the-audit-log) is required on every run.
 
 ## Choosing numbers safely
 
@@ -419,13 +448,18 @@ set higher than the exercise actually calls for.
 
 ## The audit log
 
-Record an accountable, hash-chained trail of every run — who authorized what,
-against which allowlist, and with what outcome:
+An accountable, hash-chained trail of every run — who authorized what, against
+which allowlist, and with what outcome. **Required**: a run with neither
+`--audit-log` nor an explicit `--no-audit` is refused, because a trail that can
+be skipped by omission is one that goes missing exactly when it matters. The log
+is opened before any traffic and a write failure aborts the run, so traffic can
+never outrun its own record. Only one jinrai process may write to a given log at
+a time — concurrent writers would fork the hash chain.
 
 ```sh
 export JINRAI_OPERATOR="you@example.com"          # else falls back to the OS user
 jinrai --layer l4 --l4-mode udp --allow 10.0.0.0/8 --target 10.1.2.3 \
-       --port 9 --ack-l34-lab --rate 1000 --duration 10 \
+       --port 9 --ack-lab --rate 1000 --duration 10 \
        --audit-log runs.jsonl
 
 jinrai --verify-audit runs.jsonl                 # 0 = chain intact, non-zero = tampered
@@ -472,6 +506,13 @@ current.
 The `--url` host is validated as a *datum* against its own rule type — an
 IP-literal host against the CIDR rules, a DNS-name host against the DNS rules —
 and only then resolved once and pinned. A name is never resolved-then-IP-checked.
+
+**Redirects are not followed.** Pinning the connect address is only worth
+something if the client cannot be talked into connecting elsewhere, and a
+`3xx` with a `Location:` on another host is exactly that: the *target* choosing
+where your traffic and your `--header` values go next. A redirect is counted as
+the response it is (`3xx` in the summary) and the run stays on the host the gate
+authorized.
 
 ### The L7 methods
 
@@ -566,8 +607,8 @@ ever stop traffic, never generate it, and it is inert without at least one
 
 ## L3/L4 reference
 
-Requires raw target IPs matching a CIDR `--allow`, an explicit `--ack-l34-lab`
-acknowledgement, and a `--port` (except the ICMP modes). `udp`/`tcp`/`data` need
+Requires raw target IPs matching a CIDR `--allow` and a `--port` (except the
+ICMP modes), on top of the `--ack-lab` acknowledgement every layer needs. `udp`/`tcp`/`data` need
 no privilege, and `tcp`/`data` work over IPv4 **and** IPv6; the raw-socket modes
 (`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-ack`/`syn-fin`/`syn-rst`/`xmas`/
 `null`/`tcp-options`/`icmp`/`icmp-timestamp`/`icmp-address-mask`) need `CAP_NET_RAW`/root
