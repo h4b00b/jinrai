@@ -322,6 +322,12 @@ struct Tally {
     errors: u64,
     errno: ErrnoTally,
     latency: Histogram<u64>,
+    /// Total time resolved attempts spent occupying an in-flight slot, and how
+    /// many there were. A running sum rather than a second histogram: only the
+    /// mean is wanted, and it is the one statistic a histogram of the survivors
+    /// cannot supply.
+    residency_micros: u128,
+    residency_n: u64,
 }
 
 impl Tally {
@@ -330,11 +336,30 @@ impl Tally {
             sent: 0,
             errors: 0,
             errno: ErrnoTally::default(),
+            residency_micros: 0,
+            residency_n: 0,
             // 1us .. 60s at 3 significant figures — bounded memory regardless of
             // how long the run holds, unlike retaining every sample.
             latency: Histogram::new_with_bounds(1, 60_000_000, 3)
                 .expect("valid histogram bounds"),
         }
+    }
+
+    /// Note how long one resolved attempt held its in-flight slot, whether it
+    /// succeeded or failed.
+    ///
+    /// Kept separate from the latency histogram on purpose. "Latency" in the
+    /// summary means *the time a completed handshake took*, and folding failures
+    /// into it would redefine a number operators already read. Residency answers
+    /// a different question — what the concurrency budget was actually spent on —
+    /// and a timeout is the most expensive answer there is: it buys no completion
+    /// and holds the slot longer than any success.
+    fn record_residency(&mut self, held: Duration) {
+        // Floor at one microsecond: an attempt that resolved occupied a slot, and
+        // rounding a sub-microsecond loopback refusal down to "free" would let
+        // the mean report an infinite ceiling.
+        self.residency_micros = self.residency_micros.saturating_add(held.as_micros().max(1));
+        self.residency_n += 1;
     }
 
     fn record(&mut self, emission: Emission) {
@@ -372,6 +397,12 @@ impl Tally {
             p90_micros: if measured { self.latency.value_at_quantile(0.9) } else { 0 },
             p99_micros: if measured { self.latency.value_at_quantile(0.99) } else { 0 },
             max_micros: if measured { self.latency.max() } else { 0 },
+            mean_micros: if self.residency_n > 0 {
+                u64::try_from(self.residency_micros / u128::from(self.residency_n))
+                    .unwrap_or(u64::MAX)
+            } else {
+                0
+            },
             ..Default::default()
         }
     }
@@ -418,9 +449,40 @@ const MAX_DATA_PAYLOAD: usize = 65_536;
 
 /// Upper bound on connect-flood worker threads. `--concurrency` sets the real
 /// ceiling; this only stops a very large `--concurrency` from spawning one OS
-/// thread per socket. 512 handshakes in flight is ~170k attempts/s against a
-/// 3 ms target, far above any rate this tool is meant to offer.
-const MAX_CONNECT_WORKERS: usize = 512;
+/// thread per socket.
+///
+/// ## Why it is not 512
+///
+/// It was, on the reasoning that "512 handshakes in flight is ~170k attempts/s
+/// against a 3 ms target, far above any rate this tool is meant to offer". That
+/// arithmetic silently assumes every handshake *completes* — and it is exactly
+/// wrong in the case the flood exists to produce. Against a target whose accept
+/// path is saturating, a large share of attempts do not complete at all; they
+/// occupy a worker for the full `--connect-timeout-ms`. At a 500 ms timeout and
+/// a 28% timeout rate the mean slot residency is ~130 ms, not 3 ms, so 512
+/// workers top out near 3.9k/s — and in the worst case (nothing completes) at
+/// 1024/s. `--concurrency 4096` would not move either number, because the clamp
+/// held in-flight handshakes at 512 no matter what the operator asked for.
+///
+/// The bound now sits high enough that `--concurrency` is the binding constraint
+/// across the range of timeouts an operator will actually choose. The cost is
+/// bounded and cheap: these threads only block in `connect_timeout`, and at
+/// [`CONNECT_WORKER_STACK`] the full ceiling reserves 256 MiB of *address space*
+/// with a resident cost of a few MiB. Beyond this, more threads is the wrong
+/// instrument — lower `--connect-timeout-ms` (which cuts residency directly) or
+/// move the pool to non-blocking connects.
+const MAX_CONNECT_WORKERS: usize = 4096;
+
+/// The most simultaneous handshakes a connect flood can have in flight, given a
+/// `--concurrency` budget.
+///
+/// Public because the summary's Little's-law note divides by this to say what
+/// the run could have offered, and it must divide by the ceiling that actually
+/// applied — quoting a `--concurrency` the pool then clamped away would make the
+/// note advise raising a knob that does nothing.
+pub fn effective_parallelism(concurrency: usize) -> usize {
+    concurrency.clamp(1, MAX_CONNECT_WORKERS)
+}
 
 /// Stack size for a connect worker. The thread does nothing but block in
 /// `connect_timeout` and hand the result back, so the default 8 MiB reservation
@@ -439,7 +501,11 @@ enum ConnectOutcome {
     /// the FIFO of held connections — keeping a single owner for the descriptor
     /// budget means no lock on the hot path.
     Established { stream: TcpStream, latency: Duration },
-    Failed(ErrnoBucket),
+    /// The attempt failed after occupying its slot for `held` — which is the
+    /// timeout in full whenever the target simply never answered. Carried
+    /// because a failure's residency is what actually bounds offered load; see
+    /// [`Tally::record_residency`].
+    Failed { bucket: ErrnoBucket, held: Duration },
 }
 
 /// TCP full-handshake connect flood, backed by a small pool of blocking workers.
@@ -493,7 +559,7 @@ impl ConnectPool {
     fn new(cap: usize, timeout: Duration) -> Result<Self, L34Error> {
         // Never more workers than the descriptor budget: a worker that can never
         // be admitted is a thread that only ever sleeps.
-        let parallelism = cap.clamp(1, MAX_CONNECT_WORKERS);
+        let parallelism = effective_parallelism(cap);
         let (work_tx, work_rx) = mpsc::sync_channel::<SocketAddr>(parallelism);
         let (res_tx, res_rx) = mpsc::channel::<ConnectOutcome>();
         // `mpsc::Receiver` is Send but not Sync, so the workers share one behind a
@@ -528,7 +594,10 @@ impl ConnectPool {
                             set_abortive_close(&stream);
                             ConnectOutcome::Established { stream, latency }
                         }
-                        Err(e) => ConnectOutcome::Failed(classify_io(&e)),
+                        Err(e) => ConnectOutcome::Failed {
+                            bucket: classify_io(&e),
+                            held: began.elapsed(),
+                        },
                     };
                     if res_tx.send(outcome).is_err() {
                         break;
@@ -561,9 +630,13 @@ impl ConnectPool {
         match outcome {
             ConnectOutcome::Established { stream, latency } => {
                 self.held.push_back(stream);
+                tally.record_residency(latency);
                 tally.record(Emission::Sent { latency: Some(latency) });
             }
-            ConnectOutcome::Failed(bucket) => tally.record(Emission::Failed(bucket)),
+            ConnectOutcome::Failed { bucket, held } => {
+                tally.record_residency(held);
+                tally.record(Emission::Failed(bucket));
+            }
         }
     }
 
@@ -1151,6 +1224,54 @@ mod tests {
             report.max_micros
         );
         drop(listener);
+    }
+
+    /// REGRESSION: `--concurrency` above 512 used to buy nothing.
+    ///
+    /// The pool clamped simultaneous handshakes at 512 regardless of the
+    /// operator's budget, so a run that was told to raise `--concurrency` to
+    /// reach its cap could raise it to 4096 and see the achieved rate not move.
+    #[test]
+    fn concurrency_above_the_old_clamp_still_buys_parallelism() {
+        assert_eq!(effective_parallelism(0), 1, "never zero workers");
+        assert_eq!(effective_parallelism(512), 512);
+        assert!(
+            effective_parallelism(2048) > 512,
+            "a 2048-socket budget must run more than 512 handshakes in flight"
+        );
+        assert_eq!(
+            effective_parallelism(usize::MAX),
+            MAX_CONNECT_WORKERS,
+            "but an absurd budget still stops at the thread ceiling"
+        );
+    }
+
+    /// ACCEPTANCE: a run where nothing completes must still report what an
+    /// in-flight slot cost.
+    ///
+    /// The latency histogram is fed only by successful handshakes, so a flood
+    /// against a refusing port leaves every percentile at 0. That is correct for
+    /// "latency" and useless for "what could this run have offered?" — the
+    /// failures held the slots. `mean_micros` is the field that has to survive
+    /// this case, because the summary divides the concurrency budget by it.
+    #[test]
+    fn connect_flood_measures_slot_residency_even_when_nothing_completes() {
+        let _fd = fd_guard();
+        let closed_port = {
+            let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(config(L4Mode::TcpConnect, closed_port, 16));
+        let report = engine.execute(&plan(vec![t], 100, 1));
+
+        assert_eq!(report.units_sent, 0, "a refusing port completes nothing: {report:?}");
+        assert!(report.errors > 0, "and must record the refusals: {report:?}");
+        assert_eq!(report.p50_micros, 0, "no completion means no latency percentile");
+        assert!(
+            report.mean_micros > 0,
+            "the failures held slots, so residency must be measured: {report:?}"
+        );
     }
 
     /// ACCEPTANCE: failures are bucketed by errno, and the tally reconciles with

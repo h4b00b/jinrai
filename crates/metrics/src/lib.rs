@@ -200,16 +200,36 @@ pub fn render_summary(
     }
 
     if report.units_sent > 0 {
-        out.push_str(&row(
-            "latency",
-            &format!(
-                "p50 {}   p90 {}   p99 {}   max {}",
-                fmt_micros(report.p50_micros),
-                fmt_micros(report.p90_micros),
-                fmt_micros(report.p99_micros),
-                fmt_micros(report.max_micros),
-            ),
-        ));
+        let mut latency = format!(
+            "p50 {}   p90 {}   p99 {}   max {}",
+            fmt_micros(report.p50_micros),
+            fmt_micros(report.p90_micros),
+            fmt_micros(report.p99_micros),
+            fmt_micros(report.max_micros),
+        );
+        // These percentiles cover attempts that COMPLETED. With failures in the
+        // mix that is a materially different population, and an unqualified
+        // "p99 7.7ms" next to "26% failed" reads as a healthy target when a
+        // quarter of the attempts in fact took the timeout in full.
+        if report.errors > 0 {
+            latency.push_str(&format!(
+                " (completed attempts only — the {} that failed are not in these percentiles)",
+                report.errors
+            ));
+        }
+        out.push_str(&row("latency", &latency));
+        // The residency that the concurrency budget actually paid for, shown
+        // whenever it diverges from the completed-only view above.
+        if report.mean_micros > report.p50_micros.saturating_mul(2) {
+            out.push_str(&row(
+                "  per-slot",
+                &format!(
+                    "{} mean per attempt across all {attempts} — what one in-flight \
+                     slot cost, failures included",
+                    fmt_micros(report.mean_micros)
+                ),
+            ));
+        }
     }
     // Why the run fell short of its cap, when it did. The two notes are mutually
     // exclusive by construction: the first applies only where there is an
@@ -310,16 +330,38 @@ fn achieved_hint(effective: f64, ctx: &RunContext) -> String {
 /// Explain a run that fell short of its rate cap because it could not have
 /// reached it, rather than because the target pushed back.
 ///
-/// Offered load is bounded by Little's law: with `N` attempts in flight and a
-/// median attempt taking `L`, the most a run can offer is `N / L` per second. If
-/// that product is below the cap, the cap was unreachable from the start and the
-/// achieved percentage says nothing about the target — the operator needs to
-/// raise the concurrency ceiling, not read the result as absorbed load. Silent
-/// when the run got near its cap, when latency was never measured (the stateless
-/// floods), or when the ceiling was not the binding constraint.
+/// Offered load is bounded by Little's law: with `N` attempts in flight and an
+/// attempt occupying its slot for `W`, the most a run can offer is `N / W` per
+/// second. If that product is below the cap, the cap was unreachable from the
+/// start and the achieved percentage says nothing about the target — the
+/// operator needs to raise the concurrency ceiling, not read the result as
+/// absorbed load. Silent when the run got near its cap, when no per-attempt
+/// duration was measured (the stateless floods), or when the ceiling was not the
+/// binding constraint.
+///
+/// ## `W` is the mean residency, not the median latency
+///
+/// This note used to divide by `p50_micros`, and that made it misfire in the one
+/// scenario it was written for. The percentiles describe attempts that
+/// *completed*; an attempt that times out completes nothing but holds its slot
+/// for the entire timeout. A connect flood that lands 72% of its handshakes in
+/// ~3 ms and times the rest out at 500 ms has a median of 3 ms and a mean
+/// residency of ~130 ms — a factor of 40. Dividing by the median put the ceiling
+/// at 190k/s, well above any cap, so the note stayed silent and the operator was
+/// left reading "32% of the 10000/s cap" as load the target had absorbed. It was
+/// nothing of the kind: two thirds of that load was never offered.
+///
+/// So `W` is [`RunReport::mean_micros`] when the layer measured it, and the
+/// median only as a fallback for layers that do not.
 fn concurrency_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) -> Option<String> {
     let concurrency = ctx.concurrency?;
-    if ctx.rate_per_sec == 0 || report.p50_micros == 0 || concurrency == 0 {
+    // Prefer true mean residency; fall back to the completed-only median for
+    // layers that do not measure it.
+    let (residency_micros, basis) = match report.mean_micros {
+        0 => (report.p50_micros, "median"),
+        mean => (mean, "mean"),
+    };
+    if ctx.rate_per_sec == 0 || residency_micros == 0 || concurrency == 0 {
         return None;
     }
     let cap = ctx.rate_per_sec as f64;
@@ -327,20 +369,36 @@ fn concurrency_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) 
     if effective >= cap * 0.9 {
         return None;
     }
-    let median = report.p50_micros as f64 / 1_000_000.0;
-    let ceiling = concurrency as f64 / median;
+    let residency = residency_micros as f64 / 1_000_000.0;
+    let ceiling = concurrency as f64 / residency;
     if ceiling >= cap {
         // The run had the headroom to reach the cap and did not — that is a
         // finding about the target, not about this knob. Say nothing.
         return None;
     }
-    Some(format!(
-        "concurrency, not the target: {concurrency} in flight at a {} median \
-         attempt tops out near {ceiling:.0}/s, below the {}/s cap — raise \
-         --concurrency to offer more load",
-        fmt_micros(report.p50_micros),
+    let mut note = format!(
+        "concurrency, not the target: {concurrency} in flight at a {} {basis} \
+         attempt tops out near {ceiling:.0}/s, below the {}/s cap — only \
+         {effective:.0}/s was ever offered, so the shortfall is NOT load the \
+         target absorbed",
+        fmt_micros(residency_micros),
         ctx.rate_per_sec
-    ))
+    );
+    // Where the budget went. A slot spent on an attempt that never completes is
+    // the usual reason the ceiling is this low, and it points at a different
+    // knob than "raise --concurrency" does.
+    if basis == "mean" && report.errors > 0 && residency_micros > report.p50_micros.saturating_mul(2)
+    {
+        note.push_str(&format!(
+            ". Failed attempts hold a slot far longer than the {} median completion, \
+             so they dominate that budget — lowering the attempt timeout buys more \
+             offered load than raising --concurrency",
+            fmt_micros(report.p50_micros)
+        ));
+    } else {
+        note.push_str(" — raise --concurrency to offer more load");
+    }
+    Some(note)
 }
 
 /// Explain a run that fell short of its rate cap because **this host** could not
@@ -409,6 +467,13 @@ fn share(n: u64, total: u64) -> String {
 fn row(label: &str, value: &str) -> String {
     const LABEL_W: usize = 11;
     const WRAP: usize = 74;
+    // The padding is the only thing separating label from value, so a label that
+    // fills the column renders as `slot time132.0ms`. Caught here rather than in
+    // a summary someone has to read.
+    debug_assert!(
+        label.chars().count() < LABEL_W,
+        "label {label:?} fills the {LABEL_W}-char column and would run into the value"
+    );
     let indent = " ".repeat(LABEL_W + 1);
     let mut out = format!(" {label:<width$}", width = LABEL_W);
     let mut col = out.chars().count();
@@ -660,6 +725,52 @@ mod tests {
         };
         let out = render_summary(&r, &c, None);
         assert!(!out.contains("bound by"), "{out}");
+    }
+
+    /// REGRESSION: the note used to divide by the completed-only median, and so
+    /// stayed silent on exactly the run it exists to explain.
+    ///
+    /// Real numbers from a `--concurrency 512 --connect-timeout-ms 500` connect
+    /// flood: 33470 attempts in 10.5 s, 26% of them timing out at the full
+    /// 500 ms. The median *completion* is 2.7 ms, which puts the false ceiling at
+    /// 190k/s — comfortably above the 10k cap, so the old note said nothing and
+    /// "32% of the 10000/s cap" read as 68% absorbed by the target. Mean
+    /// residency is ~132 ms: the real ceiling is ~3.9k/s and the cap was never
+    /// reachable.
+    #[test]
+    fn summary_uses_mean_residency_so_timeouts_cannot_hide_the_ceiling() {
+        let r = RunReport {
+            layer_label: "L4 tcp-connect-flood".into(),
+            units_sent: 24_737,
+            errors: 8_733,
+            timeouts: 8_733,
+            p50_micros: 2_700,
+            p90_micros: 5_700,
+            p99_micros: 7_700,
+            max_micros: 94_700,
+            mean_micros: 132_000,
+            ..Default::default()
+        };
+        let c = RunContext {
+            rate_per_sec: 10_000,
+            elapsed: Duration::from_millis(10_500),
+            concurrency: Some(512),
+            ..ctx_l4()
+        };
+        let out = render_summary(&r, &c, None);
+        assert!(out.contains("bound by"), "the ceiling must be named: {out}");
+        assert!(out.contains("concurrency, not the target"), "{out}");
+        // 512 / 0.132s ~= 3879/s, not the 190k/s the median implied.
+        assert!(out.contains("tops out near 3879/s"), "{out}");
+        // The operator must not credit the target with the shortfall.
+        assert!(out.contains("NOT load the"), "{out}");
+        // ...and must be pointed at the knob that actually helps here.
+        assert!(out.contains("lowering the attempt timeout"), "{out}");
+        // The percentiles must not silently claim to cover the failures.
+        // (Fragments short enough to survive the block's line wrapping.)
+        assert!(out.contains("attempts only"), "{out}");
+        assert!(out.contains("not in these"), "{out}");
+        assert!(out.contains("132.0ms mean per"), "{out}");
     }
 
     /// A stateless flood measures no latency, so there is no bound to compute

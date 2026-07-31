@@ -14,6 +14,70 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-07-31
+
+The summary told an operator that a saturating target had absorbed two thirds of
+the offered load. It had not — two thirds of that load was never offered.
+
+A real `--layer l4 --l4-mode tcp --rate 10000 --concurrency 512
+--connect-timeout-ms 500` run reported `3183.3/s achieved (32% of the 10000/s
+cap)`, `latency p50 2.7ms p90 5.7ms p99 7.7ms`, and no explanation of the
+shortfall. Every one of those numbers was accurate and the reading they invited
+was wrong. This release makes the reporting match the run, and removes the
+ceiling that made the shortfall unavoidable.
+
+### Fixed
+
+- **The Little's-law note divided by the wrong number, and so stayed silent.**
+  `bound by` estimates what a run *could* have offered as `concurrency /
+  attempt-time`, and used `p50_micros` for the second term. But the percentiles
+  cover attempts that **completed**; an attempt that times out completes nothing
+  and holds its in-flight slot for the entire timeout. In the run above the
+  median completion was 2.7 ms while the mean slot residency was ~132 ms — a
+  factor of 40. Dividing by the median put the estimated ceiling at 190k/s, far
+  above the 10k cap, so the note concluded the run had ample headroom and
+  printed nothing. The true ceiling was ~3.9k/s and the cap was never reachable.
+  The note now divides by mean residency and, when the shortfall is real, states
+  the achieved rate as the load actually offered.
+
+- **`--concurrency` above 512 bought nothing on `--l4-mode tcp`.** The connect
+  pool clamped simultaneous handshakes at 512 whatever the operator asked for,
+  so the advice the summary gave — raise `--concurrency` — could be followed to
+  4096 with the achieved rate not moving. The clamp's own comment justified 512
+  as "~170k attempts/s against a 3 ms target", arithmetic that assumes every
+  handshake completes and is therefore wrong in exactly the case a flood is run
+  to produce. The ceiling is now 4096.
+
+- **Failed attempts held slots invisibly (L4 and L7).** Both engines measured
+  how long an attempt took and then discarded that measurement on the failure
+  path, so the one population that dominates the concurrency budget left no
+  trace in the report.
+
+### Added
+
+- **`RunReport::mean_micros`** — mean residency of a resolved attempt, failures
+  included. Distinct from the percentiles by design: `latency` stays "how long a
+  completed attempt took", `mean_micros` answers "what did an in-flight slot
+  cost", and only the second one bounds offered load.
+
+- **`jinrai_l34::effective_parallelism`** — the in-flight ceiling that actually
+  applied, so the summary quotes the number that bound the run rather than the
+  `--concurrency` the pool may have clamped away.
+
+### Changed
+
+- **The `latency` row says what it covers.** With failures present it now reads
+  `… (completed attempts only — the 8733 that failed are not in these
+  percentiles)`, and a `per-slot` row appears when mean residency diverges from
+  the completed-only view. A `p99 7.7ms` printed directly under `failed 8733
+  (26.1%)` reads as a healthy target; it was the p99 of the survivors.
+
+- **`--concurrency` help no longer says the reachable rate is `N /
+  round-trip-time`.** It is `N / mean-attempt-time`, and once a meaningful share
+  of attempts fail, lowering `--connect-timeout-ms` raises that rate far more
+  than raising `N` does. The help now points at the `bound by` line to say which
+  of the two applies.
+
 ## [0.28.0] — 2026-07-31
 
 `crates/l34` split into modules. **No behaviour change** — this is code motion.
@@ -1113,7 +1177,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/h4b00b/jinrai/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/h4b00b/jinrai/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/h4b00b/jinrai/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/h4b00b/jinrai/compare/v0.25.0...v0.26.0

@@ -382,6 +382,23 @@ pub struct RunReport {
     pub p99_micros: u64,
     /// Worst observed latency, in microseconds.
     pub max_micros: u64,
+    /// Mean *residency* of a resolved attempt, in microseconds: how long an
+    /// attempt occupied an in-flight slot, counting the ones that failed.
+    ///
+    /// Distinct from `p50_micros` and friends, which describe only the attempts
+    /// that **completed**. The difference is not cosmetic — it is the whole
+    /// reason this field exists. Little's law bounds offered load at
+    /// `concurrency / residency`, and a failing attempt occupies its slot for the
+    /// full timeout while a successful one is gone in a millisecond. Against a
+    /// target that is actually saturating, the failures dominate the mean by two
+    /// orders of magnitude and the completed-only median says the run had ample
+    /// headroom when it had none. Reporting the shortfall correctly therefore
+    /// requires the mean over *every* resolved attempt, not the median over the
+    /// survivors.
+    ///
+    /// Zero when the layer does not measure per-attempt duration (the stateless
+    /// floods).
+    pub mean_micros: u64,
     /// Set by a breaking-point (ramp) discovery run when a load stage first
     /// breached the SLO: the capacity knee. `None` for every non-discovery run
     /// and for a discovery run that never breached (target held the whole ramp).
