@@ -14,6 +14,59 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-07-31
+
+The CLI gets its first tests.
+
+Every crate underneath it was well covered — 189 tests across safety, l7, l34,
+metrics and core — while `crates/cli`, 1100+ lines, had **none**. That is the
+layer where an operator's intent becomes a `RunPlan`, and where `--allow`,
+`--ack-l34-lab`, the SLO thresholds and the process exit codes are all read. A
+parser that quietly accepts a malformed threshold, or an outcome check that
+reports success for a run that tested nothing, is a safety defect no test below
+this layer can catch.
+
+### Added
+
+- **14 tests covering the operator-facing surface**, grouped by what they
+  protect:
+  - *defaults* — the quiet default is the safe one (`--rate 100`, L7, and
+    `--ack-l34-lab` never on by default);
+  - *the allowlist* — `--allow` accumulates in order and verbatim, a flag missing
+    its value is an error rather than a silent default (`--allow` swallowing the
+    next flag would widen the allowlist), and a malformed `--target` IP is
+    refused;
+  - *values that must not be silently accepted* — the fat-finger guard on the SLO
+    thresholds (`--slo-max-5xx-rate 50` meaning "50%" must not become an
+    unreachable 5000% threshold that can never fail), with the `0.0`/`1.0`
+    boundaries confirmed legitimate; and unknown `--l4-mode` / `--l7-method` /
+    `--http-version` / `--output` values refused rather than defaulted, since
+    silently running `udp` when the operator asked for `syn` produces a
+    confidently wrong result;
+  - *the L3/L4 pre-traffic gates* — a missing `--ack-l34-lab`, `--target` or
+    `--port` refuses before any socket is opened, asserted against otherwise
+    valid invocations;
+  - *exit-code policy* — a run that completed nothing exits non-zero, `--rate 0`
+    is a deliberate no-op rather than a failure, a watchdog abort exits non-zero
+    (the target buckled), and an operator Ctrl-C does not (they stopped it on
+    purpose).
+
+### Changed
+
+- **`parse_args` split into a testable `parse_args_from`.** The parse loop no
+  longer calls `std::process::exit` for `--help`; it returns `Ok(None)`, which
+  the caller treats as "nothing to run". Keeping a process exit in the middle of
+  a parse function would have made the whole function untestable, and a future
+  `--help` test would have killed the test runner instead of failing.
+
+### Fixed
+
+- **`--help` did not document `--layer l3`.** The parser has always accepted it
+  (`l3` and `l4` select the same module — the ICMP modes report as L3, the rest
+  as L4), and the README and cookbook both write "l3/l4", but the usage text
+  listed only `<l4|l7>`. Found by the new tests; a test now pins the help text
+  and the parser together.
+
 ## [0.26.0] — 2026-07-31
 
 The L3/L4 pacer no longer lets `thread::sleep` decide the rate.
@@ -1007,7 +1060,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/h4b00b/jinrai/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/h4b00b/jinrai/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/h4b00b/jinrai/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/h4b00b/jinrai/compare/v0.23.0...v0.24.0

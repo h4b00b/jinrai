@@ -51,7 +51,9 @@ REQUIRED:
                        authorized, isolated-lab network. No traffic without it.
 
 OPTIONS:
-    --layer <l4|l7>       Module to run (default: l7)
+    --layer <l3|l4|l7>    Module to run (default: l7). l3 and l4 are the same
+                          module — the ICMP modes report as L3, the rest as L4 —
+                          so either spelling selects it.
     --l4-mode <MODE>      L3/L4 primitive (default: udp). One of:
                             udp | tcp | data     no privilege needed (data =
                                                  PSH-ACK data flood: real OS
@@ -294,6 +296,7 @@ enum OutputForm {
     Line,
 }
 
+#[derive(Debug)]
 struct Args {
     allow: Vec<String>,
     targets: Vec<IpAddr>,
@@ -372,7 +375,8 @@ fn raise_nofile_limit() {
 fn raise_nofile_limit() {}
 
 fn run() -> Result<(), String> {
-    let args = parse_args()?;
+    // `None` => `--help` was printed; there is nothing to run.
+    let Some(args) = parse_args()? else { return Ok(()) };
 
     // A verify-only invocation checks an existing log's integrity and exits
     // without touching the allowlist, the gate, or any traffic path.
@@ -903,7 +907,25 @@ fn check_l4_outcome(report: &RunReport) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_args() -> Result<Args, String> {
+/// Parse the process's own command line.
+fn parse_args() -> Result<Option<Args>, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// Parse an arbitrary argument list.
+///
+/// Split from [`parse_args`] so the operator-facing surface — which flags are
+/// accepted, which values are refused, and what the defaults are — can be tested
+/// without a process boundary. This is the gate's front door: `--allow`,
+/// `--ack-l34-lab` and the SLO thresholds all arrive through here, and a parser
+/// that quietly accepts a malformed one of those is a safety problem, not a
+/// usability one.
+///
+/// `Ok(None)` means help was requested and already printed; the caller should
+/// exit successfully without running anything. Returning it rather than calling
+/// `process::exit` from inside the parse loop keeps this function callable from a
+/// test.
+fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let mut allow = Vec::new();
     let mut targets = Vec::new();
     let mut url = None;
@@ -940,12 +962,12 @@ fn parse_args() -> Result<Args, String> {
     let mut audit_log = None;
     let mut verify_audit = None;
 
-    let mut it = std::env::args().skip(1);
+    let mut it = args;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
-                std::process::exit(0);
+                return Ok(None);
             }
             "--allow" => allow.push(next_val(&mut it, "--allow")?),
             "--target" => {
@@ -1173,7 +1195,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    Ok(Args {
+    Ok(Some(Args {
         allow,
         targets,
         url,
@@ -1209,7 +1231,7 @@ fn parse_args() -> Result<Args, String> {
         watchdog_breaches,
         audit_log,
         verify_audit,
-    })
+    }))
 }
 
 fn next_val(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -1226,4 +1248,240 @@ fn parse_rate(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<f64, 
         return Err(format!("{flag} must be a fraction 0.0–1.0 (got {raw})"));
     }
     Ok(v)
+}
+
+/// Tests for the operator-facing surface: argument parsing, the L3/L4 pre-traffic
+/// gates, and the exit-code policy.
+///
+/// Every crate underneath this one is well covered, but the CLI is where an
+/// operator's intent is turned into a `RunPlan` — and where the mandatory
+/// acknowledgements, the allowlist and the SLO thresholds are read. A parser that
+/// silently accepts a malformed threshold, or an outcome check that reports
+/// success for a run that tested nothing, is a safety defect that no test below
+/// this layer can catch.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a command line written the way an operator would type it.
+    fn parse(argv: &[&str]) -> Result<Option<Args>, String> {
+        parse_args_from(argv.iter().map(|s| s.to_string()))
+    }
+
+    /// Parse and unwrap, for the cases that must succeed.
+    fn args_of(argv: &[&str]) -> Args {
+        parse(argv).expect("should parse").expect("should not be --help")
+    }
+
+    fn gate_of(cidrs: &[&str]) -> Authorization {
+        Authorization::new(Allowlist::from_cidrs(cidrs).unwrap(), KillSwitch::new())
+    }
+
+    // ---- defaults -------------------------------------------------------
+
+    /// The defaults an operator inherits by not passing anything. `--rate 100`
+    /// and L7 matter most: the quiet default must be the safe one.
+    #[test]
+    fn defaults_are_the_conservative_ones() {
+        let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]);
+        assert_eq!(a.rate, 100);
+        assert_eq!(a.duration_secs, 10);
+        assert!(matches!(a.layer, Layer::L7));
+        assert!(!a.ack_l34_lab, "the lab acknowledgement must never default to on");
+        assert!(a.targets.is_empty());
+        assert!(matches!(a.output, OutputForm::Human));
+    }
+
+    // ---- the allowlist, the gate's front door ---------------------------
+
+    /// `--allow` is repeatable, and every rule must survive parsing verbatim —
+    /// the allowlist is the whole safety model.
+    #[test]
+    fn allow_rules_accumulate_in_order() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8",
+            "--allow", "*.staging.internal",
+            "--allow", "192.0.2.7",
+            "--url", "http://10.1.2.3/",
+        ]);
+        assert_eq!(a.allow, ["10.0.0.0/8", "*.staging.internal", "192.0.2.7"]);
+    }
+
+    /// A flag whose value is missing must be an error, never a silent default or
+    /// a panic — `--allow` swallowing the next flag would widen the allowlist.
+    #[test]
+    fn a_flag_without_its_value_is_refused() {
+        for flag in ["--allow", "--url", "--rate", "--duration", "--target", "--port"] {
+            let err = parse(&[flag]).unwrap_err();
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_target_ip_is_refused() {
+        let err = parse(&["--allow", "10.0.0.0/8", "--target", "10.1.2"]).unwrap_err();
+        assert!(err.contains("invalid --target IP"), "{err}");
+    }
+
+    // ---- values that must not be silently accepted ----------------------
+
+    /// The fat-finger guard: `--slo-max-5xx-rate 50` meaning "50%" must not
+    /// become an unreachable 5000% threshold that can never fail. A run whose
+    /// SLO cannot fail is a test that always passes.
+    #[test]
+    fn an_out_of_range_slo_threshold_is_refused() {
+        for flag in ["--slo-max-error-rate", "--slo-max-5xx-rate", "--slo-max-4xx-rate"] {
+            for value in ["50", "-0.1", "1.5"] {
+                let err = parse(&["--allow", "10.0.0.0/8", flag, value]).unwrap_err();
+                assert!(err.contains(flag), "{flag} {value}: {err}");
+            }
+            // The boundaries themselves are legitimate.
+            for value in ["0", "0.05", "1"] {
+                assert!(
+                    parse(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", flag, value])
+                        .is_ok(),
+                    "{flag} {value} should be accepted"
+                );
+            }
+        }
+    }
+
+    /// An unrecognised mode name must be refused, not fall back to a default:
+    /// silently running `udp` when the operator asked for `syn` would produce a
+    /// confidently wrong result.
+    #[test]
+    fn unknown_enum_values_are_refused_rather_than_defaulted() {
+        let cases: [(&str, &str); 4] = [
+            ("--l4-mode", "sync"),
+            ("--l7-method", "gett"),
+            ("--http-version", "3"),
+            ("--output", "json"),
+        ];
+        for (flag, bad) in cases {
+            let err = parse(&["--allow", "10.0.0.0/8", flag, bad]).unwrap_err();
+            assert!(err.contains(flag), "{flag} {bad}: {err}");
+            assert!(err.contains(bad), "the error should quote the bad value: {err}");
+        }
+    }
+
+    /// `--layer` accepts the spellings the README and the help text use.
+    #[test]
+    fn layer_and_mode_spellings_operators_actually_type() {
+        assert!(matches!(args_of(&["--allow", "1.2.3.4", "--layer", "l4"]).layer, Layer::L4));
+        assert!(matches!(args_of(&["--allow", "1.2.3.4", "--layer", "l7"]).layer, Layer::L7));
+        // `l3` is accepted too and routes to the same module — the README and the
+        // cookbook both say "l3/l4", so the help text has to admit it exists.
+        assert!(matches!(args_of(&["--allow", "1.2.3.4", "--layer", "l3"]).layer, Layer::L3));
+        assert!(USAGE.contains("--layer <l3|l4|l7>"), "help must document the l3 spelling");
+        let a = args_of(&["--allow", "1.2.3.4", "--l4-mode", "icmp-timestamp"]);
+        assert!(matches!(a.l4_mode, L4Mode::IcmpTimestamp));
+    }
+
+    /// `--help` must be a successful no-op, not an error and not a run.
+    #[test]
+    fn help_requests_nothing_to_run() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["-h"]).unwrap().is_none());
+    }
+
+    // ---- the L3/L4 pre-traffic gates ------------------------------------
+
+    /// The mandatory lab acknowledgement. This refusal must happen before any
+    /// socket is opened, so it is asserted against a fully-formed, otherwise
+    /// valid L4 invocation.
+    #[test]
+    fn l4_without_the_lab_acknowledgement_refuses_before_any_traffic() {
+        let a = args_of(&[
+            "--allow", "127.0.0.0/8", "--layer", "l4",
+            "--target", "127.0.0.1", "--port", "9", "--rate", "1", "--duration", "1",
+        ]);
+        let err = run_l4(
+            &a,
+            gate_of(&["127.0.0.0/8"]),
+            KillSwitch::new(),
+            RateCap::new(1),
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--ack-l34-lab"), "{err}");
+    }
+
+    /// An L4 run needs a target and (outside ICMP) a port. Both refusals must
+    /// also land before any traffic.
+    #[test]
+    fn l4_refuses_a_run_it_cannot_aim() {
+        let no_target = args_of(&[
+            "--allow", "127.0.0.0/8", "--layer", "l4", "--ack-l34-lab", "--port", "9",
+        ]);
+        let err = run_l4(
+            &no_target,
+            gate_of(&["127.0.0.0/8"]),
+            KillSwitch::new(),
+            RateCap::new(1),
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--target"), "{err}");
+
+        let no_port = args_of(&[
+            "--allow", "127.0.0.0/8", "--layer", "l4", "--ack-l34-lab",
+            "--target", "127.0.0.1",
+        ]);
+        let err = run_l4(
+            &no_port,
+            gate_of(&["127.0.0.0/8"]),
+            KillSwitch::new(),
+            RateCap::new(1),
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--port"), "{err}");
+    }
+
+    // ---- exit-code policy ------------------------------------------------
+
+    /// A run that completed nothing must not exit 0: "6000 attempts, 0
+    /// responses" reported as success is a green pipeline for a test that never
+    /// happened.
+    #[test]
+    fn a_run_that_tested_nothing_is_a_failure() {
+        let dead = RunReport { units_sent: 0, errors: 40, ..Default::default() };
+        assert!(check_l7_outcome(&dead, None).is_err());
+        assert!(check_l4_outcome(&dead).is_err());
+    }
+
+    /// `--rate 0` is a deliberate no-op, not a failure: nothing was attempted, so
+    /// there is nothing to report as broken.
+    #[test]
+    fn a_zero_rate_run_is_not_a_failure() {
+        let nothing = RunReport { units_sent: 0, errors: 0, ..Default::default() };
+        assert!(check_l4_outcome(&nothing).is_ok());
+        assert!(check_l7_outcome(&nothing, None).is_ok());
+    }
+
+    /// A watchdog abort means the target buckled under load — the run did its
+    /// job, and the exit code has to say the target failed.
+    #[test]
+    fn a_watchdog_abort_exits_non_zero() {
+        let tripped = RunReport {
+            units_sent: 100,
+            aborted_by_watchdog: true,
+            ..Default::default()
+        };
+        assert!(check_l7_outcome(&tripped, None).is_err());
+    }
+
+    /// An operator Ctrl-C is not a test failure: they stopped it on purpose.
+    #[test]
+    fn an_operator_abort_is_not_a_failure() {
+        let stopped = RunReport {
+            units_sent: 100,
+            aborted_early: true,
+            ..Default::default()
+        };
+        assert!(check_l7_outcome(&stopped, None).is_ok());
+    }
 }
