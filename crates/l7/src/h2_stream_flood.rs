@@ -97,13 +97,36 @@ impl H2StreamKind {
 }
 
 /// Encode an HPACK string literal (RFC 7541 §5.2) with **no Huffman coding**:
-/// a 7-bit length prefix (high bit 0 = not Huffman) then the raw bytes. The
-/// values here (an authority host, a 1-byte name) are always < 127 bytes, so the
-/// single-byte length form always suffices.
+/// a 7-bit length prefix (high bit 0 = not Huffman) then the raw bytes.
+///
+/// Lengths of 127 or more need the multi-byte integer form of §5.1, so encode
+/// that rather than assuming the short one. A hostname may legitimately reach
+/// 253 bytes, and truncating its length into 7 bits does not fail loudly — it
+/// produces a header block the server parses as something else entirely, which
+/// in a *test tool* means silently measuring the wrong thing.
 fn hpack_str(out: &mut Vec<u8>, s: &[u8]) {
-    debug_assert!(s.len() < 128, "hpack_str only encodes the short strings used here");
-    out.push((s.len() as u8) & 0x7f);
+    hpack_int(out, s.len(), 7, 0x00);
     out.extend_from_slice(s);
+}
+
+/// HPACK integer representation (RFC 7541 §5.1): `value` in a field whose low
+/// `prefix_bits` are available, OR-ed under `flags` (the high bits that are not
+/// part of the integer). Values that fit in the prefix use one octet; larger
+/// ones set the prefix to all-ones and continue in 7-bit groups with the high
+/// bit marking continuation.
+fn hpack_int(out: &mut Vec<u8>, value: usize, prefix_bits: u32, flags: u8) {
+    let max_prefix = (1usize << prefix_bits) - 1;
+    if value < max_prefix {
+        out.push(flags | value as u8);
+        return;
+    }
+    out.push(flags | max_prefix as u8);
+    let mut rest = value - max_prefix;
+    while rest >= 128 {
+        out.push((rest % 128) as u8 | 0x80);
+        rest /= 128;
+    }
+    out.push(rest as u8);
 }
 
 /// A minimal, valid HPACK request header block for `GET / ` against `host`:
@@ -477,6 +500,39 @@ mod tests {
         assert!(b.contains(&0x40), "must insert a dynamic entry");
         let refs = b.iter().filter(|&&x| x == 0xBE).count();
         assert!(refs > 10_000, "should reference the entry thousands of times: {refs}");
+    }
+
+    /// RFC 7541 §5.1: a length of 127 or more does not fit the 7-bit prefix and
+    /// must continue into further octets. A hostname can be 253 bytes, so the
+    /// short form is not always available — and getting this wrong corrupts the
+    /// header block silently rather than failing.
+    #[test]
+    fn hpack_encodes_string_lengths_that_do_not_fit_the_prefix() {
+        // Below the boundary: one octet holding the length itself.
+        let mut short = Vec::new();
+        hpack_str(&mut short, &b"x".repeat(126));
+        assert_eq!(short[0], 126, "126 still fits the 7-bit prefix");
+        assert_eq!(short.len(), 1 + 126);
+
+        // At and above it: prefix saturates to 127, remainder in 7-bit groups.
+        let mut at = Vec::new();
+        hpack_str(&mut at, &b"x".repeat(127));
+        assert_eq!(&at[..2], &[127, 0], "127 => prefix 127, then a zero remainder");
+        assert_eq!(at.len(), 2 + 127);
+
+        let mut long = Vec::new();
+        hpack_str(&mut long, &b"x".repeat(253));
+        // 253 - 127 = 126, which fits one continuation octet with no high bit.
+        assert_eq!(&long[..2], &[127, 126]);
+        assert_eq!(long.len(), 2 + 253, "the host must survive the encoding intact");
+
+        // A realistic long authority round-trips into the block at full length.
+        let host = format!("{}.staging.internal", "a".repeat(200));
+        let block = request_block(&host, false);
+        assert!(
+            block.windows(host.len()).any(|w| w == host.as_bytes()),
+            "the full authority must appear in the header block"
+        );
     }
 
     #[test]

@@ -548,23 +548,44 @@ impl SloSpec {
         let frac = |n: u64| n as f64 / attempts as f64;
         if let Some(limit) = self.max_error_rate {
             let observed = frac(errors);
-            if observed > limit {
+            if breached(observed, limit) {
                 breaches.push(SloBreach::ErrorRate { observed, limit });
             }
         }
         if let Some(limit) = self.max_5xx_rate {
             let observed = frac(s5xx);
-            if observed > limit {
+            if breached(observed, limit) {
                 breaches.push(SloBreach::ServerErrorRate { observed, limit });
             }
         }
         if let Some(limit) = self.max_4xx_rate {
             let observed = frac(s4xx);
-            if observed > limit {
+            if breached(observed, limit) {
                 breaches.push(SloBreach::ClientErrorRate { observed, limit });
             }
         }
         breaches
+    }
+
+    /// Check every rate threshold is a fraction in `[0.0, 1.0]`.
+    ///
+    /// The fields are public, so a caller can put anything in them. The CLI
+    /// refuses bad values at parse time; this is for anyone driving the engines
+    /// as a library, who would otherwise find out by getting a verdict that
+    /// means nothing.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("max_error_rate", self.max_error_rate),
+            ("max_5xx_rate", self.max_5xx_rate),
+            ("max_4xx_rate", self.max_4xx_rate),
+        ] {
+            if let Some(v) = v {
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("{name} must be a fraction in 0.0..=1.0 (got {v})"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The end-of-run verdict: the rate thresholds over the whole run plus the
@@ -586,6 +607,17 @@ impl SloSpec {
         }
         SloVerdict { breaches }
     }
+}
+
+/// A rate threshold is breached when the observed fraction exceeds it — **or**
+/// when the limit is not a number that can be compared against.
+///
+/// `observed > f64::NAN` is `false`, so a NaN limit would quietly make every
+/// check pass and the run report `PASS` with its safety thresholds silently
+/// disabled. A threshold that cannot be evaluated must never report itself as
+/// met: for a tool whose output is evidence, that is the only safe reading.
+fn breached(observed: f64, limit: f64) -> bool {
+    !limit.is_finite() || observed > limit
 }
 
 /// Why a module produced no run at all.
@@ -742,6 +774,23 @@ mod tests {
         // The watchdog passes zero-attempt windows; they must breach nothing.
         let spec = SloSpec { max_error_rate: Some(0.0), ..Default::default() };
         assert!(spec.breaches_rates(0, 0, 0, 0).is_empty());
+    }
+
+    /// A NaN threshold used to make every comparison false, so a run whose
+    /// safety thresholds were nonsense reported a clean PASS. An unevaluable
+    /// threshold must fail, not pass.
+    #[test]
+    fn a_threshold_that_cannot_be_evaluated_does_not_report_pass() {
+        let spec = SloSpec { max_error_rate: Some(f64::NAN), ..Default::default() };
+        let report = RunReport { units_sent: 100, errors: 0, ..Default::default() };
+        assert!(
+            !spec.evaluate(&report).passed(),
+            "a NaN limit must not silently disable the threshold"
+        );
+        // And the same spec is rejected outright by the validating path.
+        assert!(spec.validate().is_err());
+        assert!(SloSpec { max_5xx_rate: Some(1.5), ..Default::default() }.validate().is_err());
+        assert!(SloSpec { max_4xx_rate: Some(0.5), ..Default::default() }.validate().is_ok());
     }
 
     #[test]

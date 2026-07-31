@@ -1,14 +1,19 @@
-//! jinrai CLI — Phase 1 operator entry point.
+//! jinrai CLI — the operator entry point.
 //!
-//! Wires the safety gate to the (stub) traffic modules end-to-end:
-//!   1. Parse the operator-supplied allowlist (`--allow <CIDR>`, repeatable).
-//!   2. Parse targets (`--target <IP>`, repeatable).
-//!   3. Authorize every target through the gate — refuse the whole run if any
+//! Wires the safety gate to the traffic modules end-to-end. **This emits real
+//! traffic**; every step below exists to make sure it only ever goes where the
+//! operator said it could:
+//!   1. Refuse a run with no audit trail (`--audit-log`, or `--no-audit` to say
+//!      so out loud) and no lab acknowledgement (`--ack-lab`).
+//!   2. Parse the operator-supplied allowlist (`--allow <CIDR|name>`, repeatable).
+//!   3. Parse targets (`--target <IP>`, or the `--url` datum for l7).
+//!   4. Authorize every target through the gate — refuse the whole run if any
 //!      target is not allowlisted (fail-closed).
-//!   4. Build a `RunPlan` and hand it to the selected module.
-//!
-//! Because the modules are still stubs, no traffic is emitted yet; this proves
-//! the safety wiring works before real generation lands.
+//!   5. Install the kill switch on SIGINT/SIGTERM, refusing to start if it could
+//!      not be installed — a run that cannot be stopped is not started.
+//!   6. Build a `RunPlan` and hand it to the selected module, which generates
+//!      the load. `--dry-run` stops exactly here, after everything refusable has
+//!      been done and before anything is sent.
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -48,8 +53,22 @@ REQUIRED:
     For --layer l3/l4:
     --target <IP>      Target address (repeatable). Must match an IP/CIDR --allow.
     --port <N>         Target port (required for l3/l4, except --l4-mode icmp).
-    --ack-l34-lab      REQUIRED acknowledgement that this L3/L4 run targets an
-                       authorized, isolated-lab network. No traffic without it.
+
+REQUIRED FOR ANY RUN THAT EMITS TRAFFIC:
+    --ack-lab          Acknowledgement that this run targets an authorized,
+                       isolated-lab system. Every layer, not just l3/l4 — an l7
+                       run needs no privileges and is the easiest to fire by
+                       accident. (--ack-l34-lab is the old spelling, still
+                       accepted.) Not needed with --dry-run.
+    --audit-log <PATH> Append-only, hash-chained record of this run. A run with
+                       neither this nor --no-audit is refused: the trail is only
+                       worth something if it cannot be quietly skipped.
+    --no-audit         Run without a trail, deliberately. Says on the command
+                       line what omitting --audit-log used to say silently.
+    --dry-run          Validate, authorize, print the plan — send nothing. Does
+                       the whole refusable path (allowlist, gate, preflight), so
+                       what it prints is the run that was about to happen. Exempt
+                       from --ack-lab and the audit requirement.
 
 OPTIONS:
     --layer <l3|l4|l7>    Module to run (default: l7). l3 and l4 are the same
@@ -161,11 +180,16 @@ OPTIONS:
                           caches/CDNs cannot serve a stored response (query only;
                           the host is never altered)
     --max-connections <N> Cap concurrent in-flight requests (~concurrent keep-alive
-                          connections) for the fast get/post/head flood (default: 0
-                          = unbounded). Pins the load to at most N connections held
-                          busy — the controlled form of keep-alive connection
-                          exhaustion (probe a server's connection-slot / worker
-                          limit); --rate still caps the request rate on top
+                          connections) for the fast get/post/head flood and the
+                          tls-handshake flood (default: 1024). Pins the load to at
+                          most N connections held busy — the controlled form of
+                          keep-alive connection exhaustion (probe a server's
+                          connection-slot / worker limit); --rate still caps the
+                          request rate on top. --rate does NOT bound concurrency
+                          by itself: against a target that answers slowly, rate x
+                          latency is the socket count, so this is what keeps a run
+                          from becoming a descriptor self-test on YOUR box. 0
+                          means unbounded — an explicit choice, never the default
     --request-timeout-ms <MS>  How long one l7 request may stay unresolved before
                           it is abandoned and counted in the `timeout` errno
                           bucket (default: 10000). Applies to the fast
@@ -331,7 +355,9 @@ struct Args {
     payload_size: usize,
     concurrency: usize,
     connect_timeout_ms: u64,
-    ack_l34_lab: bool,
+    ack_lab: bool,
+    dry_run: bool,
+    no_audit: bool,
     rate: u64,
     duration_secs: u64,
     profile: ProfileKind,
@@ -426,6 +452,9 @@ fn run() -> Result<(), String> {
     // will grant, and say what it is.
     raise_nofile_limit();
 
+    // Refused before the log exists, for the obvious reason.
+    audit_trail_required(&args)?;
+
     // Open the audit log (if requested) up front so an unusable log aborts the
     // run BEFORE any authorization or traffic — no untracked runs.
     let operator = operator_identity();
@@ -433,6 +462,12 @@ fn run() -> Result<(), String> {
         Some(path) => Some(AuditLog::open(path, &operator).map_err(|e| e.to_string())?),
         None => None,
     };
+
+    // Audited like every other pre-gate refusal: an operator who forgot the
+    // acknowledgement is an event a reviewer wants to see attempted.
+    if let Err(reason) = lab_ack_required(&args) {
+        return Err(audit_refusal(&mut audit.as_mut(), "acknowledgement", &reason)?);
+    }
 
     // 1. Build the allowlist from operator parameters (mixed CIDRs + DNS names).
     //    A malformed or missing allowlist is a safety-relevant refusal like any
@@ -463,10 +498,22 @@ fn run() -> Result<(), String> {
     // is inert. This covers Ctrl-C (SIGINT) *and* SIGTERM/SIGHUP — an unattended
     // run under systemd, docker or K8s is stopped by SIGTERM, and that is exactly
     // the case where an audited, drained shutdown matters most.
+    //
+    // A failure here is fail-closed, not a warning: continuing would start a live
+    // flood whose only advertised stop control does not exist. A run you cannot
+    // abort is precisely the run not to start. (A dry run has nothing to abort,
+    // so it is exempt.)
     {
         let kill = kill.clone();
         if let Err(e) = ctrlc::set_handler(move || kill.trip()) {
-            eprintln!("warning: could not install the abort (SIGINT/SIGTERM) handler: {e}");
+            if !args.dry_run {
+                let reason = format!(
+                    "could not install the abort (SIGINT/SIGTERM) handler: {e} — refusing \
+                     to start traffic that could not then be stopped"
+                );
+                return Err(audit_refusal(&mut audit.as_mut(), "kill-switch", &reason)?);
+            }
+            eprintln!("warning: could not install the abort handler: {e} (dry run — nothing to abort)");
         }
     }
 
@@ -516,6 +563,80 @@ fn audit_refusal(
         AuditEvent::RunRefused { stage: stage.into(), reason: reason.to_string() },
     )?;
     Ok(reason.to_string())
+}
+
+/// A live run must be accountable.
+///
+/// The audit machinery is fail-closed once a log is open — opened before any
+/// traffic, a write failure aborts the run — but all of that was worth nothing
+/// while the flag was optional, because the one command an operator would rather
+/// not have on record is exactly the one that omits it. So: name a log, or say
+/// out loud that this run will not be recorded. `--dry-run` is exempt because it
+/// emits nothing to account for.
+fn audit_trail_required(args: &Args) -> Result<(), String> {
+    if args.audit_log.is_none() && !args.no_audit && !args.dry_run {
+        return Err(
+            "refusing to run without an audit trail: pass --audit-log <PATH> to record \
+             this run, or --no-audit to run untracked on purpose"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The lab acknowledgement, for **every** layer that emits traffic.
+///
+/// It used to cover the raw-socket layers only. But l7 is the default layer and
+/// by far the most reachable — an ordinary URL and an allowlist are enough to
+/// put real load on something, no privileges required — so leaving it as the one
+/// layer that fires with no confirmation had it exactly backwards.
+fn lab_ack_required(args: &Args) -> Result<(), String> {
+    if !args.ack_lab && !args.dry_run {
+        return Err(
+            "refusing to emit traffic: pass --ack-lab to confirm this targets an \
+             authorized, isolated-lab system (or --dry-run to validate without sending)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// `--dry-run`: everything up to the first packet, and then stop.
+///
+/// By this point the run has done all of its refusable work — allowlist parsed,
+/// datum authorized through the gate, engine constructed, preflight passed — so
+/// what it prints is not a guess about what *would* happen, it is the plan that
+/// was about to execute. That is the point: the way to check a jinrai command
+/// line was previously to run it, which for a mistyped `--rate` or an `--allow`
+/// that is wider than intended is a poor way to find out.
+///
+/// Recorded as a refusal at stage `dry-run` so the trail cannot be misread: the
+/// `RunAuthorized` record above it is real, and this is what says no traffic
+/// followed it.
+fn dry_run_summary(
+    audit: &mut Option<&mut AuditLog>,
+    module: &dyn StressModule,
+    plan: &RunPlan,
+    args: &Args,
+) -> Result<(), String> {
+    audit_record(
+        audit,
+        AuditEvent::RunRefused {
+            stage: "dry-run".into(),
+            reason: "--dry-run: validated and authorized, no traffic emitted".into(),
+        },
+    )?;
+    println!("\nDRY RUN — validated and authorized, nothing was sent.");
+    println!("  module      {} ({:?})", module.name(), module.layer());
+    println!(
+        "  targets     {}",
+        plan.targets.iter().map(target_label).collect::<Vec<_>>().join(", ")
+    );
+    println!("  allow rules {}", args.allow.join(", "));
+    println!("  rate        {}/sec (ceiling)", args.rate);
+    println!("  duration    {}s", args.duration_secs);
+    println!("\nRe-run with --ack-lab (and without --dry-run) to send it.");
+    Ok(())
 }
 
 /// Audit a module that refused or could not start, and produce the operator-facing
@@ -659,7 +780,8 @@ fn run_l7(
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
         L7Kind::TlsHandshake => {
-            let engine = TlsHandshakeEngine::new(gate, url.clone());
+            let engine = TlsHandshakeEngine::new(gate, url.clone())
+                .with_max_connections(args.max_connections);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
         L7Kind::H2Frame(kind) => {
@@ -729,6 +851,9 @@ fn run_l7(
     }
 
     let plan = RunPlan { targets, rate_cap, duration, kill };
+    if args.dry_run {
+        return dry_run_summary(&mut audit, engine.as_ref(), &plan, args);
+    }
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let started = std::time::Instant::now();
     let started_unix = now_unix();
@@ -878,17 +1003,8 @@ fn run_l4(
     duration: Duration,
     mut audit: Option<&mut AuditLog>,
 ) -> Result<(), String> {
-    // Explicit, mandatory acknowledgement — in addition to the allowlist. These
-    // three pre-gate refusals are audited like every other refusal: a missing
-    // lab acknowledgement is exactly the event a reviewer wants to see attempted.
-    if !args.ack_l34_lab {
-        return Err(audit_refusal(
-            &mut audit,
-            "acknowledgement",
-            "refusing L3/L4 run: pass --ack-l34-lab to confirm this targets an \
-             authorized, isolated-lab network",
-        )?);
-    }
+    // The lab acknowledgement is enforced for every layer in `run`, before this
+    // point. These pre-gate refusals are audited like every other refusal.
     if args.targets.is_empty() {
         return Err(audit_refusal(
             &mut audit,
@@ -965,6 +1081,9 @@ fn run_l4(
             },
         )?;
         return Err(format!("refusing L3/L4 run: {e}"));
+    }
+    if args.dry_run {
+        return dry_run_summary(&mut audit, &module, &plan, args);
     }
     println!("running module '{}' ({:?})...", module.name(), module.layer());
     let started = std::time::Instant::now();
@@ -1047,7 +1166,7 @@ fn parse_args() -> Result<Option<Args>, String> {
 /// Split from [`parse_args`] so the operator-facing surface — which flags are
 /// accepted, which values are refused, and what the defaults are — can be tested
 /// without a process boundary. This is the gate's front door: `--allow`,
-/// `--ack-l34-lab` and the SLO thresholds all arrive through here, and a parser
+/// `--ack-lab` and the SLO thresholds all arrive through here, and a parser
 /// that quietly accepts a malformed one of those is a safety problem, not a
 /// usability one.
 ///
@@ -1067,7 +1186,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut cache_bust = false;
     let mut slow_connections = 100usize;
     let mut drip_ms = 10_000u64;
-    let mut max_connections = 0usize;
+    let mut max_connections = jinrai_l7::DEFAULT_MAX_CONNS;
     let mut request_timeout_ms = jinrai_l7::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64;
     let mut drain_timeout_ms = jinrai_l7::DEFAULT_DRAIN_GRACE.as_millis() as u64;
     let mut layer = Layer::L7;
@@ -1076,7 +1195,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut payload_size = 64usize;
     let mut concurrency = jinrai_l34::DEFAULT_CONCURRENCY;
     let mut connect_timeout_ms = jinrai_l34::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64;
-    let mut ack_l34_lab = false;
+    let mut ack_lab = false;
+    let mut dry_run = false;
+    let mut no_audit = false;
     let mut rate = 100u64;
     let mut duration_secs = 10u64;
     let mut profile = ProfileKind::Constant;
@@ -1190,14 +1311,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     parse_capped(&mut it, "--max-connections", MAX_CONNECTIONS as u64)? as usize;
             }
             "--request-timeout-ms" => {
-                request_timeout_ms = next_val(&mut it, "--request-timeout-ms")?
-                    .parse()
-                    .map_err(|_| "invalid --request-timeout-ms".to_string())?;
+                request_timeout_ms = parse_capped(&mut it, "--request-timeout-ms", MAX_TIMEOUT_MS)?;
             }
             "--drain-timeout-ms" => {
-                drain_timeout_ms = next_val(&mut it, "--drain-timeout-ms")?
-                    .parse()
-                    .map_err(|_| "invalid --drain-timeout-ms".to_string())?;
+                drain_timeout_ms = parse_capped(&mut it, "--drain-timeout-ms", MAX_TIMEOUT_MS)?;
             }
             "--l4-mode" => {
                 l4_mode = match next_val(&mut it, "--l4-mode")?.as_str() {
@@ -1238,20 +1355,23 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 );
             }
             "--payload-size" => {
-                payload_size = next_val(&mut it, "--payload-size")?
-                    .parse()
-                    .map_err(|_| "invalid --payload-size".to_string())?;
+                payload_size =
+                    parse_capped(&mut it, "--payload-size", MAX_PAYLOAD_SIZE as u64)? as usize;
             }
             "--concurrency" => {
                 concurrency =
                     parse_capped(&mut it, "--concurrency", MAX_CONNECTIONS as u64)? as usize
             }
             "--connect-timeout-ms" => {
-                connect_timeout_ms = next_val(&mut it, "--connect-timeout-ms")?
-                    .parse()
-                    .map_err(|_| "invalid --connect-timeout-ms".to_string())?;
+                connect_timeout_ms = parse_capped(&mut it, "--connect-timeout-ms", MAX_TIMEOUT_MS)?;
             }
-            "--ack-l34-lab" => ack_l34_lab = true,
+            // `--ack-l34-lab` was the L3/L4-only spelling. The acknowledgement now
+            // covers every layer that emits traffic, so the flag lost the layer
+            // from its name; the old spelling keeps working so existing runbooks
+            // and scripts do not break on upgrade.
+            "--ack-lab" | "--ack-l34-lab" => ack_lab = true,
+            "--dry-run" => dry_run = true,
+            "--no-audit" => no_audit = true,
             "--header" => {
                 let raw = next_val(&mut it, "--header")?;
                 let (k, v) = raw
@@ -1322,6 +1442,27 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         }
     }
 
+    // `--rate` is documented as a hard ceiling that every profile shapes traffic
+    // only *up to*. Today that holds because the engine clamps each stage — one
+    // call site, one `clamped_to`, and the promise rests on it. A profile floor
+    // above the ceiling is a contradiction the operator can see and we cannot
+    // resolve for them (is the ceiling wrong, or the floor?), so refuse it here
+    // rather than silently flattening the shape they asked for.
+    if ramp_start > rate {
+        return Err(format!(
+            "--ramp-start {ramp_start} exceeds the --rate ceiling {rate}: a ramp cannot \
+             start above the cap it ramps toward (raise --rate or lower --ramp-start)"
+        ));
+    }
+    if let Some(base) = spike_base {
+        if base > rate {
+            return Err(format!(
+                "--spike-base {base} exceeds the --rate ceiling {rate}: the baseline \
+                 cannot be above the spike peak (raise --rate or lower --spike-base)"
+            ));
+        }
+    }
+
     Ok(Some(Args {
         allow,
         targets,
@@ -1343,7 +1484,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         payload_size,
         concurrency,
         connect_timeout_ms,
-        ack_l34_lab,
+        ack_lab,
+        dry_run,
+        no_audit,
         rate,
         duration_secs,
         profile,
@@ -1385,6 +1528,20 @@ const MAX_CONNECTIONS: usize = 1_048_576;
 /// Upper bound on `--ramp-steps`. Each step is a materialised stage in a `Vec`,
 /// so an unbounded count is an allocation request, not a load shape.
 const MAX_RAMP_STEPS: u32 = 10_000;
+
+/// Upper bound on every `*-timeout-ms` flag (24 hours, the `--duration` ceiling
+/// expressed in milliseconds). These all become `Instant::now() + duration`,
+/// which **panics** on overflow — and with `panic = "abort"` that is a process
+/// death, potentially with sockets already open. A timeout longer than the
+/// longest run jinrai will accept cannot mean anything anyway.
+const MAX_TIMEOUT_MS: u64 = MAX_DURATION_SECS * 1_000;
+
+/// Upper bound on `--payload-size` (1 MiB). The value is allocated per unit, so
+/// an unbounded one is an out-of-memory abort dressed as a flag. A UDP datagram
+/// cannot exceed 65 507 bytes in the first place, and for `--l4-mode data` the
+/// write size stops mattering long before a mebibyte — so this ceiling never
+/// shapes a real test, it only catches the typo.
+const MAX_PAYLOAD_SIZE: usize = 1_048_576;
 
 /// Parse a numeric flag and refuse — loudly — anything above `max`.
 ///
@@ -1456,9 +1613,26 @@ mod tests {
         assert_eq!(a.rate, 100);
         assert_eq!(a.duration_secs, 10);
         assert!(matches!(a.layer, Layer::L7));
-        assert!(!a.ack_l34_lab, "the lab acknowledgement must never default to on");
+        assert!(!a.ack_lab, "the lab acknowledgement must never default to on");
+        assert!(!a.no_audit, "opting out of the audit trail must never default to on");
+        assert!(!a.dry_run);
         assert!(a.targets.is_empty());
         assert!(matches!(a.output, OutputForm::Human));
+        assert_eq!(
+            a.max_connections,
+            jinrai_l7::DEFAULT_MAX_CONNS,
+            "concurrency must default to a finite cap, not unbounded"
+        );
+    }
+
+    #[test]
+    fn the_lab_acknowledgement_accepts_the_old_spelling() {
+        // Renaming the flag must not silently turn an acknowledged run in an
+        // existing runbook into a refused one.
+        for flag in ["--ack-lab", "--ack-l34-lab"] {
+            let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", flag]);
+            assert!(a.ack_lab, "{flag} should set the acknowledgement");
+        }
     }
 
     // ---- the allowlist, the gate's front door ---------------------------
@@ -1664,27 +1838,80 @@ mod tests {
         assert!(parse(&["-h"]).unwrap().is_none());
     }
 
-    // ---- the L3/L4 pre-traffic gates ------------------------------------
+    // ---- the pre-traffic gates, every layer -----------------------------
 
-    /// The mandatory lab acknowledgement. This refusal must happen before any
-    /// socket is opened, so it is asserted against a fully-formed, otherwise
-    /// valid L4 invocation.
+    /// The mandatory lab acknowledgement, asserted against fully-formed,
+    /// otherwise-valid invocations of BOTH layers. l7 is the one that regressed
+    /// into firing unconfirmed, so it is the one that matters most here.
     #[test]
-    fn l4_without_the_lab_acknowledgement_refuses_before_any_traffic() {
-        let a = args_of(&[
+    fn no_layer_emits_traffic_without_the_lab_acknowledgement() {
+        let l7 = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]);
+        let l4 = args_of(&[
             "--allow", "127.0.0.0/8", "--layer", "l4",
-            "--target", "127.0.0.1", "--port", "9", "--rate", "1", "--duration", "1",
+            "--target", "127.0.0.1", "--port", "9",
         ]);
-        let err = run_l4(
-            &a,
-            gate_of(&["127.0.0.0/8"]),
-            KillSwitch::new(),
-            RateCap::new(1),
-            Duration::from_secs(1),
-            None,
-        )
+        for a in [&l7, &l4] {
+            let err = lab_ack_required(a).unwrap_err();
+            assert!(err.contains("--ack-lab"), "{err}");
+        }
+
+        let acked = args_of(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--ack-lab",
+        ]);
+        assert!(lab_ack_required(&acked).is_ok());
+    }
+
+    /// A dry run sends nothing, so neither gate applies to it — that is what
+    /// makes it the way to check a command line you are not yet sure of.
+    #[test]
+    fn a_dry_run_is_exempt_from_both_pre_traffic_gates() {
+        let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--dry-run"]);
+        assert!(lab_ack_required(&a).is_ok());
+        assert!(audit_trail_required(&a).is_ok());
+    }
+
+    /// Omitting `--audit-log` used to mean "this run leaves no trace", silently.
+    /// Now it has to be said.
+    #[test]
+    fn a_live_run_needs_a_trail_or_an_explicit_opt_out() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--ack-lab"];
+        let err = audit_trail_required(&args_of(&base)).unwrap_err();
+        assert!(err.contains("--audit-log"), "{err}");
+        assert!(err.contains("--no-audit"), "{err}");
+
+        let logged =
+            args_of(&[&base[..], &["--audit-log", "/tmp/jinrai-test.jsonl"]].concat());
+        assert!(audit_trail_required(&logged).is_ok());
+
+        let opted_out = args_of(&[&base[..], &["--no-audit"]].concat());
+        assert!(audit_trail_required(&opted_out).is_ok());
+    }
+
+    /// `--rate` is documented as a ceiling every profile stays under. A profile
+    /// floor above it is a contradiction, refused at the front door rather than
+    /// left to one `clamped_to` deep in the engine.
+    #[test]
+    fn a_profile_floor_above_the_rate_ceiling_is_refused() {
+        let err = parse(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--rate", "100", "--ramp-start", "500",
+        ])
         .unwrap_err();
-        assert!(err.contains("--ack-l34-lab"), "{err}");
+        assert!(err.contains("--ramp-start"), "{err}");
+
+        let err = parse(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--rate", "100", "--spike-base", "500",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--spike-base"), "{err}");
+
+        // At or below the ceiling is a legitimate shape and must still parse.
+        assert!(parse(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--rate", "100", "--ramp-start", "100",
+        ])
+        .is_ok());
     }
 
     /// An L4 run needs a target and (outside ICMP) a port. Both refusals must

@@ -40,7 +40,7 @@
 //! needs no bespoke reader.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -309,45 +309,27 @@ pub struct AuditLog {
 
 impl AuditLog {
     /// Open (creating if absent) the log at `path`, attributing records to
-    /// `operator`. Refuses to open a log whose tail record is unparsable, so we
-    /// never append onto a corrupted chain (fail-closed).
+    /// `operator`. Refuses to open a log whose tail record is unparsable or whose
+    /// tail hash does not recompute, so we never append onto a broken chain
+    /// (fail-closed).
+    ///
+    /// Takes an **exclusive advisory lock** for the lifetime of the log. Reading
+    /// the tail and appending to it is a read-modify-write on shared state: two
+    /// jinrai processes opening the same log would both recover the same
+    /// `(seq, prev)` and each write a record claiming that position. Neither is
+    /// tampering, but the chain forks — and `verify` reports a forked chain as
+    /// `Tampered`, which is the worst possible failure mode for this file. An
+    /// operator who ran two floods at once would find their evidence declared
+    /// forged. So: one writer at a time, and a clear error for the second.
     pub fn open(path: impl AsRef<Path>, operator: impl Into<String>) -> Result<Self, AuditError> {
         let path = path.as_ref().to_path_buf();
 
-        // Recover chain state from any existing content.
-        let (seq, prev_hash) = match File::open(&path) {
-            Ok(f) => {
-                let mut last = None;
-                for line in BufReader::new(f).lines() {
-                    let line = line.map_err(|e| AuditError::io(&path, e))?;
-                    if !line.trim().is_empty() {
-                        last = Some(line);
-                    }
-                }
-                match last {
-                    Some(line) => {
-                        let hash = extract_hash(&line)
-                            .ok_or_else(|| AuditError::Corrupt {
-                                path: path.clone(),
-                                line: 0,
-                                detail: "existing log's last record has no readable hash".into(),
-                            })?;
-                        let seq = extract_seq(&line).ok_or_else(|| AuditError::Corrupt {
-                            path: path.clone(),
-                            line: 0,
-                            detail: "existing log's last record has no readable seq".into(),
-                        })?;
-                        (seq + 1, hash)
-                    }
-                    None => (0, GENESIS.to_string()),
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (0, GENESIS.to_string()),
-            Err(e) => return Err(AuditError::io(&path, e)),
-        };
-
         let mut opts = OpenOptions::new();
-        opts.create(true).append(true);
+        // `read` as well as `append`: the tail is recovered through this same
+        // handle, *after* the lock is held, so nobody can append between the read
+        // and the first write. O_APPEND writes go to the end regardless of where
+        // reading left the cursor.
+        opts.create(true).append(true).read(true);
         // The log names every target a run was pointed at, and who pointed it.
         // On a shared host the default umask would leave that world-readable; a
         // file created for accountability should not be one anybody can read.
@@ -358,6 +340,66 @@ impl AuditLog {
             opts.mode(0o600);
         }
         let file = opts.open(&path).map_err(|e| AuditError::io(&path, e))?;
+
+        if let Err(e) = file.try_lock() {
+            let detail = match e {
+                fs::TryLockError::WouldBlock => {
+                    "another jinrai process is writing to this audit log; \
+                     concurrent writers would fork the hash chain"
+                        .to_string()
+                }
+                fs::TryLockError::Error(e) => {
+                    format!("could not lock the audit log for exclusive append: {e}")
+                }
+            };
+            return Err(AuditError::Locked { path, detail });
+        }
+
+        // Recover chain state from any existing content, now that the lock makes
+        // "what the file ends with" a stable answer.
+        let mut last = None;
+        for line in BufReader::new(&file).lines() {
+            let line = line.map_err(|e| AuditError::io(&path, e))?;
+            if !line.trim().is_empty() {
+                last = Some(line);
+            }
+        }
+        let (seq, prev_hash) = match last {
+            Some(line) => {
+                // Recompute the tail's own hash before chaining onto it. Trusting
+                // the stored value would mean a log whose last record had been
+                // edited still accepted new, correctly-chained records — the
+                // forgery would then sit *below* verified history, which is
+                // exactly the shape a reviewer is least likely to question.
+                let (body, stored) =
+                    split_body_hash(&line).ok_or_else(|| AuditError::Corrupt {
+                        path: path.clone(),
+                        line: 0,
+                        detail: "existing log's last record has no readable hash".into(),
+                    })?;
+                if sha256_hex(body.as_bytes()) != stored {
+                    return Err(AuditError::Tampered {
+                        path: path.clone(),
+                        line: 0,
+                        detail: "existing log's last record does not match its own hash; \
+                                 refusing to append to a broken chain (run --verify-audit)"
+                            .into(),
+                    });
+                }
+                let seq = extract_seq(&line).ok_or_else(|| AuditError::Corrupt {
+                    path: path.clone(),
+                    line: 0,
+                    detail: "existing log's last record has no readable seq".into(),
+                })?;
+                let next = seq.checked_add(1).ok_or_else(|| AuditError::Corrupt {
+                    path: path.clone(),
+                    line: 0,
+                    detail: "existing log's sequence number is at the maximum".into(),
+                })?;
+                (next, stored.to_string())
+            }
+            None => (0, GENESIS.to_string()),
+        };
 
         Ok(Self {
             file,
@@ -527,6 +569,11 @@ pub enum AuditError {
         line: usize,
         detail: String,
     },
+    /// The log could not be taken for exclusive append. Distinct from `Corrupt`
+    /// because nothing is wrong with the file: somebody else is using it, and
+    /// the operator's next move is to wait or pick another path, not to
+    /// investigate an integrity failure.
+    Locked { path: PathBuf, detail: String },
 }
 
 impl AuditError {
@@ -554,6 +601,9 @@ impl fmt::Display for AuditError {
                 "audit log {} FAILED integrity check at line {line}: {detail}",
                 path.display()
             ),
+            AuditError::Locked { path, detail } => {
+                write!(f, "audit log {} is in use: {detail}", path.display())
+            }
         }
     }
 }
@@ -578,11 +628,6 @@ fn split_body_hash(line: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
-}
-
-/// Read the `hash` value out of a full record line.
-fn extract_hash(line: &str) -> Option<String> {
-    split_body_hash(line).map(|(_, h)| h.to_string())
 }
 
 /// Read the `prev` value out of a record body (or full line).
@@ -754,6 +799,56 @@ mod tests {
         p.push(format!("jinrai-audit-test-{}-{}.jsonl", std::process::id(), name));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// Two processes appending to one log both recover the same `(seq, prev)`
+    /// and fork the chain — after which `verify` calls an untampered log
+    /// tampered. The lock makes the second opener fail loudly instead.
+    #[test]
+    fn a_second_writer_is_refused_rather_than_forking_the_chain() {
+        let path = tmp_path("concurrent");
+        let mut first = AuditLog::open(&path, "operator-a").unwrap();
+        first.record(&authorized_event()).unwrap();
+
+        let err = match AuditLog::open(&path, "operator-b") { Err(e) => e, Ok(_) => panic!("a second writer must not get the log") };
+        assert!(
+            err.to_string().contains("another jinrai process"),
+            "expected a concurrent-writer refusal, got: {err}"
+        );
+
+        // Once the first writer is done the log is available again, and the
+        // chain it left behind is intact and continuable.
+        drop(first);
+        let mut second = AuditLog::open(&path, "operator-b").unwrap();
+        second.record(&authorized_event()).unwrap();
+        drop(second);
+        let records = verify_and_read(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].seq, 1, "the chain continued rather than forking");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `open` used to take the tail's stored hash on faith. A forged tail would
+    /// then get honest, correctly-chained records appended below it — putting the
+    /// forgery in the part of the file a reviewer scrolls past.
+    #[test]
+    fn appending_onto_an_edited_tail_is_refused() {
+        let path = tmp_path("edited-tail");
+        let mut log = AuditLog::open(&path, "operator").unwrap();
+        log.record(&authorized_event()).unwrap();
+        drop(log);
+
+        // Edit a field of the (only, and therefore last) record, leaving its
+        // stored hash untouched — the tamper the chain exists to catch.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, contents.replace("10.0.0.9", "10.0.0.1")).unwrap();
+
+        let err = match AuditLog::open(&path, "operator") { Err(e) => e, Ok(_) => panic!("an edited tail must not be appendable") };
+        assert!(
+            matches!(err, AuditError::Tampered { .. }),
+            "expected a tamper refusal, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -23,6 +23,12 @@
 //! intentionally **not** re-checked against any IP allowlist — that is the
 //! current requirement: a name is judged as a name.
 //!
+//! That pinning is only worth anything if the client cannot be talked into
+//! connecting somewhere else, so **redirects are refused** (`Policy::none()`):
+//! a `Location:` pointing at another host is the one way a peer could walk the
+//! client past the gate, and it would carry the operator's headers along. A 3xx
+//! is therefore counted as the response it is, never followed.
+//!
 //! ## Wiring choice
 //!
 //! `L7Engine` is constructed with the [`RequestSpec`] (method GET for the MVP,
@@ -347,6 +353,22 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// something.
 pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
+/// Default cap on concurrent in-flight work (requests, or handshakes in the TLS
+/// flood).
+///
+/// The rate ceiling alone does not bound concurrency: at `--rate 5000` against a
+/// target that answers in 20s, an uncapped engine has 100 000 sockets open at
+/// once. That is not the load the operator declared — it is an EMFILE self-test
+/// on the *client*, and the run's own numbers become meaningless once the box
+/// starts refusing its own connections.
+///
+/// 1024 is the stock descriptor ceiling and comfortably above any realistic
+/// rate × latency product (5000/s at 200ms needs 1000), so it does not shape a
+/// healthy test — it only catches the runaway. `0` remains the explicit opt-out
+/// for an operator who really wants unbounded fan-out and has raised the limits
+/// to match.
+pub const DEFAULT_MAX_CONNS: usize = 1024;
+
 impl L7Engine {
     pub fn new(gate: Authorization, spec: RequestSpec) -> Self {
         Self {
@@ -462,6 +484,14 @@ impl L7Engine {
         let headers = self.headers()?;
         let mut builder = reqwest::Client::builder()
             .resolve_to_addrs(&datum.host, &addrs)
+            // Refuse redirects. This is a safety control, not a preference:
+            // `resolve_to_addrs` pins *this* host only, so a target answering
+            // `301 Location: http://somewhere.else/` would send the client
+            // through the system resolver to a host the gate never saw — an
+            // allowlist bypass driven entirely by the peer, and one that also
+            // leaks the operator's `--header` values to it. With `none`, the
+            // 3xx is simply a response like any other and lands in `s3xx`.
+            .redirect(reqwest::redirect::Policy::none())
             .default_headers(headers)
             .timeout(self.request_timeout);
         // Pin the protocol version when the operator asked for one. `Auto` leaves
@@ -1112,6 +1142,77 @@ mod tests {
             }
         });
         (port, stop, handle)
+    }
+
+    /// A server that answers every request with `302 Found` pointing at
+    /// `location`, plus a counter of how many connections it served.
+    fn spawn_redirect_server(
+        location: String,
+    ) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let handle = thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+                        let mut buf = [0u8; 1024];
+                        let _ = s.read(&mut buf);
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, stop, handle)
+    }
+
+    #[test]
+    fn a_redirect_never_walks_the_client_off_the_authorized_host() {
+        // The safety property: the authorized target answers 302 pointing at a
+        // host the gate never saw. Following it would be an allowlist bypass the
+        // *peer* chooses, so the redirect must be counted, not obeyed.
+        //
+        // The "elsewhere" listener is bound but never accepted from — if a single
+        // connection lands on it, the client escaped the pinned resolution.
+        let elsewhere = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let elsewhere_port = elsewhere.local_addr().unwrap().port();
+        elsewhere.set_nonblocking(true).unwrap();
+
+        let (port, stop, handle) =
+            spawn_redirect_server(format!("http://127.0.0.1:{elsewhere_port}/pwned"));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan).expect("the run should execute");
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // Assert the escape first: it is the safety property, and it is also the
+        // assertion that gives the right diagnosis. (Following the redirect makes
+        // `units_sent` 0 too, since the unauthorized host never answers — but
+        // "completed nothing" is a confusing way to report an allowlist bypass.)
+        assert!(
+            matches!(elsewhere.accept(), Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "the client followed the redirect and connected to an unauthorized host"
+        );
+        assert!(report.units_sent > 0, "should have completed some responses");
+        assert_eq!(report.status_3xx, report.units_sent, "every completion was the 302");
     }
 
     #[test]

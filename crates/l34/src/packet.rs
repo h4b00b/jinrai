@@ -45,8 +45,17 @@ pub(crate) fn source_ipv4_for(dst: Ipv4Addr, port: u16) -> Result<Ipv4Addr, L34E
         .map_err(|e| L34Error::Setup(e.to_string()))?;
     match probe.local_addr().map_err(|e| L34Error::Setup(e.to_string()))?.ip() {
         IpAddr::V4(v4) => Ok(v4),
-        // A v4 destination should yield a v4 local address; fall back to loopback.
-        IpAddr::V6(_) => Ok(Ipv4Addr::LOCALHOST),
+        // A v4 destination should always yield a v4 local address, so this arm is
+        // unreachable on AF_INET today. It still must not invent an address:
+        // substituting a plausible-looking constant here would put a source IP on
+        // the wire that the kernel never assigned us, which is the definition of
+        // the spoofing path this crate promises not to have. If the OS ever
+        // surprises us, refuse the run and say so.
+        IpAddr::V6(v6) => Err(L34Error::Setup(format!(
+            "a v4 destination resolved to the v6 local address {v6}: refusing to \
+             guess a source address (jinrai never puts an address it was not given \
+             on the wire)"
+        ))),
     }
 }
 
