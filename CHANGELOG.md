@@ -14,6 +14,83 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-07-31
+
+The tail of the same external review. 0.32.0 took the allowlist bypass and the
+skippable controls; this takes what was left, which is mostly one real defect and
+a lot of *load-bearing invariants held by comments instead of by types*.
+
+### Security
+
+- **Ctrl-C is prompt again for L3/L4.** Retiring the connect pool `join()`ed
+  every worker, and a worker blocked in `connect_timeout` cannot be interrupted —
+  so aborting a run against a target that never answers waited out the full
+  `--connect-timeout-ms` first. The run loop polled the kill switch every ~50ms
+  and then the shutdown ignored it, which made the advertised abort latency a
+  property of a timeout flag. The drain is now bounded (250ms on abort);
+  handshakes still outstanding are reported as `abandoned` rather than waited
+  out, and their threads are detached. `--l4-mode data` also checks the kill
+  switch *before* each unit rather than after, so an abort no longer pays for one
+  more blocking connect.
+- **An allowlist rule that can never match is refused.** An IPv4-mapped entry
+  (`--allow ::ffff:10.0.0.1/128`) parsed happily and then matched nothing ever:
+  `contains` fail-closes on mapped candidates, and a plain v4 address never
+  matches a v6 rule on family. The operator was left believing they had
+  authorized a host. The parse error now names the spelling that works.
+- **`DnsRule` can only be built by its parser.** The payload moved into a private
+  inner enum. The wildcard form's invariant is that its stored suffix carries a
+  leading dot — that is what makes `ends_with` align on a label boundary — and a
+  hand-built rule holding `"internal"` would have matched `evilinternal`, turning
+  the allowlist into a substring check.
+- **`resolve_addrs` returns a type that cannot be empty.** Six engines each wrote
+  `.first().expect("resolve_addrs is non-empty")`, a panic guarded only by a
+  check in another function. The guarantee is now in the type and all six are
+  gone.
+- **Two `expect`s and an `unreachable!()` became refusals.** In `Sender::setup`
+  they were reachable by adding a variant to `L4Mode`; under `panic = "abort"`
+  each was a process death where a named refusal belongs.
+- **A failed audit write no longer corrupts the log.** A partial `write_all`
+  (ENOSPC, realistically) left half a line behind, after which every `verify`
+  reported the file corrupt and `open` refused to append — one full disk
+  permanently retired the trail. The record is now rolled back to the file's
+  previous length, so a failure means the record did not happen.
+
+### Fixed
+
+- **A zero-rate profile stage is silent, not skipped.** Engines `continue`d past
+  it, which shortened the run and reached every later rate early — so a ramp fine
+  enough to truncate a stage to 0/s (0→5 in 10 steps wants 0.5/s first) reported
+  a shape it had not run. Defined in `core` as `LoadStage::is_silent` rather than
+  left to each engine.
+- **`LoadProfile::stages` clamps `steps`** to `MAX_LOAD_STAGES` (10 000). The CLI
+  already refused more; the library would have allocated a ~4-billion-element
+  `Vec`.
+- **`SlowConfig::drip` is floored at 1ms** when a run starts. The CLI refuses
+  `--drip-ms 0`; this is the backstop for library callers, where zero turns a
+  slowloris into an unpaced byte-flood that `--rate` does not bound.
+- **A flag given twice is refused** instead of letting the last one win in
+  silence — `--rate 100 --rate 5000` left an operator with a ceiling their own
+  shell history disagreed with. `--allow`, `--target` and `--header` still
+  repeat, because that is their interface.
+- **A flag is never swallowed as another flag's value.** `--audit-log --ack-lab`
+  wrote a file literally named `--ack-lab` and left the acknowledgement unset,
+  surfacing later as an unrelated refusal.
+- **Flags belonging to the other layer now warn** instead of being silently
+  dropped (`--max-connections` under `--layer l4`, `--target` under `l7`).
+- **Connect-worker stacks are 256 KiB**, up from 64 KiB. The work fits in 64 KiB;
+  the margin does not, and a stack overflow is a `SIGSEGV`, not an error this
+  code can return. The cost is address space, not resident memory.
+
+### Not done
+
+The review's remaining items are performance trade-offs — per-tick allocations in
+`build_tcp_packet`, the shared `Mutex<Histogram>` on the L7 response path. This
+project's optimisation history (0.24.0–0.28.0) is measured rather than guessed,
+and the raw-socket path cannot be profiled without `CAP_NET_RAW`, so they are
+left for a run that can measure them. The flat `Args` struct with per-mode fields
+is also still flat: a per-mode config enum touches every call site in the CLI for
+a readability gain, which is a poor trade against a safety-critical parser.
+
 ## [0.32.0] — 2026-07-31
 
 A second external review, this time of the safety *baseline* rather than the
@@ -1362,7 +1439,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/h4b00b/jinrai/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/h4b00b/jinrai/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/h4b00b/jinrai/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/h4b00b/jinrai/compare/v0.29.0...v0.30.0

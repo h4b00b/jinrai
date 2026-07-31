@@ -188,7 +188,7 @@ impl H2StreamFloodEngine {
 
     fn prepare(&self) -> Result<Prepared, L7Error> {
         let datum = authorize_datum(&self.gate, &self.url)?;
-        let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
+        let addr = resolve_addrs(&datum)?.primary();
         let https = datum.url.scheme() == "https";
         let host = authority(&datum);
         // https => TLS with ALPN "h2"; http => prior-knowledge h2c (no TLS).

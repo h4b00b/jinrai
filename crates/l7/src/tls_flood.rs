@@ -93,7 +93,7 @@ impl TlsHandshakeEngine {
                 datum.url.scheme()
             )));
         }
-        let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
+        let addr = resolve_addrs(&datum)?.primary();
         let connector = TlsConnector::from(crate::tls::client_config(vec![])?);
         let server_name = crate::tls::server_name(&datum)?;
         Ok(Prepared { addr, connector, server_name })

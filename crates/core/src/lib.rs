@@ -25,6 +25,20 @@ pub enum Layer {
 
 /// A hard ceiling on emission rate. A safety control, not just a knob:
 /// modules must never exceed it, and `0` means "refuse to send".
+///
+/// ## What a zero rate means inside a profile
+///
+/// "Refuse to send" is unambiguous for a *run's* cap — `--rate 0` emits nothing
+/// and the run is over. Inside a [`LoadProfile`] it needs one more word, because
+/// `--ramp-start 0` legitimately produces zero-rate stages and a ramp from zero
+/// is a perfectly ordinary thing to ask for.
+///
+/// The rule: **a zero-rate stage is a silent stage, not a skipped one.** It
+/// occupies its full `duration` emitting nothing. Engines used to `continue`
+/// past it, which quietly shortened the run — `--ramp-start 0 --duration 60`
+/// with 10 steps finished in 54 seconds and reached each rate 6 seconds early,
+/// so the shape the operator saw in the summary was not the shape they asked
+/// for. See [`LoadStage::is_silent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateCap {
     /// Maximum units per second (packets/sec for L3/L4, requests/sec for L7).
@@ -78,6 +92,17 @@ pub struct LoadStage {
     pub duration: Duration,
 }
 
+impl LoadStage {
+    /// True when this stage emits nothing but still takes its `duration`.
+    ///
+    /// The distinction an engine must honour: silent is not the same as absent.
+    /// See the note on [`RateCap`] for why skipping one is a reporting bug, not
+    /// an optimisation.
+    pub fn is_silent(&self) -> bool {
+        self.rate.min_interval().is_none()
+    }
+}
+
 /// How a run's emission rate varies over time. Each variant compiles to a
 /// `Vec<LoadStage>` via [`LoadProfile::stages`]. The rates a profile carries are
 /// the *shape*; the engine additionally clamps every stage to the run's
@@ -101,15 +126,29 @@ pub enum LoadProfile {
     Spike { base: RateCap, peak: RateCap, base_total: Duration, spike: Duration },
 }
 
+/// Upper bound on the stage count [`LoadProfile::stages`] will materialise.
+///
+/// Every step becomes an element of a `Vec`, so `steps` is an allocation request
+/// wearing the costume of a load shape: `u32::MAX` steps is a ~4-billion-element
+/// allocation, which aborts the process under `panic = "abort"` before a single
+/// unit is emitted. The CLI refuses anything above this at parse time; the guard
+/// lives here too so the library cannot be driven into it directly. Ten thousand
+/// stages over even a 24-hour run is a stage every 8 seconds — far past the point
+/// where more resolution tells anyone anything.
+pub const MAX_LOAD_STAGES: u32 = 10_000;
+
 impl LoadProfile {
     /// Expand the profile into the concrete constant-rate stages the engine runs.
     /// Rates are the profile's raw shape — clamp each to the run ceiling with
     /// [`RateCap::clamped_to`] before pacing.
+    ///
+    /// A ramp's `steps` is clamped to [`MAX_LOAD_STAGES`]: see there for why a
+    /// stage count is a memory question, not a fidelity one.
     pub fn stages(&self) -> Vec<LoadStage> {
         match *self {
             LoadProfile::Constant { rate, duration } => vec![LoadStage { rate, duration }],
             LoadProfile::Ramp { start, end, duration, steps } => {
-                let steps = steps.max(1);
+                let steps = steps.clamp(1, MAX_LOAD_STAGES);
                 let total_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
                 let base = total_ns / steps as u64;
                 let rem = total_ns % steps as u64;
@@ -791,6 +830,56 @@ mod tests {
         assert!(spec.validate().is_err());
         assert!(SloSpec { max_5xx_rate: Some(1.5), ..Default::default() }.validate().is_err());
         assert!(SloSpec { max_4xx_rate: Some(0.5), ..Default::default() }.validate().is_ok());
+    }
+
+    /// `steps` is an allocation request, not a fidelity setting. The CLI caps it,
+    /// but the library must not be drivable into a ~4-billion-element `Vec` —
+    /// under `panic = "abort"` that is a process death before anything is sent.
+    #[test]
+    fn a_ramp_cannot_be_asked_for_more_stages_than_it_will_materialise() {
+        let p = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(100),
+            duration: Duration::from_secs(10),
+            steps: u32::MAX,
+        };
+        let stages = p.stages();
+        assert_eq!(stages.len(), MAX_LOAD_STAGES as usize);
+        // The shape survives the clamp: it still lands exactly on `end`.
+        assert_eq!(stages.last().unwrap().rate, RateCap::new(100));
+        assert_eq!(
+            stages.iter().map(|s| s.duration).sum::<Duration>(),
+            Duration::from_secs(10),
+            "the stages must still sum to the requested duration"
+        );
+    }
+
+    /// A zero-rate stage is *silent*, not *absent*: it keeps its slot in the
+    /// shape. Engines that skipped it shortened the run and reached every later
+    /// rate early, so the ramp reported a shape it had not run.
+    ///
+    /// Note where these come from. A ramp from `--ramp-start 0` does *not* start
+    /// silent — `lerp` gives the rate reached after completing step i+1, so the
+    /// first stage already sits one increment up. Silent stages appear by integer
+    /// truncation instead: ramping 0→5 in 10 steps wants 0.5/s first, and half a
+    /// unit per second is zero units per second.
+    #[test]
+    fn a_ramp_finer_than_one_unit_per_second_keeps_its_silent_stages() {
+        let p = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(5),
+            duration: Duration::from_secs(10),
+            steps: 10,
+        };
+        let stages = p.stages();
+        assert!(stages[0].is_silent(), "0.5/s truncates to a silent stage");
+        assert!(!stages[0].duration.is_zero(), "but it still occupies its stage");
+        assert!(!stages.last().unwrap().is_silent(), "and the ramp still ends at 5/s");
+        assert_eq!(
+            stages.iter().map(|s| s.duration).sum::<Duration>(),
+            Duration::from_secs(10),
+            "including the silent one, the stages account for the whole run"
+        );
     }
 
     #[test]

@@ -697,9 +697,15 @@ fn l7_profile(args: &Args, rate_cap: RateCap, duration: Duration) -> Option<Load
             })
         }
         // Constant / Soak: flat at the ceiling — use the engine default.
-        ProfileKind::Constant | ProfileKind::Soak => None,
-        // Ramp handled above.
-        ProfileKind::Ramp => unreachable!("ramp handled above"),
+        //
+        // `Ramp` returned early above, so it cannot reach here. It shares this
+        // arm rather than getting an `unreachable!()`: with `panic = "abort"`
+        // that macro is a process death, and the invariant protecting it is
+        // "an early return several lines up still exists" — exactly the kind a
+        // later edit breaks silently. Falling back to the flat default would be
+        // a wrong load shape, which is a bug worth fixing; it is not worth
+        // killing a run over.
+        ProfileKind::Constant | ProfileKind::Soak | ProfileKind::Ramp => None,
     }
 }
 
@@ -1214,7 +1220,23 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut verify_audit = None;
 
     let mut it = args;
+    let mut seen: Vec<String> = Vec::new();
     while let Some(arg) = it.next() {
+        // A flag given twice used to let the last one win, silently. For `--rate`
+        // that means an operator who edited a command line and left the old value
+        // behind gets a ceiling they can see in their own shell history and did
+        // not get — the wrong direction for a safety control to be quiet about.
+        // The repeatable flags are exempt because repetition is their interface.
+        if arg.starts_with('-') && !REPEATABLE_FLAGS.contains(&arg.as_str()) {
+            if seen.iter().any(|s| s == &arg) {
+                return Err(format!(
+                    "{arg} given more than once — jinrai will not guess which value \
+                     you meant (only {} may repeat)",
+                    REPEATABLE_FLAGS.join(", ")
+                ));
+            }
+            seen.push(arg.clone());
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -1463,6 +1485,32 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         }
     }
 
+    // Flags belonging to the other layer were accepted and then quietly dropped.
+    // Warn rather than refuse: the run is still well-defined, and an operator
+    // adapting an l4 command line into an l7 one should be told which parts did
+    // not come across — not have the whole thing rejected.
+    let (targeting, wrong_layer) = match layer {
+        Layer::L7 => ("--url", ["--target", "--port", "--concurrency", "--connect-timeout-ms"]),
+        Layer::L3 | Layer::L4 => (
+            "--target",
+            ["--url", "--header", "--l7-method", "--max-connections"],
+        ),
+    };
+    let ignored: Vec<&str> =
+        wrong_layer.iter().copied().filter(|f| seen.iter().any(|s| s == f)).collect();
+    if !ignored.is_empty() {
+        eprintln!(
+            "warning: {} {} for --layer {}, which targets with {targeting} — ignored",
+            ignored.join(", "),
+            if ignored.len() == 1 { "is not a flag" } else { "are not flags" },
+            match layer {
+                Layer::L7 => "l7",
+                Layer::L4 => "l4",
+                Layer::L3 => "l3",
+            },
+        );
+    }
+
     Ok(Some(Args {
         allow,
         targets,
@@ -1504,8 +1552,26 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     }))
 }
 
+/// The flags whose whole point is being given more than once.
+const REPEATABLE_FLAGS: &[&str] = &["--allow", "--target", "--header"];
+
+/// Take a flag's value, refusing one that is obviously the next flag.
+///
+/// `it.next()` alone swallows whatever comes next, so a missing value turns the
+/// following flag into data: `--audit-log --ack-lab --allow …` wrote a file
+/// literally named `--ack-lab` and left the acknowledgement unset. That run then
+/// failed for a reason with no visible connection to the typo. None of jinrai's
+/// values legitimately begin with `-` (URLs, hosts, headers, numbers), and a path
+/// that does can be written `./-thing`.
 fn next_val(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    it.next().ok_or_else(|| format!("{flag} requires a value"))
+    match it.next() {
+        None => Err(format!("{flag} requires a value")),
+        Some(v) if v.starts_with('-') && v.len() > 1 => Err(format!(
+            "{flag} requires a value but got the flag {v} — if {v} really is the \
+             value, write it as ./{v}"
+        )),
+        Some(v) => Ok(v),
+    }
 }
 
 /// Upper bound on `--rate`. No single host emits ten million units a second —
@@ -1885,6 +1951,49 @@ mod tests {
 
         let opted_out = args_of(&[&base[..], &["--no-audit"]].concat());
         assert!(audit_trail_required(&opted_out).is_ok());
+    }
+
+    /// A flag given twice used to let the last value win in silence. For a
+    /// safety ceiling that is the wrong way to be quiet: the operator's shell
+    /// history shows a value they did not get.
+    #[test]
+    fn a_scalar_flag_given_twice_is_refused_rather_than_last_wins() {
+        let err = parse(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--rate", "100", "--rate", "5000",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--rate"), "{err}");
+        assert!(err.contains("more than once"), "{err}");
+
+        // The repeatable flags are the interface, not a mistake.
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--allow", "192.168.0.0/16",
+            "--url", "http://10.1.2.3/",
+            "--header", "A: 1", "--header", "B: 2",
+        ]);
+        assert_eq!(a.allow.len(), 2);
+        assert_eq!(a.headers.len(), 2);
+    }
+
+    /// A missing value used to swallow the following flag, so the typo surfaced
+    /// later as an unrelated failure.
+    #[test]
+    fn a_flag_is_never_silently_consumed_as_another_flags_value() {
+        let err = parse(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--audit-log", "--ack-lab",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--audit-log"), "{err}");
+        assert!(err.contains("--ack-lab"), "{err}");
+
+        // A value that genuinely starts with `-` is still reachable.
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/",
+            "--audit-log", "./-weird.jsonl",
+        ]);
+        assert_eq!(a.audit_log.as_deref(), Some("./-weird.jsonl"));
     }
 
     /// `--rate` is documented as a ceiling every profile stays under. A profile

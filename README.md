@@ -62,7 +62,7 @@ same five decisions:
 
 | Decision | Flag(s) | |
 |---|---|---|
-| **Where am I allowed to send?** | `--allow` (repeatable) | An IP/CIDR (`10.0.0.0/8`) or a DNS pattern (`*.staging.internal`). No default: with an empty allowlist the run is refused. |
+| **Where am I allowed to send?** | `--allow` (repeatable) | An IP/CIDR (`10.0.0.0/8`) or a DNS pattern (`*.staging.internal`). No default: with an empty allowlist the run is refused. A rule that could never match — an IPv4-mapped entry like `::ffff:10.0.0.1/128` — is refused too, rather than sitting there looking like it authorized something. |
 | **Which target?** | `--url` (L7), or `--target` + `--port` (L3/L4) | Checked against the allowlist before a single byte is sent. |
 | **Which pressure?** | `--layer`, then `--l7-method` / `--l4-mode` | This is "the attack" — see [the catalogue](#the-catalogue). |
 | **How hard?** | `--rate`, plus a concurrency ceiling | `--rate` is a hard safety ceiling, never exceeded by anything. Which ceiling flag applies depends on the method — see [the knob table](#rate-concurrency-and-which-knobs-apply). |
@@ -361,7 +361,12 @@ new target:
   `--watchdog-breaches` consecutive breaching windows. It can only ever *stop*
   traffic, never generate it. Use it on anything long or unattended.
 * **Ctrl-C is the manual brake** — it trips the same kill-switch, and no target
-  can be authorized once it is tripped.
+  can be authorized once it is tripped. It is also *prompt*: workers stop within
+  ~50ms and the connect pool stops draining after 250ms, whatever
+  `--connect-timeout-ms` says. Handshakes still outstanding at that point are
+  reported in the `abandoned` bucket rather than waited out, so a fast exit never
+  costs you the accounting. jinrai refuses to start at all if it could not
+  install the signal handler.
 * **If the summary says the run fell short of the rate cap, believe it.** A test
   that never produced the load it promised is not evidence that the target
   coped.

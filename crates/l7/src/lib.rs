@@ -261,21 +261,52 @@ pub(crate) fn authorize_datum(gate: &Authorization, url_str: &str) -> Result<Dat
     Ok(Datum { target, url, host, port, ip })
 }
 
+/// The connect address(es) an authorized datum resolved to, guaranteed non-empty
+/// by construction.
+///
+/// The type exists to carry that guarantee. `resolve_addrs` returned a `Vec` it
+/// had already checked was non-empty, and every single-connection engine then
+/// wrote `.first().expect("resolve_addrs is non-empty")` — six copies of a
+/// panic that could only fire if someone later changed the function. Making
+/// "there is at least one" a property of the type retires all six, and the next
+/// engine cannot forget it.
+pub(crate) struct ResolvedAddrs {
+    /// The address a single-connection primitive uses.
+    primary: SocketAddr,
+    /// Every address, in resolution order (`primary` first). Only the pooled
+    /// client needs the rest.
+    all: Vec<SocketAddr>,
+}
+
+impl ResolvedAddrs {
+    /// The address to connect to. Infallible.
+    pub(crate) fn primary(&self) -> SocketAddr {
+        self.primary
+    }
+
+    /// Every resolved address, for pinning a client that may open several
+    /// connections.
+    pub(crate) fn all(&self) -> &[SocketAddr] {
+        &self.all
+    }
+}
+
 /// Resolve an authorized datum to connect address(es) exactly ONCE: the IP
 /// itself for a literal, else a single DNS lookup. This is the only resolution
-/// in a run — pinning to it closes the TOCTOU window. Shared by both engines.
-pub(crate) fn resolve_addrs(datum: &Datum) -> Result<Vec<SocketAddr>, L7Error> {
-    let addrs: Vec<SocketAddr> = match datum.ip {
+/// in a run — pinning to it closes the TOCTOU window. Shared by every engine.
+pub(crate) fn resolve_addrs(datum: &Datum) -> Result<ResolvedAddrs, L7Error> {
+    let all: Vec<SocketAddr> = match datum.ip {
         Some(ip) => vec![SocketAddr::new(ip, datum.port)],
         None => (datum.host.as_str(), datum.port)
             .to_socket_addrs()
             .map_err(|e| L7Error::Dns(e.to_string()))?
             .collect(),
     };
-    if addrs.is_empty() {
+    // The one place emptiness is handled, so no caller has to.
+    let Some(&primary) = all.first() else {
         return Err(L7Error::NoAddresses);
-    }
-    Ok(addrs)
+    };
+    Ok(ResolvedAddrs { primary, all })
 }
 
 /// Inline health-watchdog configuration. When present *and* the [`SloSpec`] has
@@ -483,7 +514,7 @@ impl L7Engine {
 
         let headers = self.headers()?;
         let mut builder = reqwest::Client::builder()
-            .resolve_to_addrs(&datum.host, &addrs)
+            .resolve_to_addrs(&datum.host, addrs.all())
             // Refuse redirects. This is a safety control, not a preference:
             // `resolve_to_addrs` pins *this* host only, so a target answering
             // `301 Location: http://somewhere.else/` would send the client
@@ -687,8 +718,18 @@ impl StressModule for L7Engine {
             // Run each constant-rate stage back-to-back, re-pacing at each
             // boundary. One mechanism executes every profile shape.
             'stages: for stage in stages {
-                let Some(interval_dur) = stage.rate.min_interval() else { continue };
                 let stage_deadline = deadline_in(stage.duration).min(run_deadline);
+                // A zero-rate stage is silent, not absent: it holds its slot in
+                // the shape for its full duration. `continue`-ing past it used to
+                // shorten the run and reach every later rate early, so a ramp
+                // from zero measured something other than what it reported. See
+                // `LoadStage::is_silent`.
+                let Some(interval_dur) = stage.rate.min_interval() else {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(stage_deadline.into()) => continue,
+                        _ = wait_for_kill(kill.clone()) => { aborted = true; break 'stages; }
+                    }
+                };
                 let mut interval = tokio::time::interval(interval_dur);
                 // Never exceed the cap: on a missed tick, delay rather than burst.
                 interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
