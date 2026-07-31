@@ -14,6 +14,29 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-07-31
+
+### Added
+
+- **Wall-clock start and finish times in the run summary.** The block reported
+  `30.0s elapsed of 30.0s planned` and never said *when* that window was, so
+  lining a run up against the target's own logs, graphs or alerts meant
+  reconstructing the clock time from when the shell prompt came back. Two rows —
+  `started` / `finished`, RFC 3339 UTC — now bracket the window. The finish time
+  is derived from the start plus the measured elapsed time (rounded, so a 10.4 s
+  run finishes at +10 s rather than inside its own window), which is why the two
+  timestamps can never disagree with the `window` row above them. A caller that
+  cannot read the clock omits both rows rather than claiming 1970.
+- **`--l4-mode syn-ack` — unsolicited SYN-ACK flood.** The raw-TCP family had
+  every single flag and every illegal combination, but not the one combination
+  whose flags are *legal* and whose **state** is not: the second segment of a
+  handshake, answering a SYN the target never sent. Each packet must be matched
+  against connection state and either tracked or answered with an RST, which is
+  the load a firewall or load balancer sees as the reflected half of a spoofed
+  flood elsewhere. Same constraints as the rest of the raw family: `CAP_NET_RAW`/
+  root, IPv4-only, real source address (never spoofed), and the ACK number is a
+  real one rather than a bare bit.
+
 ## [0.29.0] — 2026-07-31
 
 The summary told an operator that a saturating target had absorbed two thirds of
@@ -1177,7 +1200,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/h4b00b/jinrai/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/h4b00b/jinrai/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/h4b00b/jinrai/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/h4b00b/jinrai/compare/v0.26.0...v0.27.0

@@ -5,12 +5,15 @@
 //!   - **TCP connect flood** — full-handshake connections held open to exercise
 //!     the connection table / backlog (no privilege needed);
 //!   - **TCP flag floods** — crafted IPv4+TCP packets with a single control flag
-//!     set (SYN / ACK / FIN / RST / URG / CWR / ECE) via a raw socket (requires
+//!     set (SYN / ACK / FIN / RST / URG / CWR / ECE), plus the unsolicited
+//!     `syn-ack` handshake response, via a raw socket (requires
 //!     `CAP_NET_RAW`/root). SYN exercises the accept backlog; ACK/FIN/RST exercise
 //!     the target's connection-tracking / stateful-firewall state for packets
 //!     outside an established connection; URG/CWR/ECE are otherwise-empty segments
 //!     carrying only an urgent or ECN congestion bit, probing how the stack and
-//!     any middlebox treat these rarely-standalone flags.
+//!     any middlebox treat these rarely-standalone flags; `syn-ack` is a legal
+//!     handshake response that answers a SYN the target never sent, so every
+//!     packet must be matched against connection state (or RST'd).
 //!   - **Anomalous flag-combination floods** — segments whose flag field matches
 //!     no RFC-legal state: `xmas` (FIN+PSH+URG), `null` (no flags), and the
 //!     mutually-contradictory `syn-fin` and `syn-rst` combinations. These probe
@@ -1007,6 +1010,7 @@ mod tests {
             L4Mode::Urg,
             L4Mode::Cwr,
             L4Mode::Ece,
+            L4Mode::SynAck,
             L4Mode::SynFin,
             L4Mode::SynRst,
             L4Mode::Xmas,
