@@ -21,12 +21,25 @@
 //! rejected at build time — fail-closed.
 
 /// A single DNS allowlist rule.
+///
+/// [`DnsRule::parse`] is the **only** way to build one. That is a safety
+/// property, not encapsulation for its own sake: the wildcard form's invariant
+/// is that its stored suffix carries a leading dot, which is what makes
+/// `ends_with` align on a label boundary. A hand-built wildcard holding
+/// `"internal"` would match `evilinternal` — a substring check on the one type
+/// whose entire job is deciding what this tool may hit. The parser cannot
+/// produce that shape, and now neither can anything else: the payload lives in
+/// a private inner enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsRule {
+pub struct DnsRule(Rule);
+
+/// The rule shapes. Private — see [`DnsRule`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rule {
     /// Exact host match. Stored normalized (lowercase, no trailing dot).
     Exact(String),
     /// Wildcard suffix match for proper subdomains. Stored *with* the leading
-    /// dot, e.g. `.staging.internal`, so `ends_with` aligns on a label boundary.
+    /// dot, e.g. `.staging.internal`.
     Wildcard(String),
 }
 
@@ -93,13 +106,13 @@ impl DnsRule {
         if let Some(rest) = norm.strip_prefix("*.") {
             // The remainder must be a well-formed domain with no further `*`.
             validate_domain(rest).map_err(|_| DnsParseError::BadWildcard(pattern.to_string()))?;
-            Ok(DnsRule::Wildcard(format!(".{rest}")))
+            Ok(DnsRule(Rule::Wildcard(format!(".{rest}"))))
         } else {
             if norm.contains('*') {
                 return Err(DnsParseError::BadWildcard(pattern.to_string()));
             }
             validate_domain(&norm)?;
-            Ok(DnsRule::Exact(norm))
+            Ok(DnsRule(Rule::Exact(norm)))
         }
     }
 
@@ -117,12 +130,12 @@ impl DnsRule {
         if validate_domain(&h).is_err() {
             return false;
         }
-        match self {
-            DnsRule::Exact(name) => &h == name,
+        match &self.0 {
+            Rule::Exact(name) => &h == name,
             // Suffix carries its leading dot, so this only matches a *proper*
             // subdomain and never the apex (`staging.internal` does not end with
             // `.staging.internal`).
-            DnsRule::Wildcard(suffix) => h.len() > suffix.len() && h.ends_with(suffix.as_str()),
+            Rule::Wildcard(suffix) => h.len() > suffix.len() && h.ends_with(suffix.as_str()),
         }
     }
 }

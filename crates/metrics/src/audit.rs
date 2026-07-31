@@ -441,17 +441,40 @@ impl AuditLog {
         let hash = sha256_hex(body.as_bytes());
         let line = format!("{body},\"hash\":\"{hash}\"}}\n");
 
-        self.file
-            .write_all(line.as_bytes())
-            .map_err(|e| AuditError::io(&self.path, e))?;
-        self.file
-            .flush()
-            .map_err(|e| AuditError::io(&self.path, e))?;
-        self.file
-            .sync_data()
-            .map_err(|e| AuditError::io(&self.path, e))?;
+        // Where the file ended before this record. A `write_all` that fails
+        // partway — ENOSPC is the realistic one — leaves half a line behind, and
+        // half a line is not a recoverable state for this file: every subsequent
+        // `verify` reports it corrupt and `open` refuses to append, so one full
+        // disk permanently retires the log. Rolling back to this length turns
+        // that into "the record did not happen", which is both true and something
+        // the caller can act on (the run aborts, fail-closed).
+        let before = self
+            .file
+            .metadata()
+            .map_err(|e| AuditError::io(&self.path, e))?
+            .len();
 
-        self.seq += 1;
+        if let Err(e) = self
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_data())
+        {
+            // Best-effort: if the rollback itself fails there is nothing further
+            // to try, and the original I/O error is the one worth reporting.
+            let _ = self.file.set_len(before);
+            let _ = self.file.sync_data();
+            return Err(AuditError::io(&self.path, e));
+        }
+
+        // Unreachable short of ~1.8e19 records, but `seq` is recovered from the
+        // file at `open`, so it is not purely internal — and this is the crate
+        // that must not panic.
+        self.seq = self.seq.checked_add(1).ok_or_else(|| AuditError::Corrupt {
+            path: self.path.clone(),
+            line: 0,
+            detail: "sequence number is at the maximum".into(),
+        })?;
         self.prev_hash = hash;
         Ok(())
     }

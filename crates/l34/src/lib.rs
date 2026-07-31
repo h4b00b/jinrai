@@ -283,6 +283,22 @@ impl L34Engine {
             // of the tick. The ceiling is exact: at most `batch` units leave per
             // `tick`, and `batch / tick == --rate` by construction.
             for _ in 0..batch {
+                // A batch is a burst by design, so the deadline and the abort
+                // signal are re-checked inside it: a large `--rate` must not buy
+                // extra traffic past `--duration`, and Ctrl-C must not wait for
+                // the batch to drain.
+                //
+                // Checked *before* each unit rather than after. `--l4-mode data`
+                // opens its connections with a blocking `connect_timeout` on this
+                // thread, so a check that comes after the send has already paid
+                // for one whole attempt the operator asked us not to make.
+                if start.elapsed() >= plan.duration {
+                    break 'run;
+                }
+                if plan.kill.is_tripped() {
+                    aborted = true;
+                    break 'run;
+                }
                 let ip = ips[idx % ips.len()];
                 idx += 1;
                 match sender.send(ip, self.config.port, &mut tally) {
@@ -297,17 +313,6 @@ impl L34Engine {
                     // to prevent: a "completed" run, 100% errors, all of them
                     // blamed on jinrai's internals instead of the dead route.
                     Err(e) => return Err(e),
-                }
-                // A batch is a burst by design, so the deadline and the abort
-                // signal are re-checked inside it: a large `--rate` must not buy
-                // extra traffic past `--duration`, and Ctrl-C must not wait for
-                // the batch to drain.
-                if start.elapsed() >= plan.duration {
-                    break 'run;
-                }
-                if plan.kill.is_tripped() {
-                    aborted = true;
-                    break 'run;
                 }
             }
 
@@ -326,8 +331,16 @@ impl L34Engine {
 
         // Retire the worker pool and account for every attempt still in flight,
         // so an attempt dispatched just before the deadline is reported rather
-        // than silently dropped.
-        sender.finish(&mut tally);
+        // than silently dropped. The grace differs by *why* we are here: a run
+        // that reached its own deadline can afford to wait out the handshakes it
+        // dispatched, but an operator who pressed Ctrl-C is owed a prompt exit,
+        // not a wait proportional to `--connect-timeout-ms`.
+        let grace = if aborted {
+            ABORT_DRAIN_GRACE
+        } else {
+            self.config.connect_timeout + ABORT_DRAIN_GRACE
+        };
+        sender.finish(&mut tally, grace);
 
         Ok(tally.into_report(label, aborted))
     }
@@ -506,7 +519,24 @@ pub fn effective_parallelism(concurrency: usize) -> usize {
 /// Stack size for a connect worker. The thread does nothing but block in
 /// `connect_timeout` and hand the result back, so the default 8 MiB reservation
 /// is pure waste at 512 threads.
-const CONNECT_WORKER_STACK: usize = 64 * 1024;
+///
+/// 256 KiB rather than the 64 KiB this started at. The work really does fit in
+/// 64 KiB, but the margin does not: a stack overflow is not an error this code
+/// can return, it is a `SIGSEGV` that takes the whole run with it, and the
+/// budget is address space rather than resident memory — 4096 workers reserve
+/// 1 GiB of *virtual* mapping and touch a few pages each. Paying nothing real
+/// for a 4x margin against a future refactor (a buffer on the stack, a deeper
+/// call into `std::net`) is the right side to be wrong on.
+const CONNECT_WORKER_STACK: usize = 256 * 1024;
+
+/// How long the connect pool keeps draining results after an **aborted** run.
+///
+/// This is the abort latency the tool promises. It is deliberately of the same
+/// order as the kill-switch polling granularity (~50ms): an operator who pressed
+/// Ctrl-C should get the process back in well under a second, whatever
+/// `--connect-timeout-ms` says. Attempts that miss it are reported as
+/// [`ErrnoBucket::Abandoned`] rather than waited out.
+const ABORT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// How long [`ConnectPool::send`] will wait for an in-flight slot to free up
 /// before giving the run loop control back. Bounded so the kill switch is still
@@ -705,20 +735,51 @@ impl ConnectPool {
         }
     }
 
-    /// Stop dispatching, wait for the workers to finish what they hold, and fold
-    /// every remaining result into `tally`.
-    fn finish(&mut self, tally: &mut Tally) {
+    /// Stop dispatching, fold in whatever lands within `grace`, and account for
+    /// anything still outstanding.
+    ///
+    /// ## Why this is time-bounded
+    ///
+    /// It used to `join()` every worker. A worker blocked in `connect_timeout`
+    /// cannot be interrupted, so the join lasted until the slowest in-flight
+    /// handshake resolved — i.e. up to `--connect-timeout-ms`, *after* the
+    /// operator pressed Ctrl-C. The run loop polls the kill switch every ~50ms
+    /// and then the shutdown ignored it, which made the advertised abort latency
+    /// a property of a timeout flag rather than of the abort.
+    ///
+    /// So the drain is bounded instead. Attempts that have not reported by then
+    /// are counted as [`ErrnoBucket::Abandoned`] — the bucket that exists for
+    /// exactly this ("offered load that never got an answer, disclosed rather
+    /// than dropped") — and their worker threads are detached rather than
+    /// waited on. A detached worker exits on its own within one connect timeout
+    /// of here, holding nothing but its own socket, so the process is free to
+    /// exit immediately without leaving the accounting dishonest.
+    fn finish(&mut self, tally: &mut Tally, grace: Duration) {
         // Dropping the dispatch queue is what tells the workers to exit; they can
         // still report the attempt in hand because `results` is unbounded.
         self.work = None;
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
+
+        let deadline = Instant::now() + grace;
+        while self.in_flight > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+            else {
+                break;
+            };
+            match self.results.recv_timeout(left) {
+                Ok(outcome) => self.absorb(outcome, tally),
+                // Timed out, or every sender is gone and nothing more is coming.
+                Err(_) => break,
+            }
         }
-        // Every worker (and so every result sender) is gone: this drains to
-        // completion and terminates.
-        while let Ok(outcome) = self.results.recv() {
-            self.absorb(outcome, tally);
+
+        // Whatever never reported is disclosed, not silently dropped.
+        for _ in 0..self.in_flight {
+            tally.record(Emission::Failed(ErrnoBucket::Abandoned));
         }
+        self.in_flight = 0;
+
+        // Detach: see the doc comment. `drain` drops the handles without joining.
+        self.workers.drain(..);
     }
 }
 
@@ -751,7 +812,14 @@ impl Sender {
                 idx: 0,
             }),
             L4Mode::Icmp | L4Mode::IcmpTimestamp | L4Mode::IcmpAddressMask => {
-                let query = mode.icmp_query().expect("ICMP mode without a query kind");
+                // Refusal, not `expect`. Today the outer arm guarantees this is
+                // `Some`, but that guarantee lives in a match arm somebody will
+                // eventually edit — and with `panic = "abort"` an `expect` here is
+                // a process death, at setup, in a tool whose whole design says a
+                // primitive that cannot start says so and returns.
+                let query = mode.icmp_query().ok_or_else(|| {
+                    L34Error::Setup(format!("{mode:?} has no ICMP query kind"))
+                })?;
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
                     .map_err(|e| L34Error::RawSocket(e.to_string()))?;
                 // Payload capped like UDP to avoid accidental fragmentation (echo
@@ -763,9 +831,16 @@ impl Sender {
             }
             other => {
                 // SYN/ACK/FIN/RST/Xmas/NULL: all raw-TCP flag floods share one setup.
-                let flags = other
-                    .raw_tcp_flags()
-                    .expect("setup reached with a non-raw-TCP mode");
+                //
+                // This is the catch-all arm, so a mode added to `L4Mode` and not
+                // wired above lands here. Refusing names the gap; the `expect`
+                // that used to be here would have aborted the process instead.
+                let flags = other.raw_tcp_flags().ok_or_else(|| {
+                    L34Error::Setup(format!(
+                        "{other:?} has no send path: it is neither a raw-TCP flag \
+                         flood nor handled by an earlier arm (this is a jinrai bug)"
+                    ))
+                })?;
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
                     .map_err(|e| L34Error::RawSocket(e.to_string()))?;
                 let with_options = other == L4Mode::TcpOptions;
@@ -783,9 +858,9 @@ impl Sender {
     }
 
     /// Retire any background workers and account for attempts still outstanding.
-    fn finish(&mut self, tally: &mut Tally) {
+    fn finish(&mut self, tally: &mut Tally, grace: Duration) {
         if let Sender::Tcp(pool) = self {
-            pool.finish(tally);
+            pool.finish(tally, grace);
         }
     }
 
@@ -1296,6 +1371,48 @@ mod tests {
             report.mean_micros > 0,
             "the failures held slots, so residency must be measured: {report:?}"
         );
+    }
+
+    /// ACCEPTANCE: shutting the pool down is bounded by its grace, not by
+    /// `--connect-timeout-ms`.
+    ///
+    /// `finish` used to `join()` every worker, and a worker blocked in
+    /// `connect_timeout` cannot be interrupted — so Ctrl-C against a target that
+    /// never answers waited out the full connect timeout before the process
+    /// exited. The run loop polled the kill switch every ~50ms and then the
+    /// shutdown ignored it.
+    ///
+    /// Driven at the pool directly with a deliberately huge timeout and attempts
+    /// marked in flight that no worker will ever report: the network-level
+    /// version of this ("find a target whose connects hang") is not deterministic
+    /// across environments, and the property under test is the shutdown, not the
+    /// connect.
+    #[test]
+    fn retiring_the_connect_pool_is_bounded_by_its_grace_not_the_connect_timeout() {
+        let _fd = fd_guard();
+        let mut pool = ConnectPool::new(4, Duration::from_secs(3600))
+            .expect("the pool should start");
+        let mut tally = Tally::new();
+
+        // Three attempts that will never report back.
+        pool.in_flight = 3;
+
+        let grace = Duration::from_millis(50);
+        let began = Instant::now();
+        pool.finish(&mut tally, grace);
+        let took = began.elapsed();
+
+        assert!(
+            took < Duration::from_secs(1),
+            "shutdown must not wait out the connect timeout, took {took:?}"
+        );
+        let report = tally.into_report("test".into(), true);
+        assert_eq!(
+            report.errno.iter().find(|(b, _)| *b == ErrnoBucket::Abandoned).map(|(_, n)| n),
+            Some(3),
+            "in-flight attempts must be disclosed, not dropped: {report:?}"
+        );
+        assert_eq!(report.errors, 3, "and counted as errors: {report:?}");
     }
 
     /// ACCEPTANCE: failures are bucketed by errno, and the tally reconciles with

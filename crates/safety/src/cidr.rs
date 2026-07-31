@@ -21,6 +21,8 @@ pub enum CidrParseError {
     BadAddress(String),
     BadPrefix(String),
     PrefixTooLong { prefix: u8, max: u8 },
+    /// An IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`), which would match nothing.
+    Ipv4Mapped(String),
 }
 
 impl std::fmt::Display for CidrParseError {
@@ -32,6 +34,11 @@ impl std::fmt::Display for CidrParseError {
             CidrParseError::PrefixTooLong { prefix, max } => {
                 write!(f, "prefix /{prefix} exceeds maximum /{max}")
             }
+            CidrParseError::Ipv4Mapped(s) => write!(
+                f,
+                "IPv4-mapped address {s} would authorize nothing — write it as \
+                 an IPv4 block instead (e.g. 10.0.0.1/32)"
+            ),
         }
     }
 }
@@ -91,6 +98,16 @@ impl FromStr for Cidr {
                 if prefix > 128 {
                     return Err(CidrParseError::PrefixTooLong { prefix, max: 128 });
                 }
+                // An IPv4-mapped entry (`::ffff:10.0.0.1/128`) authorizes exactly
+                // nothing, and does so silently. `contains` fail-closes on mapped
+                // *candidates* (they are IPv4 hosts in a v6 costume), and a plain
+                // v4 address never matches a v6 rule on family — so the operator
+                // gets a rule that looks like it opened something and did not,
+                // which on an allowlist is the worst way to be wrong. Say so at
+                // parse time and name the spelling that works.
+                if a.to_ipv4_mapped().is_some() {
+                    return Err(CidrParseError::Ipv4Mapped(addr_str.trim().to_string()));
+                }
                 let network = u128::from(a) & v6_mask(prefix);
                 Ok(Cidr::V6 { network, prefix })
             }
@@ -135,6 +152,10 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         IpAddr::from_str(s).unwrap()
+    }
+
+    fn ip_v6(s: &str) -> Ipv6Addr {
+        Ipv6Addr::from_str(s).unwrap()
     }
 
     #[test]
@@ -192,6 +213,25 @@ mod tests {
         assert!(!v4.contains(ip("::ffff:10.0.0.1")));
     }
 
+    /// An allowlist entry that can never match is worse than a rejected one: the
+    /// operator believes they authorized a host and did not. Refuse at parse and
+    /// name the spelling that works.
+    #[test]
+    fn ipv4_mapped_allowlist_entries_are_refused_rather_than_silently_inert() {
+        for pattern in ["::ffff:10.0.0.1/128", "::ffff:0:0/96", "::FFFF:192.168.1.0/120"] {
+            let err = pattern.parse::<Cidr>().unwrap_err();
+            assert!(
+                matches!(err, CidrParseError::Ipv4Mapped(_)),
+                "{pattern} should be refused as v4-mapped, got {err:?}"
+            );
+            assert!(err.to_string().contains("10.0.0.1/32"), "the error must name the fix");
+        }
+        // Ordinary v6 blocks, including the catch-all, still parse.
+        assert!("::/0".parse::<Cidr>().is_ok());
+        assert!("2001:db8::/32".parse::<Cidr>().is_ok());
+        assert!("::1/128".parse::<Cidr>().is_ok());
+    }
+
     #[test]
     fn ipv4_mapped_v6_refused_by_v6_block_fail_closed() {
         // Regression: an operator listing ONLY a v6 block (even the catch-all
@@ -202,7 +242,14 @@ mod tests {
 
         // Even a v6 block that literally covers the mapped range refuses it:
         // mapped addresses are never authorized by anything (strictly closed).
-        let mapped_block: Cidr = "::ffff:0:0/96".parse().unwrap();
+        //
+        // Built directly rather than parsed, because the parser now refuses such
+        // an entry outright (see
+        // `ipv4_mapped_allowlist_entries_are_refused_rather_than_silently_inert`).
+        // Both layers are wanted: the parser stops the operator writing a rule
+        // that authorizes nothing, and this stops the *matcher* honouring one if
+        // it ever arrives by another route.
+        let mapped_block = Cidr::V6 { network: u128::from(ip_v6("::ffff:0:0")), prefix: 96 };
         assert!(!mapped_block.contains(ip("::ffff:10.0.0.1")));
     }
 

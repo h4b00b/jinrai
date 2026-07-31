@@ -136,7 +136,7 @@ impl H2FrameFloodEngine {
 
     fn prepare(&self) -> Result<Prepared, L7Error> {
         let datum = authorize_datum(&self.gate, &self.url)?;
-        let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
+        let addr = resolve_addrs(&datum)?.primary();
         // https => TLS with ALPN "h2"; http => prior-knowledge h2c (no TLS).
         let tls = if datum.url.scheme() == "https" {
             let connector = TlsConnector::from(crate::tls::client_config(vec![b"h2".to_vec()])?);

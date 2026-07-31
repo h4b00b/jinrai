@@ -53,7 +53,7 @@ impl H2RapidResetEngine {
 
     fn prepare(&self) -> Result<Prepared, L7Error> {
         let datum = authorize_datum(&self.gate, &self.url)?;
-        let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
+        let addr = resolve_addrs(&datum)?.primary();
         let uri = datum
             .url
             .as_str()

@@ -91,9 +91,25 @@ pub struct SlowConfig {
     /// Concurrent connection ceiling. New connections are opened (rate-capped)
     /// up to this many, then the run just keeps them alive until the deadline.
     pub max_conns: usize,
-    /// Interval between keep-alive writes on each held connection.
+    /// Interval between keep-alive writes on each held connection. Clamped to at
+    /// least [`MIN_DRIP`] when the run starts — see there.
     pub drip: Duration,
 }
+
+/// Floor on [`SlowConfig::drip`].
+///
+/// The drip interval is what makes a slow attack slow. At zero the per-connection
+/// write loop is unpaced, so each held connection becomes a byte-flood running as
+/// fast as the socket accepts — and crucially, `--rate` does **not** bound it:
+/// the rate cap governs how fast connections are *opened*, never how fast an
+/// already-open one is written to. A `drip` of zero therefore turns a primitive
+/// the operator chose for being gentle into unbounded traffic no declared ceiling
+/// covers.
+///
+/// The CLI refuses `--drip-ms 0` outright with a message. This floor is the
+/// library-side backstop for callers that build a [`SlowConfig`] directly, where
+/// silently clamping beats emitting a flood nobody asked for.
+pub const MIN_DRIP: Duration = Duration::from_millis(1);
 
 /// The slow-connection engine. Holds a clone of the gate (the sole authority),
 /// the target URL, and the run config.
@@ -119,7 +135,7 @@ impl L7SlowEngine {
     /// build the TLS connector + SNI server name used for every connection.
     fn prepare(&self) -> Result<Prepared, L7Error> {
         let datum = authorize_datum(&self.gate, &self.url)?;
-        let addr = *resolve_addrs(&datum)?.first().expect("resolve_addrs is non-empty");
+        let addr = resolve_addrs(&datum)?.primary();
 
         let mut target = datum.url.path().to_string();
         if let Some(q) = datum.url.query() {
@@ -210,7 +226,8 @@ impl StressModule for L7SlowEngine {
         let errors_w = errors.clone();
 
         let mode = self.cfg.mode;
-        let drip = self.cfg.drip;
+        // Floored here rather than trusted from the config: see `MIN_DRIP`.
+        let drip = self.cfg.drip.max(MIN_DRIP);
         let max_conns = self.cfg.max_conns;
         let duration = plan.duration;
         let kill = plan.kill.clone();
