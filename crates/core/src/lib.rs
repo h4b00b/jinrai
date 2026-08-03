@@ -481,6 +481,18 @@ pub struct RunReport {
     /// `None` for the layers whose units have one meaning, and the reporter omits
     /// the row entirely.
     pub detail: Option<String>,
+    /// Attempts the generator declined to make because its own in-flight budget
+    /// was saturated — load that was *never offered* to the target.
+    ///
+    /// Deliberately outside `attempts()`: these are not the target's failures, so
+    /// folding them into `errors` would blame it for our shortfall and drag every
+    /// SLO rate with it. But dropping them silently is worse, because it makes the
+    /// two readings of a low `sent` count indistinguishable — "the target absorbed
+    /// everything we offered" and "we never offered it" produce the same summary,
+    /// and only one of them is a result. A non-zero count here says the binding
+    /// constraint was on this side of the wire: raise `--concurrency`, or read the
+    /// run as a generator measurement.
+    pub not_offered: u64,
 }
 
 impl RunReport {
@@ -524,6 +536,20 @@ pub enum SloBreach {
     ClientErrorRate { observed: f64, limit: f64 },
     /// p99 latency exceeded the limit.
     LatencyP99 { observed_micros: u64, limit_micros: u64 },
+    /// A rate threshold was not a fraction in `[0.0, 1.0]`, so nothing could be
+    /// evaluated against it.
+    ///
+    /// Reported as a breach rather than resolved either way, because both of the
+    /// quiet answers are worse. Skipping the threshold prints PASS for a run that
+    /// checked nothing; honouring it literally prints FAIL for a target that did
+    /// nothing wrong (`max_error_rate: Some(-0.5)` is exceeded by every possible
+    /// observation). This tool's verdicts are meant to be evidence, so a spec that
+    /// cannot produce one says so in the verdict itself.
+    ///
+    /// Unreachable from the CLI, which refuses these at parse time — this is for
+    /// library callers, who can put anything in the public fields. See
+    /// [`SloSpec::validate`] to catch it before a run instead.
+    InvalidThreshold { name: &'static str, limit: f64 },
 }
 
 impl std::fmt::Display for SloBreach {
@@ -540,6 +566,9 @@ impl std::fmt::Display for SloBreach {
             }
             SloBreach::LatencyP99 { observed_micros, limit_micros } => {
                 write!(f, "p99 {observed_micros}us > {limit_micros}us")
+            }
+            SloBreach::InvalidThreshold { name, limit } => {
+                write!(f, "{name} {limit} is not a fraction 0.0–1.0 — nothing was evaluated")
             }
         }
     }
@@ -594,9 +623,24 @@ impl SloSpec {
     /// the end-of-run verdict and the inline watchdog (which passes the counts
     /// observed in its trailing window). Returns every breached rate. An empty
     /// sample (`attempts == 0`) can breach nothing.
+    /// A threshold outside `[0.0, 1.0]` is reported before anything is measured,
+    /// and *ahead of* the empty-sample short-circuit below: a spec that cannot be
+    /// evaluated is a finding regardless of how much traffic the run managed. See
+    /// [`SloBreach::InvalidThreshold`].
     pub fn breaches_rates(&self, attempts: u64, errors: u64, s5xx: u64, s4xx: u64) -> Vec<SloBreach> {
         let mut breaches = Vec::new();
-        if attempts == 0 {
+        for (name, limit) in [
+            ("max_error_rate", self.max_error_rate),
+            ("max_5xx_rate", self.max_5xx_rate),
+            ("max_4xx_rate", self.max_4xx_rate),
+        ] {
+            if let Some(limit) = limit {
+                if !(0.0..=1.0).contains(&limit) {
+                    breaches.push(SloBreach::InvalidThreshold { name, limit });
+                }
+            }
+        }
+        if !breaches.is_empty() || attempts == 0 {
             return breaches;
         }
         let frac = |n: u64| n as f64 / attempts as f64;
@@ -790,6 +834,34 @@ mod tests {
         let verdict = spec.evaluate(&report);
         assert!(!verdict.passed());
         assert!(matches!(verdict.breaches[0], SloBreach::ErrorRate { .. }));
+    }
+
+    #[test]
+    fn an_out_of_range_threshold_is_a_breach_not_a_silent_pass_or_fail() {
+        // `validate()` existed but nothing called it, so a library caller with a
+        // nonsense threshold got a verdict that meant nothing: -0.5 is exceeded by
+        // every possible observation, so a healthy target "FAILED" its SLO and the
+        // summary named a breach that never happened.
+        let spec = SloSpec { max_error_rate: Some(-0.5), ..Default::default() };
+        let clean = RunReport { units_sent: 100, status_2xx: 100, ..Default::default() };
+        let verdict = spec.evaluate(&clean);
+        assert!(!verdict.passed(), "an unevaluatable spec must not silently pass");
+        assert_eq!(
+            verdict.breaches,
+            vec![SloBreach::InvalidThreshold { name: "max_error_rate", limit: -0.5 }],
+            "and it must name the spec, not blame the target"
+        );
+        assert!(verdict.to_string().contains("not a fraction"), "{verdict}");
+
+        // Reported even when the run measured nothing — the spec is the finding.
+        assert!(!spec.evaluate(&RunReport::default()).passed());
+        // And a threshold above 1.0, which can never be exceeded, is equally
+        // unevaluatable in the other direction.
+        let over = SloSpec { max_5xx_rate: Some(50.0), ..Default::default() };
+        assert!(!over.evaluate(&clean).passed());
+        // A spec in range is untouched.
+        let ok = SloSpec { max_error_rate: Some(0.05), ..Default::default() };
+        assert!(ok.evaluate(&clean).passed());
     }
 
     #[test]

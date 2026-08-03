@@ -232,6 +232,12 @@ impl StressModule for TlsHelloEngine {
                     break;
                 }
 
+                // Reap finished attempts every tick: a `JoinSet` retains each
+                // completed task's output until joined, so collecting only after
+                // the loop grew our own memory with `rate × duration`. The permit
+                // cap bounds what is in flight, not what has already finished.
+                while tasks.try_join_next().is_some() {}
+
                 let permit = match &sem {
                     Some(sem) => match sem.clone().try_acquire_owned() {
                         Ok(p) => Some(p),

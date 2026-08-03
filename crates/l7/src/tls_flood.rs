@@ -173,6 +173,12 @@ impl StressModule for TlsHandshakeEngine {
                     break;
                 }
 
+                // Reap finished handshakes every tick: a `JoinSet` retains each
+                // completed task's output until joined, so collecting only after
+                // the loop grew our own memory with `rate × duration`. The permit
+                // cap bounds what is in flight, not what has already finished.
+                while tasks.try_join_next().is_some() {}
+
                 // Saturated: skip this tick rather than pile on. The permit is
                 // held for the whole handshake and released when the task ends.
                 let permit = match &sem {

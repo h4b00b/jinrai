@@ -8,8 +8,20 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 /// A single CIDR block, e.g. `10.0.0.0/8` or `2001:db8::/32`.
+///
+/// The representation is sealed: [`FromStr`] and the [`From`] conversions below
+/// are the only ways to build one, so every `Cidr` in existence has been through
+/// the prefix-length bound, the host-bit normalisation and the IPv4-mapped
+/// refusal. It used to be an enum with public fields, which made
+/// `Cidr::V4 { network, prefix: 200 }` — a block that matches by a mask the
+/// parser would never have produced — an ordinary safe expression, in the one
+/// crate whose documented job is that invalid states are unrepresentable. Sealed
+/// the same way [`DnsRule`](crate::dns::DnsRule) is, for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cidr {
+pub struct Cidr(CidrKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CidrKind {
     V4 { network: u32, prefix: u8 },
     V6 { network: u128, prefix: u8 },
 }
@@ -48,12 +60,12 @@ impl std::error::Error for CidrParseError {}
 impl Cidr {
     /// Does this block contain `ip`?
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self, ip) {
-            (Cidr::V4 { network, prefix }, IpAddr::V4(addr)) => {
+        match (&self.0, ip) {
+            (CidrKind::V4 { network, prefix }, IpAddr::V4(addr)) => {
                 let mask = v4_mask(*prefix);
                 (u32::from(addr) & mask) == (*network & mask)
             }
-            (Cidr::V6 { network, prefix }, IpAddr::V6(addr)) => {
+            (CidrKind::V6 { network, prefix }, IpAddr::V6(addr)) => {
                 // Fail-closed on IPv4-mapped IPv6 (`::ffff:a.b.c.d`). Such an
                 // address *is* an IPv4 host wearing a v6 costume: an OS/socket
                 // connect to it lands on the embedded IPv4 target. Honouring it
@@ -92,7 +104,7 @@ impl FromStr for Cidr {
                 }
                 // Normalise: zero out host bits so `network` is canonical.
                 let network = u32::from(a) & v4_mask(prefix);
-                Ok(Cidr::V4 { network, prefix })
+                Ok(Cidr(CidrKind::V4 { network, prefix }))
             }
             Ok(IpAddr::V6(a)) => {
                 if prefix > 128 {
@@ -109,7 +121,7 @@ impl FromStr for Cidr {
                     return Err(CidrParseError::Ipv4Mapped(addr_str.trim().to_string()));
                 }
                 let network = u128::from(a) & v6_mask(prefix);
-                Ok(Cidr::V6 { network, prefix })
+                Ok(Cidr(CidrKind::V6 { network, prefix }))
             }
             Err(_) => Err(CidrParseError::BadAddress(addr_str.to_string())),
         }
@@ -133,16 +145,17 @@ fn v6_mask(prefix: u8) -> u128 {
     }
 }
 
-// Convenience conversions used in tests / callers.
+// Convenience conversions used in tests / callers. A single host is already
+// canonical at /32 and /128, so there are no host bits to normalise.
 impl From<Ipv4Addr> for Cidr {
     fn from(a: Ipv4Addr) -> Self {
-        Cidr::V4 { network: u32::from(a), prefix: 32 }
+        Cidr(CidrKind::V4 { network: u32::from(a), prefix: 32 })
     }
 }
 
 impl From<Ipv6Addr> for Cidr {
     fn from(a: Ipv6Addr) -> Self {
-        Cidr::V6 { network: u128::from(a), prefix: 128 }
+        Cidr(CidrKind::V6 { network: u128::from(a), prefix: 128 })
     }
 }
 
@@ -243,13 +256,15 @@ mod tests {
         // Even a v6 block that literally covers the mapped range refuses it:
         // mapped addresses are never authorized by anything (strictly closed).
         //
-        // Built directly rather than parsed, because the parser now refuses such
-        // an entry outright (see
-        // `ipv4_mapped_allowlist_entries_are_refused_rather_than_silently_inert`).
-        // Both layers are wanted: the parser stops the operator writing a rule
-        // that authorizes nothing, and this stops the *matcher* honouring one if
-        // it ever arrives by another route.
-        let mapped_block = Cidr::V6 { network: u128::from(ip_v6("::ffff:0:0")), prefix: 96 };
+        // Built through the private representation rather than parsed, because
+        // the parser now refuses such an entry outright (see
+        // `ipv4_mapped_allowlist_entries_are_refused_rather_than_silently_inert`)
+        // — and no caller outside this module can build one at all. Both layers
+        // are wanted: the parser stops the operator writing a rule that
+        // authorizes nothing, and this stops the *matcher* honouring one if it
+        // ever arrives by another route.
+        let mapped_block =
+            Cidr(CidrKind::V6 { network: u128::from(ip_v6("::ffff:0:0")), prefix: 96 });
         assert!(!mapped_block.contains(ip("::ffff:10.0.0.1")));
     }
 
