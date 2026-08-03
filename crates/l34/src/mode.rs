@@ -80,6 +80,24 @@ pub enum L4Mode {
     /// ICMP address-mask-request flood (type 17, raw socket, L3). Exercises the
     /// target's address-mask handler.
     IcmpAddressMask,
+    /// Fragmented-UDP flood — each unit is one UDP datagram cut into IPv4
+    /// fragments (header, then payload) that the target must hold and reassemble
+    /// before it can even see which port was addressed. The load is the
+    /// reassembly table: one entry per unit, held until the last fragment arrives
+    /// or the target's fragment timer expires. Raw socket, IPv4-only, real source.
+    UdpFrag,
+    /// Fragmented-TCP flood — the same, for a SYN. A 20-byte TCP header cut on
+    /// 8-byte boundaries puts the ports in fragment 0 and the *control flags* in
+    /// fragment 1, so nothing on the path can classify the segment without
+    /// reassembling it first. Raw socket, IPv4-only, real source.
+    TcpFrag,
+    /// GRE flood (IP protocol 47) — packets encapsulating a real IPv4/UDP
+    /// datagram in a version-0 GRE header. A target that accepts protocol 47 must
+    /// recognise it, strip the outer header and re-enter its IP stack with the
+    /// inner packet, so each unit costs roughly two packets' worth of processing.
+    /// Raw socket, IPv4-only, real source — inside the encapsulation as well as
+    /// outside it.
+    Gre,
 }
 
 /// Which ICMPv4 *query* message an ICMP flood mode emits. All three are messages
@@ -165,6 +183,34 @@ impl L4Mode {
             L4Mode::Icmp => "icmp-echo-flood",
             L4Mode::IcmpTimestamp => "icmp-timestamp-flood",
             L4Mode::IcmpAddressMask => "icmp-address-mask-flood",
+            L4Mode::UdpFrag => "udp-fragment-flood",
+            L4Mode::TcpFrag => "tcp-fragment-flood",
+            L4Mode::Gre => "gre-flood",
+        }
+    }
+
+    /// The three modes that craft a complete IPv4 packet of their own without
+    /// being one of the TCP flag floods: the two fragmentation floods and the GRE
+    /// flood. They share the flag floods' raw socket, IPv4-only and real-source
+    /// constraints, and like ICMP they are network-layer tests — what they
+    /// exercise is IP reassembly and IP-protocol demultiplexing, not a transport.
+    pub(crate) fn crafts_own_ipv4(self) -> bool {
+        matches!(self, L4Mode::UdpFrag | L4Mode::TcpFrag | L4Mode::Gre)
+    }
+
+    /// How many IPv4 packets one unit of this mode puts on the wire.
+    ///
+    /// One, for every mode but the fragmentation floods — whose unit is a
+    /// *datagram*, the thing the target has to reassemble, deliberately counted
+    /// as one offered unit rather than as its pieces. The number is fixed by the
+    /// cut rule in [`crate::packet`] (the UDP header is one block; a TCP header is
+    /// three), and `fragment_counts_match_the_builder` in that module holds the
+    /// two definitions together.
+    pub(crate) fn packets_per_unit(self) -> usize {
+        match self {
+            L4Mode::UdpFrag => 2,
+            L4Mode::TcpFrag => 3,
+            _ => 1,
         }
     }
 
@@ -184,12 +230,20 @@ impl L4Mode {
     }
 
     /// The TCP flags for a raw-TCP flood mode, or `None` for every other mode
-    /// (UDP / TCP-connect need no raw socket; ICMP is not TCP).
+    /// (UDP / TCP-connect need no raw socket; ICMP and GRE are not TCP).
+    ///
+    /// [`L4Mode::TcpFrag`] answers here too, with a SYN: the fragmented flood is
+    /// a handshake opener cut into pieces, and the flags belong in this table
+    /// rather than hidden in the sender that crafts them.
     pub(crate) fn raw_tcp_flags(self) -> Option<TcpFlags> {
         match self {
             // The options bomb is a SYN too — it differs only in carrying a full
             // option block, which the sender attaches based on the mode.
-            L4Mode::Syn | L4Mode::TcpOptions => Some(TcpFlags { syn: true, ..TcpFlags::NONE }),
+            // The options bomb and the fragmented flood are SYNs too; they differ
+            // only in what the sender wraps around this flag field.
+            L4Mode::Syn | L4Mode::TcpOptions | L4Mode::TcpFrag => {
+                Some(TcpFlags { syn: true, ..TcpFlags::NONE })
+            }
             L4Mode::Ack => Some(TcpFlags { ack: true, ..TcpFlags::NONE }),
             L4Mode::Fin => Some(TcpFlags { fin: true, ..TcpFlags::NONE }),
             L4Mode::Rst => Some(TcpFlags { rst: true, ..TcpFlags::NONE }),
@@ -211,7 +265,9 @@ impl L4Mode {
             | L4Mode::Data
             | L4Mode::Icmp
             | L4Mode::IcmpTimestamp
-            | L4Mode::IcmpAddressMask => None,
+            | L4Mode::IcmpAddressMask
+            | L4Mode::UdpFrag
+            | L4Mode::Gre => None,
         }
     }
 
@@ -227,7 +283,7 @@ impl L4Mode {
     /// IPv4 header); ICMP uses `IPPROTO_ICMP` (the kernel supplies the IP header,
     /// so the source address is the real one — no spoofing path).
     pub(crate) fn raw_socket_protocol(self) -> Option<Protocol> {
-        if self.raw_tcp_flags().is_some() {
+        if self.raw_tcp_flags().is_some() || self.crafts_own_ipv4() {
             Some(Protocol::from(IPPROTO_RAW))
         } else if self.is_icmp() {
             Some(Protocol::ICMPV4)
@@ -236,9 +292,13 @@ impl L4Mode {
         }
     }
 
-    /// Which OSI layer this mode drives: ICMP is L3, everything else L4.
+    /// Which OSI layer this mode drives. ICMP, the fragmentation floods and the
+    /// GRE flood are L3 — what each of them exercises is the target's IP layer
+    /// (its query handlers, its reassembly table, its protocol demultiplexer),
+    /// even when the bytes inside happen to be a UDP datagram or a SYN.
+    /// Everything else is L4.
     pub(crate) fn layer(self) -> Layer {
-        if self.is_icmp() {
+        if self.is_icmp() || self.crafts_own_ipv4() {
             Layer::L3
         } else {
             Layer::L4
@@ -400,5 +460,36 @@ mod tests {
             assert_eq!(mode.icmp_query().map(|q| q.type_byte()), Some(ty));
         }
         assert_eq!(L4Mode::Udp.layer(), Layer::L4);
+    }
+
+    /// The fragmentation and GRE floods are network-layer tests riding a raw
+    /// socket: L3, IPv4-only, and — for the fragmentation pair — one unit that is
+    /// several packets. A regression that let one of them report L4 or count one
+    /// packet per unit would understate what the run put on the wire.
+    #[test]
+    fn fragment_and_gre_modes_are_l3_raw_and_declare_their_packet_count() {
+        for (mode, name, packets) in [
+            (L4Mode::UdpFrag, "udp-fragment-flood", 2usize),
+            (L4Mode::TcpFrag, "tcp-fragment-flood", 3),
+            (L4Mode::Gre, "gre-flood", 1),
+        ] {
+            assert_eq!(mode.label(), name);
+            assert_eq!(mode.layer(), Layer::L3, "{mode:?} is an L3 test");
+            assert!(mode.crafts_own_ipv4(), "{mode:?} builds its own IPv4 header");
+            assert!(mode.needs_raw_socket(), "{mode:?} needs a raw socket");
+            assert!(!mode.is_icmp(), "{mode:?} is not an ICMP mode");
+            assert_eq!(mode.packets_per_unit(), packets);
+        }
+        // The fragmented flood is a SYN; the other two carry no TCP flags at all.
+        assert_eq!(
+            L4Mode::TcpFrag.raw_tcp_flags(),
+            Some(TcpFlags { syn: true, ..TcpFlags::NONE })
+        );
+        assert_eq!(L4Mode::UdpFrag.raw_tcp_flags(), None);
+        assert_eq!(L4Mode::Gre.raw_tcp_flags(), None);
+        // Every other mode is one packet per unit, so the summary's unit count
+        // and its packet count coincide.
+        assert_eq!(L4Mode::Udp.packets_per_unit(), 1);
+        assert_eq!(L4Mode::Syn.packets_per_unit(), 1);
     }
 }

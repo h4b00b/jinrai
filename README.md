@@ -193,6 +193,8 @@ whether the target survives.
 | Raw datagram volume | `--l4-mode udp --payload-size 1400` |
 | Fill application read buffers over real connections (PSH-ACK data flood) | `--l4-mode data --payload-size 4096` |
 | ICMP query handlers (echo / timestamp / address-mask) | `--layer l3 --l4-mode icmp` \| `icmp-timestamp` \| `icmp-address-mask` |
+| IP reassembly table (fragmented datagrams the target must hold and rebuild) | `--layer l3 --l4-mode udp-frag` \| `tcp-frag` |
+| GRE decapsulation path (IP protocol 47) | `--layer l3 --l4-mode gre` |
 
 ### 6. Stateful middlebox behaviour (lab, raw sockets) — "does the firewall/IDS handle this correctly?"
 
@@ -206,6 +208,8 @@ reacts to control flags it should never see.
 | Unsolicited handshake response — a SYN-ACK answering a SYN nobody sent | `syn-ack` |
 | Illegal flag combinations (contradictory / all-set / none-set) | `syn-fin`, `syn-rst`, `xmas`, `null` |
 | Maximal 40-byte TCP option block on every SYN | `tcp-options` |
+| Fragmented datagrams — can it classify what it cannot read without reassembling? | `udp-frag`, `tcp-frag` (add `--port-order random` for the fragmentation + random-ports shape) |
+| Encapsulated traffic — does protocol 47 get decapsulated and re-inspected? | `gre` |
 | **Several of these at once** (multi-vector) | repeat `--l4-mode` — see [multi-vector runs](#multi-vector-runs) |
 
 ## Rate, concurrency, and which knobs apply
@@ -374,6 +378,20 @@ sudo -E jinrai $REQ --layer l4 --l4-mode syn --allow 10.0.0.0/8 --target 10.1.2.
 # icmp-timestamp (type 13) or icmp-address-mask (type 17)
 sudo -E jinrai $REQ --layer l3 --l4-mode icmp --allow 10.0.0.0/8 --target 10.1.2.3 \
        --rate 1000 --duration 30
+
+# IP fragmentation flood over random ports — each unit is one datagram the target
+# must hold and reassemble before it can even read the port. --rate counts
+# datagrams; udp-frag puts 2 packets on the wire per unit, tcp-frag 3, and the
+# summary says which. Swap udp-frag for tcp-frag to fragment a SYN instead.
+sudo -E jinrai $REQ --layer l3 --l4-mode udp-frag --allow 10.0.0.0/8 --target 10.1.2.3 \
+       --port 20000-20999 --port-order random --payload-size 1400 \
+       --rate 5000 --duration 30
+
+# GRE flood (IP protocol 47) — packets wrapping a real IPv4/UDP datagram, so a
+# target that accepts protocol 47 has to decapsulate and re-enter its IP stack
+# once per packet. --port sets the encapsulated destination port.
+sudo -E jinrai $REQ --layer l3 --l4-mode gre --allow 10.0.0.0/8 --target 10.1.2.3 \
+       --port 4789 --rate 5000 --duration 30
 
 # Multi-vector: repeat --l4-mode and they run at the same time, splitting the one
 # --rate ceiling between them (here 10000/s each, not 30000/s each)
@@ -739,8 +757,8 @@ a list, or a range — except for the ICMP modes, which are portless), on top of
 the `--ack-lab` acknowledgement every layer needs. `udp`/`tcp`/`data` need
 no privilege, and `tcp`/`data` work over IPv4 **and** IPv6; the raw-socket modes
 (`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-ack`/`syn-fin`/`syn-rst`/`xmas`/
-`null`/`tcp-options`/`icmp`/`icmp-timestamp`/`icmp-address-mask`) need `CAP_NET_RAW`/root
-and are IPv4-only.
+`null`/`tcp-options`/`udp-frag`/`tcp-frag`/`gre`/`icmp`/`icmp-timestamp`/
+`icmp-address-mask`) need `CAP_NET_RAW`/root and are IPv4-only.
 
 ### Random ports and carpet bombing
 
@@ -843,6 +861,46 @@ timestamp + window scale, NOP-padded to the limit). Each SYN forces the target's
 TCP stack to walk a maximal option block and allocate SACK/timestamp state,
 amplifying the per-SYN cost over a bare SYN. Same raw-socket / real-source /
 IPv4-only constraints as the flag floods.
+
+### Fragmentation floods (`udp-frag`, `tcp-frag`)
+
+These cut one datagram into IPv4 fragments, so the target has to **hold the
+pieces and rebuild them** before it can act on any of it. The cut is deliberate,
+not an MTU accident: the datagram is split on 8-byte boundaries *inside its
+transport header*, so
+
+* `udp-frag` puts the 8-byte UDP header in fragment 0 and the payload in
+  fragment 1 — the destination port is unreadable until both have arrived;
+* `tcp-frag` fragments a SYN, whose 20-byte header cuts into 8 + 8 + 4 — the
+  ports are in fragment 0 and the **control flags** are in fragment 1, so nothing
+  on the path can tell it is a SYN without reassembling first.
+
+The load is the reassembly table: one entry per unit, held until the last
+fragment lands or the target's fragment timer expires. Each unit carries its own
+IP identification, so entries accumulate instead of overwriting one another.
+
+**`--rate` counts datagrams, not packets.** One `udp-frag` unit is 2 packets on
+the wire and one `tcp-frag` unit is 3, so `--rate 5000` on `tcp-frag` is 15 000
+pps. The run summary states the multiplier rather than leaving it implicit.
+
+Combine with `--port-order random` over a range for the fragmentation +
+random-ports shape. Same raw-socket / real-source / IPv4-only constraints as the
+flag floods; the source address is the host's real one on **every** fragment.
+
+### The GRE flood (`gre`)
+
+`gre` sends IP protocol 47 packets: an outer IPv4 header, the 4-byte version-0
+GRE header (RFC 2784, no checksum/key/sequence), and an encapsulated IPv4/UDP
+datagram. A target that accepts protocol 47 — a router, a firewall, a tunnel
+endpoint — has to recognise it, strip the outer header and hand the inner packet
+back to its IP stack, so each unit costs roughly two packets' worth of processing
+for one packet of bandwidth. `--port` sets the *encapsulated* destination port.
+
+The encapsulated packet is addressed **from the same real source** to the same
+target. A GRE payload is the one place a source address could be written where no
+kernel would validate it, and the builder deliberately has no argument with which
+to write a different one — the no-spoofing guarantee does not stop at the tunnel
+header.
 
 ### The connect flood
 

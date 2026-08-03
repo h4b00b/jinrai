@@ -26,6 +26,14 @@
 //!   - **ICMP echo flood** — L3 ICMPv4 echo-request packets via a raw socket
 //!     (requires `CAP_NET_RAW`/root). The kernel writes the IPv4 header, so the
 //!     source is the real address — the same no-spoofing property as the rest.
+//!   - **Fragmentation floods** — a UDP datagram or a TCP SYN cut into IPv4
+//!     fragments, so the target must hold reassembly state per datagram and
+//!     cannot read the ports (or, for the SYN, the control flags) until it has
+//!     all the pieces. One unit is one datagram, two or three packets.
+//!   - **GRE flood** — IP protocol 47 packets wrapping a real IPv4/UDP datagram,
+//!     exercising a target's decapsulation path. The encapsulated packet carries
+//!     the host's own source address too: the no-spoofing guarantee does not stop
+//!     at the tunnel header.
 //!
 //! ## Non-negotiable guardrail: no source spoofing
 //!
@@ -79,7 +87,10 @@ use jinrai_core::{
 use crate::mode::{IcmpQuery, TcpFlags};
 use crate::pace::{batch_for, interruptible_sleep};
 use crate::packet::IPPROTO_RAW;
-use crate::packet::{build_icmp_query, build_tcp_options_syn, build_tcp_packet, source_ipv4_for};
+use crate::packet::{
+    build_gre_packet, build_icmp_query, build_tcp_fragments, build_tcp_options_syn,
+    build_tcp_packet, build_udp_fragments, source_ipv4_for,
+};
 
 /// What one emission attempt produced.
 enum Emission {
@@ -143,9 +154,11 @@ impl std::fmt::Display for L34Error {
                  (use --l4-mode tcp for IPv6, or give an IPv4 target)",
                 mode.label()
             ),
-            L34Error::Ipv6RawTcpUnsupported(ip) => {
-                write!(f, "TCP flag floods are IPv4-only for now; refusing IPv6 target {ip}")
-            }
+            L34Error::Ipv6RawTcpUnsupported(ip) => write!(
+                f,
+                "the raw packet-crafting modes (TCP flag floods, fragmentation, GRE) \
+                 are IPv4-only for now; refusing IPv6 target {ip}"
+            ),
             L34Error::RawSocket(e) => write!(
                 f,
                 "cannot open raw socket ({e}); needs CAP_NET_RAW/root \
@@ -301,11 +314,43 @@ impl L34Engine {
             return Ok(RunReport { layer_label: label, ..Default::default() });
         }
 
-        if !self.config.is_multi_vector() {
+        let mut report = if self.config.is_multi_vector() {
+            self.run_multi_vector(plan, label)?
+        } else {
             let (tally, aborted) = self.run_vector(self.config.primary(), plan, plan.rate_cap)?;
-            return Ok(tally.into_report(label, aborted));
+            tally.into_report(label, aborted)
+        };
+        if let Some(note) = self.wire_note() {
+            report.detail = Some(match report.detail.take() {
+                Some(existing) => format!("{existing}; {note}"),
+                None => note,
+            });
         }
-        self.run_multi_vector(plan, label)
+        Ok(report)
+    }
+
+    /// What one *unit* meant on the wire, when it was not one packet.
+    ///
+    /// The fragmentation floods count the datagram — the thing the target has to
+    /// reassemble — as the unit, which is the honest measure of offered load but
+    /// two to three times short of the packet count. A summary that reported
+    /// `units_sent` with no such note would understate the traffic by that factor,
+    /// in the one family of modes where the two numbers differ.
+    fn wire_note(&self) -> Option<String> {
+        let notes: Vec<String> = self
+            .config
+            .modes
+            .iter()
+            .filter(|m| m.packets_per_unit() > 1)
+            .map(|m| {
+                format!(
+                    "{}: 1 unit = 1 datagram, sent as {} IPv4 fragments",
+                    m.label(),
+                    m.packets_per_unit()
+                )
+            })
+            .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// Drive every vector at once, each on its own thread, each with its own
@@ -668,10 +713,38 @@ enum Sender {
     /// is the per-packet sequence number; `payload` is the echo body (ignored by
     /// the fixed-format timestamp and address-mask messages).
     Icmp { raw: Socket, query: IcmpQuery, id: u16, counter: u16, payload: Vec<u8> },
+    /// Fragmented UDP or TCP flood. One unit is one **datagram**, emitted as the
+    /// several IPv4 fragments the target has to hold and reassemble; `mode`
+    /// selects which. `counter` supplies both the per-datagram IP identification
+    /// (so fragments of different units do not collide in the reassembly table)
+    /// and the varying source port / sequence number.
+    Frag {
+        mode: L4Mode,
+        raw: Socket,
+        srcs: HashMap<IpAddr, Ipv4Addr>,
+        counter: u32,
+        payload: Vec<u8>,
+    },
+    /// GRE flood (IP protocol 47): one packet per unit, encapsulating a real
+    /// IPv4/UDP datagram addressed from the same real source to the same target.
+    Gre { raw: Socket, srcs: HashMap<IpAddr, Ipv4Addr>, counter: u32, payload: Vec<u8> },
 }
 
 /// UDP payloads above this are rejected to avoid accidental fragmentation.
 const MAX_UDP_PAYLOAD: usize = 1472;
+
+/// Smallest payload a fragmented UDP datagram will carry. Below one byte there is
+/// nothing past the 8-byte UDP header to cut off, so the "fragmented" flood would
+/// quietly emit one ordinary unfragmented datagram — a run that reports a
+/// primitive it did not actually exercise. Eight bytes is one fragment block.
+const MIN_FRAG_PAYLOAD: usize = 8;
+
+/// Largest payload the GRE flood will encapsulate, so the whole packet — outer
+/// IPv4 header, GRE header, inner IPv4+UDP headers, payload — still fits the
+/// [`MAX_UDP_PAYLOAD`] budget the other modes keep to. A GRE packet that the
+/// local kernel had to fragment on its way out would be testing our MTU, not the
+/// target's decapsulation path.
+const MAX_GRE_PAYLOAD: usize = MAX_UDP_PAYLOAD - 4 - 28;
 
 /// The per-write payload for the data flood is capped well above a single
 /// segment — TCP handles segmentation — to push more bytes per write.
@@ -1043,6 +1116,29 @@ impl Sender {
                     idx: 0,
                 })
             }
+            L4Mode::UdpFrag | L4Mode::TcpFrag => {
+                let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
+                    .map_err(|e| L34Error::RawSocket(e.to_string()))?;
+                Ok(Sender::Frag {
+                    mode,
+                    raw,
+                    srcs: HashMap::new(),
+                    counter: 0,
+                    // Only the UDP variant carries one; the TCP variant fragments
+                    // a bare SYN, whose 20-byte header is the whole datagram.
+                    payload: vec![0u8; payload_size.clamp(MIN_FRAG_PAYLOAD, MAX_UDP_PAYLOAD)],
+                })
+            }
+            L4Mode::Gre => {
+                let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
+                    .map_err(|e| L34Error::RawSocket(e.to_string()))?;
+                Ok(Sender::Gre {
+                    raw,
+                    srcs: HashMap::new(),
+                    counter: 0,
+                    payload: vec![0u8; payload_size.min(MAX_GRE_PAYLOAD)],
+                })
+            }
             L4Mode::Icmp | L4Mode::IcmpTimestamp | L4Mode::IcmpAddressMask => {
                 // Refusal, not `expect`. Today the outer arm guarantees this is
                 // `Some`, but that guarantee lives in a match arm somebody will
@@ -1158,21 +1254,11 @@ impl Sender {
             }
 
             Sender::RawTcp { flags, with_options, raw, srcs, counter } => {
-                let dst = match ip {
-                    IpAddr::V4(v4) => v4,
-                    IpAddr::V6(_) => return Err(L34Error::Ipv6RawTcpUnsupported(ip)),
-                };
+                let dst = require_ipv4(ip)?;
                 // Real source address for the route to this target — never spoofed.
-                let src = match srcs.get(&ip) {
-                    Some(s) => *s,
-                    None => {
-                        let s = source_ipv4_for(dst, port)?;
-                        srcs.insert(ip, s);
-                        s
-                    }
-                };
+                let src = route_source(srcs, ip, dst, port)?;
                 *counter = counter.wrapping_add(1);
-                let src_port = 20_000u16.wrapping_add((*counter % 40_000) as u16);
+                let src_port = varying_source_port(*counter);
                 let packet = if *with_options {
                     build_tcp_options_syn(src, dst, src_port, port, *counter)?
                 } else {
@@ -1185,12 +1271,57 @@ impl Sender {
                 })
             }
 
-            Sender::Icmp { raw, query, id, counter, payload } => {
-                let dst = match ip {
-                    IpAddr::V4(v4) => v4,
-                    // check_targets refuses IPv6 for ICMP up front; this is defensive.
-                    IpAddr::V6(_) => return Err(L34Error::Ipv6RawTcpUnsupported(ip)),
+            Sender::Frag { mode, raw, srcs, counter, payload } => {
+                let dst = require_ipv4(ip)?;
+                let src = route_source(srcs, ip, dst, port)?;
+                *counter = counter.wrapping_add(1);
+                let src_port = varying_source_port(*counter);
+                // The IP identification is what separates one unit's fragments
+                // from the next one's in the target's reassembly table, so it
+                // moves with the counter rather than being fixed for the run.
+                let id = *counter as u16;
+                let fragments = match mode.raw_tcp_flags() {
+                    Some(flags) => {
+                        build_tcp_fragments(src, dst, src_port, port, *counter, flags, id)?
+                    }
+                    None => build_udp_fragments(src, dst, src_port, port, payload, id)?,
                 };
+                let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
+                // A datagram the target cannot reassemble is not the unit we
+                // claimed to offer, so the first fragment that fails to leave
+                // fails the whole unit rather than being averaged away — even
+                // though the pieces already on the wire still cost the target a
+                // reassembly entry.
+                for fragment in &fragments {
+                    if let Err(e) = raw.send_to(fragment, &dest) {
+                        return Ok(Emission::Failed(classify_io(&e)));
+                    }
+                }
+                Ok(Emission::Sent { latency: None })
+            }
+
+            Sender::Gre { raw, srcs, counter, payload } => {
+                let dst = require_ipv4(ip)?;
+                let src = route_source(srcs, ip, dst, port)?;
+                *counter = counter.wrapping_add(1);
+                let packet = build_gre_packet(
+                    src,
+                    dst,
+                    varying_source_port(*counter),
+                    port,
+                    payload,
+                    *counter as u16,
+                )?;
+                let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
+                Ok(match raw.send_to(&packet, &dest) {
+                    Ok(_) => Emission::Sent { latency: None },
+                    Err(e) => Emission::Failed(classify_io(&e)),
+                })
+            }
+
+            Sender::Icmp { raw, query, id, counter, payload } => {
+                // check_targets refuses IPv6 for ICMP up front; this is defensive.
+                let dst = require_ipv4(ip)?;
                 *counter = counter.wrapping_add(1);
                 let packet = build_icmp_query(*query, *id, *counter, payload);
                 // Port is irrelevant for ICMP; the kernel builds the IP header from
@@ -1203,6 +1334,50 @@ impl Sender {
             }
         }
     }
+}
+
+/// Narrow an authorized target to IPv4, which every packet-crafting mode is
+/// limited to. `check_targets` refuses an IPv6 target before a socket exists, so
+/// reaching this is defensive — but it stays a refusal rather than an `expect`,
+/// because the alternative to returning here is aborting the process mid-run.
+fn require_ipv4(ip: IpAddr) -> Result<Ipv4Addr, L34Error> {
+    match ip {
+        IpAddr::V4(v4) => Ok(v4),
+        IpAddr::V6(_) => Err(L34Error::Ipv6RawTcpUnsupported(ip)),
+    }
+}
+
+/// The host's **real** outbound address for the route to this target, memoised
+/// per target so the lookup happens once rather than per packet.
+///
+/// Every packet-crafting mode goes through here, and [`source_ipv4_for`] is the
+/// only thing it calls: that is what makes "no spoofing path" a property of two
+/// short functions instead of a claim about an engine.
+fn route_source(
+    srcs: &mut HashMap<IpAddr, Ipv4Addr>,
+    ip: IpAddr,
+    dst: Ipv4Addr,
+    port: u16,
+) -> Result<Ipv4Addr, L34Error> {
+    match srcs.get(&ip) {
+        Some(s) => Ok(*s),
+        None => {
+            let s = source_ipv4_for(dst, port)?;
+            srcs.insert(ip, s);
+            Ok(s)
+        }
+    }
+}
+
+/// The source *port* a crafted packet leaves from: a deterministic walk of the
+/// ephemeral range, driven by the run's packet counter.
+///
+/// Deliberately not random. Source-*address* spoofing is the guardrail this crate
+/// is built around, and randomising the source port is the neighbouring move that
+/// makes a run's flows unattributable to the host that produced them — see the
+/// same note in [`ports`], which only ever decides where a unit is *sent*.
+fn varying_source_port(counter: u32) -> u16 {
+    20_000u16.wrapping_add((counter % 40_000) as u16)
 }
 
 /// The result of a single PSH-ACK write in the data flood.
