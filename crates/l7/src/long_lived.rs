@@ -322,9 +322,17 @@ impl StressModule for LongLivedEngine {
             layer_label: label,
             units_sent: held,
             // A decline is a failed attempt to hold a connection, so it belongs in
-            // `errors` for the attempt arithmetic; the label says which kind it was.
+            // `errors` for the attempt arithmetic; `detail` says which kind it was,
+            // because "the server said no" and "the server never answered" are
+            // findings about entirely different things.
             errors: declined + tally.errors.load(Ordering::Relaxed),
             aborted_early: aborted,
+            detail: (declined > 0).then(|| {
+                format!(
+                    "{declined} declined by the server (the transport was refused, \
+                     not unreachable — check the path in --url)"
+                )
+            }),
             ..Default::default()
         })
     }

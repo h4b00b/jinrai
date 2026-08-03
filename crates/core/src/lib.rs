@@ -466,6 +466,21 @@ pub struct RunReport {
     /// response leave it empty and the reporter omits it. Sums to `units_sent` for
     /// the fast L7 methods.
     pub http_versions: BTreeMap<String, u64>,
+    /// The module's own breakdown of what `units_sent` was made of, when the
+    /// completed/failed split does not carry the finding.
+    ///
+    /// Some primitives resolve into outcomes that are all "completed" and yet
+    /// mean opposite things: a TLS hello the server *parsed* and one it
+    /// *refused with an alert* were both delivered, but the first says the
+    /// oversized input was processed and the second says the parser held. A
+    /// WebSocket upgrade the server declined is not a failed connection, it is a
+    /// successful conversation with the answer "no". Folding either into
+    /// `units_sent` loses the result of the test; folding it into `errors` blames
+    /// the transport for the target's decision.
+    ///
+    /// `None` for the layers whose units have one meaning, and the reporter omits
+    /// the row entirely.
+    pub detail: Option<String>,
 }
 
 impl RunReport {
