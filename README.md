@@ -484,6 +484,15 @@ instead (stable for scripts and log scraping):
 ==========================================================================
 ```
 
+On a terminal the block is coloured, in three senses only: **green** = the run
+did what it set out to do (`completed`, `failed 0`, `2xx`, `SLO: PASS`, `ran to
+completion`), **yellow** = a caveat about *our* side (`bound by`, `not offered`,
+a local errno ceiling, an operator abort, `4xx`), **red** = failure and the
+target's own errors (`failed`, `5xx`, a remote errno, `SLO: FAIL`, a watchdog
+abort, the hollow-run `WARNING`). `--color auto|always|never` controls it;
+`auto` paints only when stdout is a terminal and `NO_COLOR` is unset, so a
+redirected report is exactly the plain block above.
+
 Five things the block is there to make unmissable:
 
 * **When the run happened** — `started` / `finished` (RFC 3339 UTC) bracket the

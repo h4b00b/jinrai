@@ -30,7 +30,7 @@ use jinrai_l7::{
     LongLivedKind, PathMode, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, TlsHelloEngine,
     TlsHelloKind, Variation, WatchdogConfig, parse_path_list,
 };
-use jinrai_metrics::{AuditEvent, AuditLog, RunContext};
+use jinrai_metrics::{AuditEvent, AuditLog, Palette, RunContext};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
 
 const USAGE: &str = "\
@@ -381,6 +381,13 @@ OPTIONS:
                                    failures mean
                             line   the single machine-friendly summary line
                                    (stable for scripts/log scraping)
+    --color <WHEN>        Colour the human summary: auto (default) | always |
+                          never. auto paints only when stdout is a terminal and
+                          $NO_COLOR is unset, so a redirected report never picks
+                          up escape codes. Green = the run did its job, yellow =
+                          a caveat about OUR side (a ceiling we hit, load we
+                          never offered), red = failure and the target's own
+                          errors.
     --audit-log <PATH>    Append a tamper-evident audit record for this run to
                           PATH (authorized/completed/refused). Operator identity
                           comes from $JINRAI_OPERATOR (else the OS user).
@@ -451,6 +458,34 @@ enum OutputForm {
     Line,
 }
 
+/// When to paint the human summary. `Auto` is the default because the same
+/// command is run by an operator watching a terminal and by a pipeline writing
+/// the report to a file, and escape codes in a file are worse than no colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorWhen {
+    /// Resolve to an actual palette. `Auto` asks the two questions everything
+    /// else in a terminal asks: is stdout a terminal at all, and has the user
+    /// opted out via the `NO_COLOR` convention (any value, including empty).
+    fn palette(self) -> Palette {
+        use std::io::IsTerminal;
+        Palette::new(match self {
+            ColorWhen::Always => true,
+            ColorWhen::Never => false,
+            ColorWhen::Auto => {
+                std::io::stdout().is_terminal()
+                    && std::env::var_os("NO_COLOR").is_none()
+                    && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
+            }
+        })
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     allow: Vec<String>,
@@ -460,6 +495,7 @@ struct Args {
     l7_kind: L7Kind,
     http_version: HttpVersion,
     output: OutputForm,
+    color: ColorWhen,
     body: Option<String>,
     /// How each l7 request differs from the last: `--cache-bust`,
     /// `--random-path` / `--path-file`, `--search-param`, `--session-cookie`.
@@ -1154,7 +1190,8 @@ fn report_run(
 ) {
     match args.output {
         OutputForm::Human => {
-            println!("{}", jinrai_metrics::render_summary(report, &ctx, verdict))
+            let palette = args.color.palette();
+            println!("{}", jinrai_metrics::render_summary(report, &ctx, verdict, &palette))
         }
         OutputForm::Line => {
             println!("{}", jinrai_metrics::render(report));
@@ -1432,6 +1469,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut l7_kind = L7Kind::Fast(L7Method::Get);
     let mut http_version = HttpVersion::Auto;
     let mut output = OutputForm::Human;
+    let mut color = ColorWhen::Auto;
     let mut body = None;
     let mut cache_bust = false;
     let mut random_path = false;
@@ -1552,6 +1590,18 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     "line" => OutputForm::Line,
                     other => {
                         return Err(format!("unknown --output: {other} (want human|line)"))
+                    }
+                }
+            }
+            "--color" => {
+                color = match next_val(&mut it, "--color")?.as_str() {
+                    "auto" => ColorWhen::Auto,
+                    "always" | "yes" => ColorWhen::Always,
+                    "never" | "no" => ColorWhen::Never,
+                    other => {
+                        return Err(format!(
+                            "unknown --color: {other} (want auto|always|never)"
+                        ))
                     }
                 }
             }
@@ -1900,6 +1950,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         l7_kind,
         http_version,
         output,
+        color,
         body,
         variation,
         slow_connections,
@@ -2452,6 +2503,36 @@ mod tests {
         ];
         let err = parse(&argv).expect_err("a missing path file must be refused");
         assert!(err.contains("--path-file"), "{err}");
+    }
+
+    /// Colour defaults to `auto` — never to `always`, because the same command
+    /// line is run by an operator at a terminal and by a pipeline redirecting
+    /// the report into a file, and escape codes in that file are worse than no
+    /// colour at all.
+    #[test]
+    fn color_defaults_to_auto_and_a_redirected_report_is_plain() {
+        let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]);
+        assert_eq!(a.color, ColorWhen::Auto);
+        // Under `cargo test` stdout is not a terminal, which is exactly the
+        // redirected case.
+        assert_eq!(a.color.palette(), Palette::PLAIN);
+        assert_eq!(ColorWhen::Never.palette(), Palette::PLAIN);
+        assert_eq!(ColorWhen::Always.palette(), Palette::ANSI);
+
+        let forced =
+            args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--color", "never"]);
+        assert_eq!(forced.color, ColorWhen::Never);
+
+        let err = parse(&[
+            "--allow",
+            "10.0.0.0/8",
+            "--url",
+            "http://10.1.2.3/",
+            "--color",
+            "rainbow",
+        ])
+        .expect_err("an unknown colour mode must be refused, not ignored");
+        assert!(err.contains("--color"), "the refusal must name the flag: {err}");
     }
 
     /// The default is the historical shape: one identical request, N times.
