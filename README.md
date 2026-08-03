@@ -10,8 +10,7 @@ infrastructure. Covers L3/L4 and L7. Built in-house and validated in-house.
 > because different campaigns target different networks.
 
 > **Test plan in hand?** [`docs/playbook.md`](docs/playbook.md) maps a test-plan
-> row to a ready command and explains **every switch in it**, one case at a time
-> (in Italian, for the operators running the lab).
+> row to a ready command and explains **every switch in it**, one case at a time.
 
 ## Contents
 
