@@ -1,485 +1,486 @@
-# jinrai — playbook dei test case
+# jinrai — test-case playbook
 
-Un test case per riga della lista use case, con il comando pronto da copiare e la
-spiegazione di **ogni singolo switch passato**, così chi lancia il test sa
-esattamente cosa finisce sul filo e come si legge il risultato.
+One section per row of a test plan, with the ready-to-paste command and an
+explanation of **every switch in it**, so whoever runs the test knows exactly
+what lands on the wire and how to read the result.
 
-Versione di riferimento: **0.41.0**.
-
----
-
-## Indice
-
-- [Prima di tutto: setup](#prima-di-tutto-setup)
-- [I flag obbligatori, spiegati una volta sola](#i-flag-obbligatori-spiegati-una-volta-sola)
-- [Test case L3/L4](#test-case-l3l4) — 1–19
-- [Test case L7](#test-case-l7) — 20–36
-- [Test case di capacità](#test-case-di-capacità) — 37–40
-- [Fuori scope, e perché](#fuori-scope-e-perché)
-- [Come si legge il summary](#come-si-legge-il-summary)
-- [Verifica dell'audit log](#verifica-dellaudit-log)
+Reference version: **0.41.0**.
 
 ---
 
-## Prima di tutto: setup
+## Contents
+
+- [Setup](#setup)
+- [The mandatory flags, explained once](#the-mandatory-flags-explained-once)
+- [L3/L4 test cases](#l3l4-test-cases) — 1–19
+- [L7 test cases](#l7-test-cases) — 20–36
+- [Capacity test cases](#capacity-test-cases) — 37–40
+- [Out of scope, and why](#out-of-scope-and-why)
+- [Reading the run summary](#reading-the-run-summary)
+- [Verifying the audit log](#verifying-the-audit-log)
+- [When a run reaches nothing](#when-a-run-reaches-nothing)
+
+---
+
+## Setup
+
+Set these once to your own authorized lab values:
 
 ```sh
-export REQ='--ack-lab --audit-log /home/c2/runs.jsonl'
-export T=192.168.178.41                  # il target del lab
-export A='--allow 192.168.178.41'        # la regola di autorizzazione
-export URL=http://192.168.178.41/        # il datum L7
-export JINRAI_OPERATOR="$(whoami)"       # finisce in ogni record di audit
+export T=10.0.0.10                       # the target address
+export A="--allow $T"                    # the authorization rule
+export URL=http://10.0.0.10/             # the L7 datum
+export REQ='--ack-lab --audit-log ./runs.jsonl'
+export JINRAI_OPERATOR="$(whoami)"       # recorded in every audit record
 ```
 
-**Aggiungi `--dry-run` a qualsiasi comando** per far girare tutto il percorso
-rifiutabile (allowlist, gate di autorizzazione, preflight dei privilegi) e
-stampare il piano **senza mandare un byte**. È il modo giusto di provare una riga
-nuova: se il dry-run passa, il run vero parte.
+**Add `--dry-run` to any command** to walk the whole refusable path (allowlist,
+authorization gate, privilege preflight) and print the plan **without sending a
+byte**. It is the right way to try a new line: if the dry run passes, the real
+run starts.
 
-I comandi marcati `[sudo]` aprono raw socket: servono `CAP_NET_RAW` o root. In
-alternativa a `sudo`, una volta sola:
+Commands marked `[raw]` open raw sockets and need `CAP_NET_RAW` or root. Either
+prefix them with `sudo -E`, or grant the capability once:
 
 ```sh
-sudo setcap cap_net_raw+ep /home/c2/jinrai/target/release/jinrai
+sudo setcap cap_net_raw+ep /path/to/jinrai
 ```
 
 ---
 
-## I flag obbligatori, spiegati una volta sola
+## The mandatory flags, explained once
 
-Compaiono in **tutti** i comandi del playbook. Qui la spiegazione completa; nelle
-tabelle dei singoli test case li trovi con una riga di richiamo.
+These appear in **every** command in this playbook. Full explanation here; the
+per-case tables reference them in one line.
 
-| Switch | Cosa fa |
+| Switch | What it does |
 |---|---|
-| `--allow <IP\|CIDR\|nome>` | **La lista di autorizzazione. Ripetibile, senza default: vuota non autorizza niente.** È il cardine di sicurezza: jinrai rifiuta di mandare traffico a qualsiasi cosa non coperta. La validazione è sul **dato così com'è scritto**: un IP viene confrontato con le regole IP/CIDR, un nome DNS con le regole DNS. Un nome che risolve su un IP autorizzato ma non corrisponde a nessuna regola DNS **viene rifiutato**. |
-| `--target <IP>` | Destinazione per L3/L4. **Ripetibile**: più target in un run è la forma "carpet bombing", il carico viene distribuito su tutti. Ogni target deve corrispondere a una regola `--allow`. |
-| `--url <URL>` | Il datum per L7 (al posto di `--target`). L'host viene autorizzato, risolto **una volta sola** e l'IP viene pinnato nel client HTTP: il DNS non può cambiare destinazione a run avviato, e i redirect non vengono seguiti (uscirebbero dal pin). |
-| `--ack-lab` | Presa d'atto che il bersaglio è un sistema di lab autorizzato e isolato. **Obbligatorio per ogni layer**, non solo L3/L4 — un run L7 non richiede privilegi ed è il più facile da lanciare per sbaglio. Non serve con `--dry-run`. |
-| `--audit-log <PATH>` | Registro append-only con catena di hash SHA-256: un record prima del traffico (`RunAuthorized`), uno a fine run (`RunCompleted`), uno per ogni rifiuto (`RunRefused`). Se il file non si apre, il run **non parte**. In alternativa esiste `--no-audit`, che dice a voce alta quello che omettere `--audit-log` diceva in silenzio. |
-| `--rate <N>` | **Tetto di sicurezza in unità/secondo, non un obiettivo.** Nessun profilo di carico può superarlo. Cosa sia una "unità" dipende dal modulo — è indicato in ogni test case. Max 10 000 000. |
-| `--duration <SECS>` | Durata a orologio del run, in secondi. Max 86400. Limita il **traffico**, non solo il dispatch: le richieste ancora in volo vengono cancellate dopo `--drain-timeout-ms`. |
-| `--dry-run` | Valida, autorizza, fa il preflight, stampa il piano, **non manda niente**. Esente da `--ack-lab` e dall'obbligo di audit. |
-| `--color <auto\|always\|never>` | Colora il summary. `auto` (default) colora solo se stdout è un terminale e `NO_COLOR` non è settata, quindi un report rediretto su file resta in chiaro. Usa `always` se passi l'output in `tee` e vuoi comunque i colori. |
-| `--output <human\|line>` | `human` (default) è il blocco leggibile; `line` è la singola riga stabile per script e log scraping. |
+| `--allow <IP\|CIDR\|name>` | **The authorization list. Repeatable, no default: an empty one authorizes nothing.** This is the safety anchor — jinrai refuses to send traffic anywhere it does not cover. Validation is on the **datum as written**: an IP literal is checked against the IP/CIDR rules, a DNS name against the DNS rules. A name that resolves to an allowlisted IP but matches no DNS rule **is refused**. |
+| `--target <IP>` | Destination for L3/L4. **Repeatable**: several targets in one run is the carpet-bombing shape, and the load is spread across all of them. Every target must match an `--allow` rule. |
+| `--url <URL>` | The datum for L7 (instead of `--target`). The host is authorized, resolved **once**, and the address is pinned into the HTTP client: DNS cannot move the destination mid-run, and redirects are not followed (they would leave the pin). |
+| `--ack-lab` | Acknowledgement that the target is an authorized, isolated lab system. **Required for every layer**, not just L3/L4 — an L7 run needs no privileges and is the easiest to fire by accident. Not needed with `--dry-run`. |
+| `--audit-log <PATH>` | Append-only record with a SHA-256 hash chain: one record before any traffic (`RunAuthorized`), one at the end (`RunCompleted`), one for every refusal (`RunRefused`). If the file cannot be opened, the run **does not start**. The alternative is `--no-audit`, which says out loud what omitting `--audit-log` used to say silently. |
+| `--rate <N>` | **A safety ceiling in units per second, not a target.** No load profile can exceed it. What a "unit" is depends on the module — stated in every test case below. Max 10 000 000. |
+| `--duration <SECS>` | Wall-clock length of the run, in seconds. Max 86400. It bounds the **traffic**, not just the dispatching of it: requests still in flight are cancelled after `--drain-timeout-ms`. |
+| `--dry-run` | Validate, authorize, preflight, print the plan, **send nothing**. Exempt from `--ack-lab` and from the audit requirement. |
+| `--color <auto\|always\|never>` | Colours the summary. `auto` (default) paints only when stdout is a terminal and `NO_COLOR` is unset, so a redirected report stays plain. Use `always` when piping through `tee` and you still want colour. |
+| `--output <human\|line>` | `human` (default) is the readable block; `line` is the single stable line for scripts and log scraping. |
 
-**Ctrl-C ferma sempre tutto** (SIGINT e SIGTERM sono agganciati al kill switch),
-il drain viene eseguito e il record di audit viene scritto lo stesso.
+**Ctrl-C always stops everything** (SIGINT and SIGTERM are wired to the kill
+switch), the drain still runs, and the audit record is still written.
 
 ---
 
-## Test case L3/L4
+## L3/L4 test cases
 
-### 1 — UDP Flood
+### 1 — UDP flood
 
-Il flood volumetrico di base: datagrammi verso una porta, il target deve
-processarli e, se non c'è nessuno in ascolto, generare una ICMP port-unreachable
-per ognuno.
+The baseline volumetric flood: datagrams at a port, which the target must
+process and — if nothing is listening — answer with an ICMP port-unreachable for
+each one.
 
 ```sh
 jinrai $A --target $T --port 53 --layer l4 --l4-mode udp \
   --payload-size 512 --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `$A` = `--allow 192.168.178.41` | Autorizza il target. Senza, il run è rifiutato. |
-| `--target $T` | Destinazione dei datagrammi. |
-| `--port 53` | Porta di destinazione. Qui una sola. |
-| `--layer l4` | Seleziona il modulo L3/L4 (`l3` e `l4` selezionano lo stesso modulo; cambia solo come si riporta il layer). |
-| `--l4-mode udp` | La primitiva: UDP flood. **Non richiede privilegi**, usa la socket UDP del kernel. |
-| `--payload-size 512` | Byte di payload per datagramma (default 64). È la leva sulla banda: 50000/s × 512 B ≈ 205 Mbit/s. |
-| `--rate 50000` | Tetto: 50 000 datagrammi/secondo. |
-| `--duration 60` | 60 secondi. |
-| `$REQ` | `--ack-lab` + `--audit-log` (vedi sopra). |
+| `$A` = `--allow <target>` | Authorizes the target. Without it the run is refused. |
+| `--target $T` | Where the datagrams go. |
+| `--port 53` | Destination port. One port here. |
+| `--layer l4` | Selects the L3/L4 module (`l3` and `l4` select the same module; only the reported layer differs). |
+| `--l4-mode udp` | The primitive: UDP flood. **No privileges needed** — it uses the kernel's UDP socket. |
+| `--payload-size 512` | Payload bytes per datagram (default 64). This is the bandwidth lever: 50 000/s × 512 B ≈ 205 Mbit/s. |
+| `--rate 50000` | Ceiling: 50 000 datagrams per second. |
+| `--duration 60` | 60 seconds. |
+| `$REQ` | `--ack-lab` + `--audit-log` (see above). |
 
-**Sul filo:** un pacchetto per unità, IP sorgente reale (mai spoofato).
-**Da leggere:** se `attempts` sta sotto il tetto con `failed 0`, la riga
-`bound by` (gialla) dice se il limite era questa macchina e non il target.
+**On the wire:** one packet per unit, real source IP (never spoofed).
+**How to read it:** if `attempts` lands below the cap with `failed 0`, the yellow
+`bound by` line says whether the limit was this host rather than the target.
 
 ---
 
-### 2 — UDP Flood RandomPorts
+### 2 — UDP flood, random ports
 
-Stessa cosa, ma la porta di destinazione cambia a ogni pacchetto: una regola di
-firewall agganciata a una porta vede un rivolo invece del run.
+The same, but the destination port changes per packet: a firewall rule keyed on
+one port sees a trickle instead of the run.
 
 ```sh
 jinrai $A --target $T --port 1-65535 --port-order random --layer l4 --l4-mode udp \
   --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--port 1-65535` | **Spec di porte, non un numero.** Accetta un valore (`443`), una lista (`80,443,8080`), un range inclusivo (`1000-2000`) o un misto (`80,8000-8100`). Tenuto come range, quindi `1-65535` costa due interi. La porta 0 è sempre rifiutata. |
-| `--port-order random` | Estrae una porta per pacchetto: pacchetti consecutivi non sono correlati. Il default `sequential` percorre il set nell'ordine scritto avanzando a ogni passata sui target (così un run multi-target enumera l'intero prodotto target × porte). |
+| `--port 1-65535` | **A port spec, not a number.** Takes a single port (`443`), a comma list (`80,443,8080`), an inclusive range (`1000-2000`), or a mix (`80,8000-8100`). Held as ranges, so `1-65535` costs two integers. Port 0 is always refused. |
+| `--port-order random` | Draws a port per packet: consecutive packets are unrelated. The default `sequential` walks the set in the order written, advancing once per pass over the targets (so a multi-target run enumerates the whole target × port cross-product). |
 
-Gli altri switch: come al test 1.
+Everything else: as in test 1.
 
-> **Garanzia che non cambia:** varia **solo la porta di destinazione**. L'IP
-> sorgente non è mai spoofato e la porta sorgente resta deterministica —
-> randomizzare quella renderebbe i flussi non attribuibili, ed è assente per la
-> stessa ragione per cui è assente lo spoofing.
+> **The guarantee that does not change:** only the **destination** port varies.
+> The source IP is never spoofed and the source port stays deterministic —
+> randomising that is what makes flows unattributable, and it is absent for the
+> same reason source-IP spoofing is.
 
 ---
 
-### 3 — UDP CarpetBombing
+### 3 — UDP carpet bombing
 
-Più indirizzi di destinazione × un range di porte: nessun singolo IP porta tutto
-il run, quindi una soglia per-destinazione non scatta.
+Several destination addresses × a port range: no single address carries the
+whole run, so a per-destination threshold never trips.
 
 ```sh
-jinrai $A --allow 192.168.178.42 --target $T --target 192.168.178.42 \
+jinrai $A --allow 10.0.0.11 --target $T --target 10.0.0.11 \
   --port 1-65535 --port-order random --layer l4 --l4-mode udp \
   --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--allow 192.168.178.42` | **Seconda regola di allowlist.** Ogni target va autorizzato: aggiungere `--target` senza `--allow` fa rifiutare il run. |
-| `--target` × 2 | I due bersagli. Il carico viene diviso tra loro, non moltiplicato. |
-| `--port 1-65535 --port-order random` | Come al test 2. |
+| `--allow 10.0.0.11` | **A second allowlist rule.** Every target must be authorized: adding a `--target` without its `--allow` refuses the run. |
+| `--target` × 2 | The two destinations. The load is divided between them, not multiplied. |
+| `--port 1-65535 --port-order random` | As in test 2. |
 
-**Sul filo:** `--rate 50000` resta il totale del run, ~25 000/s per target.
+**On the wire:** `--rate 50000` stays the run total, ~25 000/s per target.
 
 ---
 
-### 4 — UDP Fragmentation `[sudo]`
+### 4 — UDP fragmentation `[raw]`
 
-Il datagramma viene tagliato **dentro l'header di trasporto**: il frammento 0
-contiene gli 8 byte di header UDP, il frammento 1 il payload. La porta di
-destinazione non è leggibile finché non arrivano entrambi, quindi il target deve
-tenere lo stato di riassemblaggio prima di poter decidere qualsiasi cosa.
+The datagram is cut **inside the transport header**: fragment 0 carries the
+8-byte UDP header, fragment 1 the payload. The destination port is unreadable
+until both land, so the target must hold reassembly state before it can decide
+anything at all.
 
 ```sh
 sudo -E jinrai $A --target $T --port 53 --layer l3 --l4-mode udp-frag \
   --payload-size 1400 --rate 20000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `sudo -E` | Serve `CAP_NET_RAW`: jinrai costruisce l'header IPv4 da sé. `-E` conserva l'ambiente (`JINRAI_OPERATOR`). **Solo IPv4.** |
-| `--layer l3` | Questi modi riportano **L3**: quello che stressano è il layer IP (la tabella di riassemblaggio), non la porta. |
-| `--l4-mode udp-frag` | 2 frammenti per unità, tagliati su confine di 8 byte. Ogni unità ha il **proprio IP identification**, così le entry di riassemblaggio si accumulano invece di sovrascriversi. |
-| `--payload-size 1400` | Payload del datagramma **prima** della frammentazione. Minimo forzato a 8 byte: sotto non ci sarebbe niente da tagliare oltre l'header UDP e il run manderebbe datagrammi interi spacciandoli per un frag flood. |
-| `--rate 20000` | ⚠️ **`--rate` conta i datagrammi, non i pacchetti.** 20 000 unità/s = **40 000 pacchetti/s** sul filo. Il summary lo dichiara nella riga `of which`. |
+| `sudo -E` | Needs `CAP_NET_RAW`: jinrai builds the IPv4 header itself. `-E` preserves the environment (`JINRAI_OPERATOR`). **IPv4 only.** |
+| `--layer l3` | These modes report **L3**: what they stress is the IP layer (the reassembly table), not the port. |
+| `--l4-mode udp-frag` | 2 fragments per unit, cut on an 8-byte boundary. Each unit carries its **own IP identification**, so reassembly entries accumulate instead of overwriting one another. |
+| `--payload-size 1400` | Datagram payload **before** fragmentation. Floored at 8 bytes: below that there would be nothing past the UDP header to cut off, and the run would emit ordinary unfragmented datagrams while reporting a fragmentation flood. |
+| `--rate 20000` | ⚠️ **`--rate` counts datagrams, not packets.** 20 000 units/s = **40 000 packets/s** on the wire. The summary states the multiplier in its `of which` row. |
 
 ---
 
-### 5 — UDP Fragmentation RandomPorts `[sudo]`
+### 5 — UDP fragmentation, random ports `[raw]`
 
-Frammentazione e porte casuali insieme: la porta è nel frammento 0 e cambia a
-ogni unità.
+Fragmentation and random ports together: the port lives in fragment 0 and
+changes every unit.
 
 ```sh
 sudo -E jinrai $A --target $T --port 1-65535 --port-order random --layer l3 \
   --l4-mode udp-frag --payload-size 1400 --rate 20000 --duration 60 $REQ
 ```
 
-Switch: unione dei test 2 e 4, stessi significati.
+Switches: the union of tests 2 and 4, same meanings.
 
 ---
 
-### 6 — TCP SYN Flood `[sudo]`
+### 6 — TCP SYN flood `[raw]`
 
-Il classico: SYN a raffica, ogni SYN costa al target una entry nella coda di
-half-open.
+The classic: SYNs at rate, each one costing the target a half-open queue entry.
 
 ```sh
 sudo -E jinrai $A --target $T --port 445 --layer l4 --l4-mode syn \
   --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode syn` | SYN raw. L'IP sorgente è **l'indirizzo reale scelto dal routing** (`source_ipv4_for`), mai uno arbitrario: significa che le SYN-ACK tornano indietro davvero e il test è attribuibile. |
-| `--port 445` | Porta di destinazione. Sceglila su un servizio che esiste, altrimenti misuri il path del RST. |
-
-**Nota lab:** questo modo **passa** il firewall Proxmox (apre stato conntrack
-legittimo). I modi out-of-state al test 12–13 no.
+| `--l4-mode syn` | Raw SYN. The source IP is **the real route-local address** (`source_ipv4_for`), never an arbitrary one: the SYN-ACKs really do come back, and the test is attributable. |
+| `--port 445` | Destination port. Pick one with a service behind it, or you are measuring the RST path. |
 
 ---
 
-### 7 — TCP SYN RandomPorts `[sudo]`
+### 7 — TCP SYN, random ports `[raw]`
 
 ```sh
 sudo -E jinrai $A --target $T --port 1-65535 --port-order random --layer l4 \
   --l4-mode syn --rate 50000 --duration 60 $REQ
 ```
 
-Switch: test 6 + `--port`/`--port-order` del test 2.
+Switches: test 6 plus `--port` / `--port-order` from test 2.
 
 ---
 
-### 8 — TCP CarpetBombing `[sudo]`
+### 8 — TCP carpet bombing `[raw]`
 
 ```sh
-sudo -E jinrai $A --allow 192.168.178.42 --target $T --target 192.168.178.42 \
+sudo -E jinrai $A --allow 10.0.0.11 --target $T --target 10.0.0.11 \
   --port 1-65535 --port-order random --layer l4 --l4-mode syn \
   --rate 50000 --duration 60 $REQ
 ```
 
-Switch: test 3 con `--l4-mode syn` al posto di `udp`.
+Switches: test 3 with `--l4-mode syn` instead of `udp`.
 
 ---
 
-### 9 — TCP Fragmentation RandomPorts `[sudo]`
+### 9 — TCP fragmentation, random ports `[raw]`
 
-Una SYN frammentata in 3: l'header TCP di 20 byte viene tagliato 8 + 8 + 4, così
-**le porte finiscono nel frammento 0 e i flag di controllo nel frammento 1**.
-Niente sul percorso può dire che è una SYN senza prima riassemblare.
+A SYN cut into 3: the 20-byte TCP header splits 8 + 8 + 4, so **the ports land
+in fragment 0 and the control flags in fragment 1**. Nothing on the path can
+tell it is a SYN without reassembling first.
 
 ```sh
 sudo -E jinrai $A --target $T --port 1-65535 --port-order random --layer l3 \
   --l4-mode tcp-frag --rate 20000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode tcp-frag` | 3 frammenti per unità. ⚠️ **`--rate 20000` = 60 000 pacchetti/s** sul filo. |
-| `--layer l3` | Come al test 4: è il layer IP a essere sotto test. |
+| `--l4-mode tcp-frag` | 3 fragments per unit. ⚠️ **`--rate 20000` = 60 000 packets/s** on the wire. |
+| `--layer l3` | As in test 4: the IP layer is what is under test. |
 
 ---
 
-### 10 — TCP Connect / handshake flood
+### 10 — TCP connect / handshake flood
 
-Handshake veri, tenuti aperti contro il backlog di accept. Nessun privilegio:
-usa lo stack del kernel, e funziona anche su IPv6.
+Real handshakes held open against the accept backlog. No privileges: it uses the
+kernel stack, and it works over IPv6 too.
 
 ```sh
 jinrai $A --target $T --port 445 --layer l4 --l4-mode tcp \
   --concurrency 512 --connect-timeout-ms 500 --rate 10000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode tcp` | Connect flood: apre connessioni complete e le tiene. |
-| `--concurrency 512` | **Socket aperte contemporaneamente** (default 256, cap a 4096 thread). È l'impronta locale del run *ed* è il parallelismo degli handshake. Quando si arriva a N, ammettere un nuovo tentativo chiude la connessione più vecchia. |
-| `--connect-timeout-ms 500` | Quanto un tentativo può restare irrisolto prima di essere abbandonato e contato nel bucket errno `timeout` (default 500). **Questa è la leva vera:** un tentativo che va in timeout occupa il suo slot per tutto il timeout, quindi appena una quota significativa fallisce, abbassare questo valore alza il rate raggiungibile molto più che alzare `--concurrency`. |
-| `--rate 10000` | Tetto sui tentativi/s. Il rate realmente raggiungibile è circa `--concurrency` ÷ durata media del tentativo. |
+| `--l4-mode tcp` | Connect flood: opens complete connections and holds them. |
+| `--concurrency 512` | **Simultaneously open sockets** (default 256, capped at 4096 threads). It is the run's local footprint *and* the handshake parallelism. Once N are open, admitting a new attempt closes the oldest connection. |
+| `--connect-timeout-ms 500` | How long one attempt may stay unresolved before it is abandoned and counted in the `timeout` errno bucket (default 500). **This is the real lever:** an attempt that times out holds its slot for the whole timeout, so once a meaningful share of attempts fail, lowering this buys far more offered load than raising `--concurrency`. |
+| `--rate 10000` | Ceiling on attempts/s. The reachable rate is about `--concurrency` ÷ mean attempt time. |
 
-**Da leggere:** se `attempts` è molto sotto il tetto, la riga gialla `bound by`
-dice **quale delle due manopole** toccare, con l'aritmetica in chiaro.
+**How to read it:** if `attempts` falls well short of the cap, the yellow
+`bound by` line says **which of the two knobs** to reach for, with the arithmetic
+spelled out.
 
 ---
 
 ### 11 — TCP PSH-ACK / data flood
 
-Connessioni reali riempite di dati applicativi: il target non deve solo
-accettare, deve leggere e consegnare i byte allo strato sopra.
+Real connections filled with application data: the target must not only accept,
+it must read the bytes and hand them up the stack.
 
 ```sh
 jinrai $A --target $T --port 445 --layer l4 --l4-mode data \
   --payload-size 1400 --concurrency 256 --rate 5000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode data` | Flood di segmenti PSH-ACK su connessioni stabilite. Nessun privilegio, IPv4 + IPv6. |
-| `--payload-size 1400` | Byte per write. Qui è la dimensione della scrittura applicativa, non del datagramma. |
-| `--concurrency 256` | Connessioni tenute aperte contemporaneamente. |
+| `--l4-mode data` | PSH-ACK segment flood over established connections. No privileges, IPv4 and IPv6. |
+| `--payload-size 1400` | Bytes per write. Here it is the application write size, not a datagram size. |
+| `--concurrency 256` | Connections held open at once. |
 
 ---
 
-### 12 — TCP ACK / RST / FIN flood `[sudo]`
+### 12 — TCP ACK / RST / FIN flood `[raw]`
 
-Flag singoli su connessioni che non esistono: mette alla prova il tracciamento
-di stato di firewall e stack.
+Single flags on connections that do not exist: it exercises the state tracking
+of firewalls and stacks.
 
 ```sh
 sudo -E jinrai $A --target $T --port 445 --layer l4 --l4-mode ack \
   --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode ack` | Un flag per modo. Sostituibile con `rst`, `fin`, `urg`, `cwr`, `ece` — `urg`/`cwr`/`ece` mandano un segmento altrimenti vuoto che porta solo quel bit (raramente isolato nel traffico reale). |
+| `--l4-mode ack` | One flag per mode. Swap for `rst`, `fin`, `urg`, `cwr`, `ece` — `urg`/`cwr`/`ece` send an otherwise-empty segment carrying only that (rarely standalone) bit. |
 
-> ⚠️ **Lab:** questi sono modi *out-of-state*. Il firewall del datacenter Proxmox
-> li scarta tutti prima di consegnarli (vedi [in fondo](#i-modi-out-of-state-e-il-firewall-proxmox)).
+> ⚠️ These are *out-of-state* modes. A stateful device anywhere on the path can
+> drop them before delivery while the run still reports success — see
+> [when a run reaches nothing](#when-a-run-reaches-nothing).
 
 ---
 
-### 13 — TCP flag anomali (Xmas / NULL) `[sudo]`
+### 13 — Anomalous TCP flags (Xmas / NULL) `[raw]`
 
-Combinazioni di flag illegali o contraddittorie: probe sulla gestione dei campi
-di controllo malformati da parte di firewall, IDS e stack TCP.
+Illegal or contradictory flag combinations: a probe of how firewalls, IDS and
+TCP stacks handle malformed control fields.
 
 ```sh
 sudo -E jinrai $A --target $T --port 445 --layer l4 --l4-mode xmas \
   --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode xmas` | FIN+PSH+URG accesi insieme. Sostituibile con: `null` (nessun flag), `syn-fin` e `syn-rst` (combinazioni contraddittorie), `syn-ack` (una *risposta* legale a una SYN che il target non ha mai mandato — flag legali, **stato** illegale). |
+| `--l4-mode xmas` | FIN+PSH+URG set together. Swap for `null` (no flags at all), `syn-fin` and `syn-rst` (contradictory combinations), or `syn-ack` (a legal handshake *response* to a SYN the target never sent — legal flags, illegal **state**). |
 
-> ⚠️ Anche questi sono out-of-state: stesso avviso del test 12.
+> ⚠️ Also out-of-state: same caveat as test 12.
 
 ---
 
-### 14 — TCP options bomb `[sudo]`
+### 14 — TCP options bomb `[raw]`
 
-Una SYN con il blocco opzioni riempito al massimo consentito (40 byte): il costo
-è nel parsing delle opzioni, non nel volume.
+A SYN whose option block is filled to the 40-byte maximum: the cost is in option
+parsing, not in volume.
 
 ```sh
 sudo -E jinrai $A --target $T --port 445 --layer l4 --l4-mode tcp-options \
   --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode tcp-options` | SYN con blocco opzioni massimale. Apre stato legittimo, quindi **passa** il firewall del lab. |
+| `--l4-mode tcp-options` | SYN with a maximal option block. It opens legitimate state, so stateful devices on the path pass it. |
 
 ---
 
-### 15 — ICMP Flood `[sudo]`
+### 15 — ICMP flood `[raw]`
 
 ```sh
 sudo -E jinrai $A --target $T --layer l3 --l4-mode icmp \
   --payload-size 1400 --rate 50000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode icmp` | Echo request flood. Sostituibile con `icmp-timestamp` (tipo 13) e `icmp-address-mask` (tipo 17): ognuno costringe il target a **rispondere direttamente**. |
-| *(nessun `--port`)* | I modi ICMP non hanno porte. Passare `--port` qui non serve. |
-| `--layer l3` | Vero L3. |
-| `--payload-size 1400` | Byte di payload nell'echo. |
+| `--l4-mode icmp` | Echo-request flood. Swap for `icmp-timestamp` (type 13) or `icmp-address-mask` (type 17): each one forces the target to **answer directly**. |
+| *(no `--port`)* | ICMP modes are portless. Passing `--port` here does nothing. |
+| `--layer l3` | True L3. |
+| `--payload-size 1400` | Payload bytes in the echo. |
 
 ---
 
-### 16 — GRE-Attack `[sudo]`
+### 16 — GRE flood `[raw]`
 
-Un header IPv4 esterno con protocollo 47, l'header GRE versione 0 di 4 byte
-(RFC 2784), e dentro un datagramma IPv4/UDP completo. Un target che accetta il
-protocollo 47 deve riconoscerlo, togliere l'header esterno e **rientrare nel
-proprio stack IP** con il pacchetto interno: circa il doppio del lavoro per un
-pacchetto di banda.
+An outer IPv4 header with protocol 47, the 4-byte version-0 GRE header
+(RFC 2784), and a complete IPv4/UDP datagram inside it. A target that accepts
+protocol 47 must recognise it, strip the outer header and **re-enter its own IP
+stack** with the inner packet — roughly two packets' worth of work for one
+packet of bandwidth.
 
 ```sh
 sudo -E jinrai $A --target $T --port 53 --layer l3 --l4-mode gre \
   --rate 20000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode gre` | Il flood incapsulato. |
-| `--port 53` | ⚠️ È la porta di destinazione **del datagramma interno**, non dell'esterno (GRE non ha porte). |
+| `--l4-mode gre` | The encapsulated flood. |
+| `--port 53` | ⚠️ The destination port of the **inner** datagram, not the outer one (GRE has no ports). |
 
-> **Nessuno spoofing nemmeno dentro il tunnel:** il datagramma incapsulato è
-> indirizzato dallo stesso indirizzo sorgente reale del pacchetto esterno, e il
-> costruttore non ha alcun argomento con cui esprimere altro.
+> **No spoofing inside the tunnel either:** the encapsulated datagram is
+> addressed from the same real source as the outer packet, and the builder has no
+> argument with which to express anything else.
 
 ---
 
-### 17 — MultiVector UDP + TCP `[sudo]`
+### 17 — Multi-vector: UDP + TCP `[raw]`
 
 ```sh
 sudo -E jinrai $A --target $T --port 445 --layer l4 \
   --l4-mode udp --l4-mode syn --rate 60000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode` ripetuto | **Ogni occorrenza aggiunge un vettore.** Girano in parallelo, un thread ciascuno, contro gli stessi target, con una sola `--duration`, un solo kill switch, un solo record di audit e un solo summary. |
-| `--rate 60000` | ⚠️ **Il tetto è condiviso, non per vettore.** Due vettori a 60 000 emettono **30 000/s ciascuno**. Un tetto che si moltiplica alle spalle dell'operatore non sarebbe un tetto. Un rate troppo piccolo per essere diviso viene rifiutato invece di azzerare un vettore. |
+| `--l4-mode` repeated | **Each occurrence adds a vector.** They run concurrently, one thread each, against the same targets, sharing one `--duration`, one kill switch, one audit record and one summary. |
+| `--rate 60000` | ⚠️ **The ceiling is shared, not per vector.** Two vectors at 60 000 emit **30 000/s each**. A ceiling that multiplies behind the operator's back is not a ceiling. A rate too small to split is refused rather than rounding a vector to zero. |
 
-**Da leggere:** la riga `of which` dà il **breakdown per vettore** — un totale
-solo non distingue "sono partiti entrambi" da "uno ha fatto tutto il lavoro".
+**How to read it:** the `of which` row gives the **per-vector breakdown** — one
+total cannot tell "both vectors landed" from "one did all the work".
 
 ---
 
-### 18 — MultiVector UDP / TCP / ICMP `[sudo]`
+### 18 — Multi-vector: UDP / TCP / ICMP `[raw]`
 
 ```sh
 sudo -E jinrai $A --target $T --port 445 --layer l4 \
   --l4-mode udp --l4-mode syn --l4-mode icmp --rate 60000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l4-mode icmp` nel mix | Consentito. `--port` resta obbligatorio **per i vettori che ne indirizzano una**; ICMP lo ignora. |
-| `--layer l4` | Un run tutto-ICMP riporta L3, un run misto riporta **L4**: chiamare L3 un run che floodda una porta la sottovaluterebbe. |
-| `--rate 60000` | 3 vettori → 20 000/s ciascuno. |
+| `--l4-mode icmp` in the mix | Allowed. `--port` is still required **for the vectors that address one**; ICMP ignores it. |
+| `--layer l4` | An all-ICMP run reports L3, a mixed run reports **L4**: calling a run that floods a port "L3" would understate it. |
+| `--rate 60000` | 3 vectors → 20 000/s each. |
 
 ---
 
-### 19 — MultiVector frammentazione + flood `[sudo]`
+### 19 — Multi-vector: fragmentation + flood `[raw]`
 
 ```sh
 sudo -E jinrai $A --target $T --port 1-65535 --port-order random --layer l4 \
   --l4-mode udp-frag --l4-mode tcp-frag --l4-mode udp --rate 60000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| tre `--l4-mode` | 20 000 unità/s ciascuno. ⚠️ In pacchetti: udp-frag ×2 + tcp-frag ×3 + udp ×1 = **120 000 pacchetti/s**. Il preflight controlla **ogni** vettore, quindi un `CAP_NET_RAW` mancante ferma il run prima di qualsiasi traffico. |
-| `--port-order random` | Vale per tutti i vettori che indirizzano una porta. |
+| three `--l4-mode` | 20 000 units/s each. ⚠️ In packets: udp-frag ×2 + tcp-frag ×3 + udp ×1 = **120 000 packets/s**. Preflight checks **every** vector, so a missing `CAP_NET_RAW` stops the run before any traffic. |
+| `--port-order random` | Applies to every vector that addresses a port. |
 
 ---
 
-## Test case L7
+## L7 test cases
 
-Nessuno di questi richiede privilegi. Tutti usano `--url` invece di `--target`.
+None of these need privileges. All use `--url` instead of `--target`.
 
-### 20 — GET Flood, con verdetto
+### 20 — GET flood, with a verdict
 
 ```sh
 jinrai $A --url $URL --l7-method get --rate 2000 --duration 60 \
   --slo-max-5xx-rate 0.01 --slo-max-p99-ms 500 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--url $URL` | Il datum autorizzato. L'host viene risolto una volta e pinnato. |
-| `--l7-method get` | Flood di richieste veloci (default). Sostituibile con `post` e `head`. |
-| `--rate 2000` | Richieste/secondo. |
-| `--slo-max-5xx-rate 0.01` | **FAIL del run se più dell'1% delle risposte è 5xx.** Un SLO non rispettato fa uscire con codice ≠ 0: è così che una pipeline distingue "il target ha retto" da "il target ha ceduto". |
-| `--slo-max-p99-ms 500` | FAIL se la latenza p99 di fine run supera 500 ms. |
+| `--url $URL` | The authorized datum. The host is resolved once and pinned. |
+| `--l7-method get` | Fast request flood (the default). Swap for `post` or `head`. |
+| `--rate 2000` | Requests per second. |
+| `--slo-max-5xx-rate 0.01` | **The run FAILS if more than 1% of responses are 5xx.** An unmet SLO exits non-zero: that is how a pipeline tells "the target held" from "the target buckled". |
+| `--slo-max-p99-ms 500` | FAIL if end-of-run p99 latency exceeds 500 ms. |
 
-Altri SLO disponibili: `--slo-max-error-rate <0.0-1.0>` (errori di trasporto),
-`--slo-max-4xx-rate <F>` (spento di default).
+Other SLOs available: `--slo-max-error-rate <0.0-1.0>` (transport errors) and
+`--slo-max-4xx-rate <F>` (off by default).
 
 ---
 
-### 21 — GET-Random-Flood
+### 21 — Random-path flood
 
-Ogni richiesta chiede un URI che **non esiste**: niente è cacheabile, l'origine
-risponde (e di solito logga) tutto.
+Every request asks for a URI that **does not exist**: nothing is cacheable, and
+the origin answers (and usually logs) all of it.
 
 ```sh
 jinrai $A --url $URL --l7-method get --random-path --rate 2000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--random-path` | Aggiunge un segmento casuale fresco al path a ogni richiesta. Tocca **solo** il path: l'host non viene mai alterato, quindi l'autorizzazione e il pin DNS reggono per ogni richiesta del run. |
+| `--random-path` | Appends a fresh random segment to the path on every request. It touches the path **only**: the host is never altered, so the authorization and the DNS pin hold for every request of the run. |
 
-**Da leggere:** un 100% di 4xx qui è il test che funziona, non il target rotto —
-il summary lo dichiara con `varying: random path`.
+**How to read it:** 100% 4xx here is the test working, not the target failing —
+the summary says so with `varying: random path`.
 
 ---
 
-### 22 — GET /VALID_RANDOM
+### 22 — Valid-random flood
 
-Come sopra, ma i path sono presi da endpoint che **esistono davvero**: il carico
-finisce sugli handler reali invece che sul path del 404.
+The same idea, but the paths come from endpoints that **do exist**: the load
+lands on real handlers rather than the 404 path.
 
 ```sh
-jinrai $A --url $URL --l7-method get --path-file /home/c2/endpoints.txt \
+jinrai $A --url $URL --l7-method get --path-file ./endpoints.txt \
   --rate 2000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--path-file <PATH>` | Un path per riga, righe vuote e commenti `#` saltati, **ogni voce deve iniziare con un singolo `/`**. Una voce che sposterebbe il run su un'altra origine **fa rifiutare il run** — non viene saltata in silenzio, perché saltarla vorrebbe dire che la lista ha girato diversamente da come si legge. Un file illeggibile fa fallire il parsing degli argomenti, prima ancora dell'ack di lab. |
+| `--path-file <PATH>` | One path per line, blank lines and `#` comments skipped, **every entry must start with a single `/`**. An entry that would move the run to another origin **refuses the run** — it is never silently skipped, because skipping it would mean the list ran differently than it reads. An unreadable file fails at argument-parse time, before the lab acknowledgement. |
 
-Esempio di `endpoints.txt`:
+Example `endpoints.txt`:
 
 ```
-# endpoint reali del target
+# real endpoints on the target
 /api/v1/health
 /api/v1/users?page=2
 /static/app.css
@@ -487,88 +488,88 @@ Esempio di `endpoints.txt`:
 
 ---
 
-### 23 — POST Flood
+### 23 — POST flood
 
 ```sh
 jinrai $A --url $URL --l7-method post --body '{"q":"load"}' --cache-bust \
   --rate 1000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method post` | Percorso di scrittura. |
-| `--body '<STRING>'` | Il corpo mandato con ogni POST. |
-| `--cache-bust` | Aggiunge una query `_cb=<n>` unica, così una CDN o una cache non può rispondere al posto dell'origine. |
+| `--l7-method post` | The write path. |
+| `--body '<STRING>'` | The body sent with every POST. |
+| `--cache-bust` | Appends a unique `_cb=<n>` query so a cache or CDN cannot answer for the origin. |
 
 ---
 
-### 24 — SearchField-Flood
+### 24 — Search-field flood
 
-La query che nessuna cache può servire: un termine nuovo a ogni richiesta.
+The one query a cache can never serve: a fresh term on every request.
 
 ```sh
 jinrai $A --url ${URL}search --l7-method get --search-param q \
   --rate 2000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--search-param q` | Manda `q=<termine casuale>` a ogni richiesta: in query string per `get`/`head`, in corpo form-encoded per `post` (dove **sostituisce** `--body`). Il termine è una parola pronunciabile, non un blob esadecimale: un blob è ugualmente non cacheabile, ma un termine che sembra un termine raggiunge lo stesso percorso di codice di una ricerca vera. |
+| `--search-param q` | Sends `q=<random term>` on every request: in the query string for `get`/`head`, in a form-encoded body for `post` (where it **replaces** `--body`). The term is a pronounceable word, not a hex blob: a blob is equally uncacheable, but a term that looks like a term reaches the same code path a real query does. |
 
 ---
 
-### 25 — THOR / Session-Exhaustion
+### 25 — Session exhaustion
 
-Sessione nuova **e** query nuova a ogni richiesta: né la cache né lo store delle
-sessioni possono assorbire niente.
+A fresh session **and** a fresh query per request: neither the cache nor the
+session store can absorb any of it.
 
 ```sh
 jinrai $A --url $URL --l7-method get --session-cookie JSESSIONID --search-param q \
   --rate 2000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--session-cookie JSESSIONID` | Manda un cookie `JSESSIONID=<valore>` distinto e sconosciuto a ogni richiesta, così il target alloca o cerca stato di sessione per ognuna invece di riusarne una per tutto il run. Usa il nome giusto per lo stack sotto test: `JSESSIONID`, `PHPSESSID`, `connect.sid`, `ASP.NET_SessionId`. |
-| `--search-param q` | Come al test 24, si combina. |
+| `--session-cookie JSESSIONID` | Sends a distinct, unrecognised `JSESSIONID=<value>` cookie per request, so the target allocates or looks up session state for each one instead of reusing a single session for the whole run. Use the right name for the stack under test: `JSESSIONID`, `PHPSESSID`, `connect.sid`, `ASP.NET_SessionId`. |
+| `--search-param q` | As in test 24; they compose. |
 
 ---
 
 ### 26 — Keep-alive connection exhaustion
 
-La forma controllata di GoldenEye/XerXes: il carico viene fissato a un numero
-massimo di connessioni tenute occupate.
+The controlled form of the connection-slot attacks: the load is pinned to a
+maximum number of connections held busy.
 
 ```sh
 jinrai $A --url $URL --l7-method get --max-connections 50 --rate 5000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--max-connections 50` | Tetto sulle richieste in volo ≈ connessioni keep-alive concorrenti (default 1024). Serve a sondare il limite di slot/worker del server. **`--rate` da solo non limita le connessioni**: contro un target lento, rate × latenza *è* il numero di socket, ed è questo flag a impedire che il run diventi un test dei descriptor della tua macchina. `0` = illimitato, scelta esplicita, mai il default. |
+| `--max-connections 50` | Caps concurrent in-flight requests ≈ concurrent keep-alive connections (default 1024). It is how you probe a server's connection-slot / worker limit. **`--rate` alone does not bound connections**: against a slow target, rate × latency *is* the socket count, and this flag is what keeps the run from becoming a descriptor self-test on your own box. `0` means unbounded — an explicit choice, never the default. |
 
 ---
 
 ### 27 — Slowloris
 
-Connessioni mezze aperte, una riga di header ogni tanto per tenerle vive.
+Half-open connections, one header line each every so often to keep them alive.
 
 ```sh
 jinrai $A --url $URL --l7-method slowloris --slow-connections 500 --drip-ms 10000 \
   --rate 50 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method slowloris` | Header parziali lenti. Funziona anche su `https://` (handshake TLS vero, poi si sgocciola dentro il tunnel). |
-| `--slow-connections 500` | **Tetto di connessioni concorrenti** per i modi lenti e per websocket/sse (default 100). È il numero che stai davvero testando. |
-| `--drip-ms 10000` | Intervallo tra un tick e l'altro (default 10000): qui, ogni quanto si scrive un pezzo di header. Va tenuto **sotto** il read timeout del target, altrimenti è il target a chiudere e non hai misurato niente. |
-| `--rate 50` | ⚠️ Per i modi lenti il tetto è **connessioni aperte al secondo**, non richieste. Con 500 connessioni e 50/s ci vogliono 10 s per arrivare a regime. |
-| `--duration 300` | Questi test hanno senso lunghi. |
+| `--l7-method slowloris` | Slow partial headers. Works on `https://` too (a real TLS handshake, then the dribble happens inside the tunnel). |
+| `--slow-connections 500` | **Concurrent connection ceiling** for the slow modes and for websocket/sse (default 100). This is the number you are actually testing. |
+| `--drip-ms 10000` | Interval between ticks (default 10000): here, how often a piece of header is written. Keep it **below** the target's read timeout, or the target closes first and you have measured nothing. |
+| `--rate 50` | ⚠️ For slow modes the ceiling is **connections opened per second**, not requests. With 500 connections at 50/s it takes 10 s to reach steady state. |
+| `--duration 300` | These tests are only meaningful when long. |
 
-**Da leggere:** dichiarare il tetto di connessioni **silenzia** le note di
-scostamento (`bound by`): il run smette di aprire perché ha raggiunto il tetto
-che hai chiesto tu, non perché la macchina non ce la faceva.
+**How to read it:** declaring the connection ceiling **silences** the shortfall
+notes (`bound by`): the run stopped opening because it hit the ceiling you asked
+for, not because the host could not go faster.
 
 ---
 
@@ -579,143 +580,143 @@ jinrai $A --url $URL --l7-method slowbody --slow-connections 500 --drip-ms 10000
   --rate 50 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method slowbody` | Richiesta completa con `Content-Length` dichiarato, corpo sgocciolato. |
-| `--drip-ms 10000` | Intervallo tra un pezzo di corpo e il successivo. |
+| `--l7-method slowbody` | A complete request with a declared `Content-Length`, body trickled. |
+| `--drip-ms 10000` | Interval between body chunks. |
 
-Gli altri: come al test 27.
+Everything else: as in test 27.
 
 ---
 
-### 29 — Slow-read
+### 29 — Slow read
 
-Lo specchio in lettura di slowbody: richiesta completa e corretta, poi la
-risposta viene drenata un pezzetto per tick con la finestra di ricezione
-ristretta, così il server non riesce a svuotare il suo buffer.
+The read-side mirror of slowbody: a complete, well-formed request, then the
+response is drained one small chunk per tick with a shrunken receive window, so
+the server cannot flush its buffer.
 
 ```sh
 jinrai $A --url $URL --l7-method slow-read --slow-connections 500 --drip-ms 10000 \
   --rate 50 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method slow-read` | Come sopra. Punta a un URL che restituisce una risposta **grande**, altrimenti non c'è niente da trattenere. |
-| `--drip-ms 10000` | Qui è l'intervallo di **lettura** di un chunk. |
+| `--l7-method slow-read` | As above. Point it at a URL that returns a **large** response, or there is nothing to hold back. |
+| `--drip-ms 10000` | Here it is the **read** interval, one chunk per tick. |
 
 ---
 
 ### 30 — WebSocket session exhaustion
 
-Il test che nessun read timeout ritira: niente è lento e niente è malformato,
-sono sessioni corrette che restano aperte.
+The test no read timeout retires: nothing is slow and nothing is malformed —
+these are correct sessions that stay open.
 
 ```sh
 jinrai $A --url ${URL}ws --l7-method websocket --slow-connections 500 \
   --drip-ms 15000 --rate 100 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method websocket` | Upgrade RFC 6455 fatto per bene, chiave `Sec-WebSocket-Key` di 16 byte fresca per connessione. |
-| `--url ${URL}ws` | ⚠️ **`http://` e `https://`, non `ws://`/`wss://`** — l'upgrade *è* una richiesta HTTP/1.1. Per wss usa `https://`. |
-| `--slow-connections 500` | Sessioni concorrenti tenute: è il ceiling che stai misurando. |
-| `--drip-ms 15000` | Intervallo del Ping vuoto mascherato che tiene viva la sessione. |
-| `--rate 100` | Connessioni aperte al secondo. |
+| `--l7-method websocket` | A proper RFC 6455 upgrade, with a fresh 16-byte `Sec-WebSocket-Key` per connection. |
+| `--url ${URL}ws` | ⚠️ **`http://` and `https://`, not `ws://`/`wss://`** — the upgrade *is* an HTTP/1.1 request. For wss, use `https://`. |
+| `--slow-connections 500` | Concurrent sessions held: the ceiling you are measuring. |
+| `--drip-ms 15000` | Interval of the masked empty Ping that keeps the session alive. |
+| `--rate 100` | Connections opened per second. |
 
-**Da leggere:** la riga `of which` separa un server che **rifiuta** il trasporto
-(path sbagliato, upgrade non supportato) da una connessione che non ha mai avuto
-risposta. Sono cose diverse e un solo contatore non le distingue.
+**How to read it:** the `of which` row separates a server **declining** the
+transport (wrong path, upgrade unsupported) from a connection that never got an
+answer. Those are different things and one counter cannot tell them apart.
 
 ---
 
 ### 31 — SSE session exhaustion
 
-Stessa idea con un event-stream, che non ha nemmeno bisogno di keep-alive: è il
-server a tenerlo aperto per disegno.
+The same idea with an event stream, which needs no keep-alive at all: the server
+holds it open by design.
 
 ```sh
 jinrai $A --url ${URL}events --l7-method sse --slow-connections 500 \
   --rate 100 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method sse` | GET normale con `Accept: text/event-stream`, tenuta aperta e drenata. |
+| `--l7-method sse` | A normal `Accept: text/event-stream` GET, held open and drained. |
 
 ---
 
-### 32 — TLS Handshake Flood (THC-SSL-DoS)
+### 32 — TLS handshake flood
 
-Handshake completo, connessione buttata, ripetere: l'asimmetria è tutta nel costo
-crittografico lato server.
+Full handshake, connection dropped, repeat: the asymmetry is entirely in the
+server's crypto cost.
 
 ```sh
 jinrai $A --url https://$T/ --l7-method tls-handshake --max-connections 200 \
   --rate 500 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method tls-handshake` | **Solo `https://`.** Il tetto conta handshake/secondo. |
-| `--url https://...` | Obbligatoriamente TLS. Il certificato del server **non viene verificato** ed è deliberato: il confine di sicurezza è l'host autorizzato e pinnato, non l'identità TLS del peer; il run non manda segreti e non legge risposte. |
-| `--max-connections 200` | Vale anche per i metodi TLS una-connessione-per-unità. |
+| `--l7-method tls-handshake` | **`https://` only.** The ceiling counts handshakes per second. |
+| `--url https://...` | Must be TLS. The server certificate is **not verified**, deliberately: the safety boundary is the authorized, pinned host, not the TLS peer identity; the run sends no secrets and reads no response. |
+| `--max-connections 200` | Applies to the one-connection-per-unit TLS methods too. |
 
 ---
 
 ### 33 — TLS ClientHello parser stress
 
-Nessun handshake completato: si spende tutta la connessione nel far analizzare al
-target un ClientHello enorme ma **legale**.
+No handshake is completed: the whole connection is spent making the target parse
+a huge but **legal** ClientHello.
 
 ```sh
 jinrai $A --url https://$T/ --l7-method tls-big-hello --rate 500 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method tls-big-hello` | Un hello ben formato gonfiato fino al tetto di 16 KiB del record: 2048 cipher suite che il server deve intersecare + padding RFC 7685. Sostituibile con `tls-sni-bomb`, che isola l'SNI: ~12 KiB di `server_name` fatto di label DNS legali da ≤63 byte, così sopravvive ai controlli di sintassi e **arriva alla lookup del vhost** invece di essere scartato come malformato. |
-| `--rate 500` | Hello al secondo. |
+| `--l7-method tls-big-hello` | A well-formed hello inflated to the 16 KiB record ceiling: 2048 cipher-suite code points the server must intersect, plus RFC 7685 padding. Swap for `tls-sni-bomb`, which isolates the SNI: ~12 KiB of `server_name` built from legal ≤63-byte DNS labels, so it survives the syntax checks and **reaches the vhost lookup** instead of being discarded as malformed. |
+| `--rate 500` | Hellos per second. |
 
-**Da leggere:** ⚠️ **non guardare il conteggio dei completati, guarda la riga
-`of which`.** `parsed` significa che il target ha fatto il lavoro;
-`refused with an alert` è il risultato **sano** — il parser ha rifiutato.
+**How to read it:** ⚠️ **do not read the completion count, read the `of which`
+row.** `parsed` means the target did the work; `refused with an alert` is the
+**healthy** result — the parser rejected it.
 
 ---
 
-### 34 — HTTP/2 Rapid Reset (CVE-2023-44487)
+### 34 — HTTP/2 rapid reset (CVE-2023-44487)
 
-Apri uno stream, mandi subito RST_STREAM: il client non paga quasi niente, il
-server sì, e il limite di stream concorrenti non lo ferma perché lo slot si
-libera all'istante.
+Open a stream, immediately RST_STREAM: the client pays almost nothing, the
+server pays, and the concurrent-stream limit does not stop it because the slot
+frees instantly.
 
 ```sh
 jinrai $A --url https://$T/ --l7-method h2-rapid-reset --rate 5000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--l7-method h2-rapid-reset` | Il tetto conta **reset al secondo**. Su `https` usa ALPN `h2`; su `http` usa h2c a conoscenza pregressa. |
+| `--l7-method h2-rapid-reset` | The ceiling counts **resets per second**. On `https` it uses ALPN `h2`; on `http`, prior-knowledge h2c. |
 
 ---
 
-### 35 — Gli altri flood HTTP/2
+### 35 — The other HTTP/2 floods
 
-Stessa identica forma del test 34, cambia solo `--l7-method`:
+Exactly the shape of test 34; only `--l7-method` changes:
 
-| Metodo | Cosa fa fare al server |
+| Method | What the server is made to do |
 |---|---|
-| `h2-made-you-reset` | CVE-2025-8671: richiesta completa poi WINDOW_UPDATE a incremento 0, così è **il server** a resettare lo stream (aggira le mitigazioni per rapid-reset). |
-| `h2-continuation` | CVE-2024-27316: HEADERS senza END_HEADERS + CONTINUATION all'infinito. |
-| `h2-settings` | CVE-2019-9515: SETTINGS vuoti che il server deve ACKare. |
-| `h2-ping` | CVE-2019-9512: PING che il server deve PONGare. |
-| `h2-window-update` | CVE-2019-9514: update di flow control a livello connessione sullo stream 0. |
-| `h2-priority` | CVE-2019-9513 (Resource Loop): frame che rimescolano l'albero delle priorità. |
-| `h2-empty-data` | CVE-2019-9518: DATA di lunghezza 0 senza END_STREAM. |
-| `h2-bomb` | CVE-2026-49975: amplificazione header HPACK con riferimenti da 1 byte + finestra iniziale a zero, così la memoria amplificata resta bloccata. |
+| `h2-made-you-reset` | CVE-2025-8671: a complete request then a 0-increment WINDOW_UPDATE, so **the server** resets the stream (evading rapid-reset mitigations). |
+| `h2-continuation` | CVE-2024-27316: HEADERS without END_HEADERS plus endless CONTINUATION frames. |
+| `h2-settings` | CVE-2019-9515: empty SETTINGS frames the server must ACK. |
+| `h2-ping` | CVE-2019-9512: PING frames the server must PONG. |
+| `h2-window-update` | CVE-2019-9514: connection-level flow-control updates on stream 0. |
+| `h2-priority` | CVE-2019-9513 (Resource Loop): frames that reshuffle the priority tree. |
+| `h2-empty-data` | CVE-2019-9518: 0-length DATA frames without END_STREAM. |
+| `h2-bomb` | CVE-2026-49975: HPACK 1-byte-reference header amplification plus a zero initial window, so the amplified memory stays pinned. |
 
-Per tutti, `--rate` conta **frame al secondo**.
+For all of them, `--rate` counts **frames per second**.
 
 ---
 
@@ -727,77 +728,78 @@ jinrai $A --url $URL --l7-method get \
   --rate 2000 --duration 60 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--header '<K: V>'` | Header extra, **ripetibile**. È il gancio per i test basati sul profilo di richiesta (User-Agent, Referer, Cookie…). |
+| `--header '<K: V>'` | An extra request header, **repeatable**. This is the hook for request-profile tests (User-Agent, Referer, Cookie…). |
 
-> Nota: la rotazione di User-Agent/Referer in stile HULK è **fuori scope per
-> scelta** — è evasione, non carico. Questo flag serve a mandare un profilo
-> dichiarato, non a nasconderlo.
+> Note: User-Agent/Referer rotation in the HULK style is **out of scope by
+> design** — that is evasion, not load. This flag exists to send a declared
+> profile, not to hide one.
 
 ---
 
-## Test case di capacità
+## Capacity test cases
 
 ### 37 — Breaking point (knee)
 
-Sale a gradini fino al tetto e **si ferma al primo gradino che rompe lo SLO**,
-riportando il ginocchio della curva di capacità.
+Steps up to the ceiling and **stops at the first step that breaks the SLO**,
+reporting the knee of the capacity curve.
 
 ```sh
 jinrai $A --url $URL --rate 5000 --duration 300 --discover-knee \
   --slo-max-5xx-rate 0.02 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--discover-knee` | Attiva la scoperta del punto di rottura. **Richiede almeno un `--slo-max-*-rate`**, altrimenti il run è rifiutato: senza soglia non c'è modo di sapere cos'è "rotto". Trovare il ginocchio è un **successo** (exit 0). Il watchdog viene sospeso durante la scoperta. |
-| `--slo-max-5xx-rate 0.02` | La soglia che definisce "rotto": 2% di 5xx. |
-| `--rate 5000` | Il tetto della rampa. |
-| `--duration 300` | Finestra totale, divisa tra i gradini. |
+| `--discover-knee` | Turns on breaking-point discovery. **Requires at least one `--slo-max-*-rate`**, or the run is refused: without a threshold there is no way to know what "broken" means. Finding the knee is a **success** (exit 0). The watchdog is suppressed during discovery. |
+| `--slo-max-5xx-rate 0.02` | The threshold that defines "broken": 2% 5xx. |
+| `--rate 5000` | The top of the ramp. |
+| `--duration 300` | Total window, divided across the steps. |
 
-**Da leggere:** la riga `knee` dice *ha retto X/s dentro SLO, ha ceduto a Y/s*.
+**How to read it:** the `knee` row says *held X/s within SLO, first breached at
+Y/s*.
 
 ---
 
 ### 38 — Burst / autoscaling
 
-Tiene una baseline, salta al tetto, ricade: la forma che mette alla prova la
-reattività dell'autoscaling.
+Holds a baseline, jumps to the ceiling, falls back: the shape that tests how
+fast autoscaling reacts.
 
 ```sh
 jinrai $A --url $URL --profile spike --spike-base 200 --spike-secs 30 \
   --rate 5000 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--profile spike` | La forma del carico. Altri: `constant` (default), `soak`, `ramp`. |
-| `--spike-base 200` | Rate della baseline (default: tetto ÷ 5). |
-| `--spike-secs 30` | Durata del picco. ⚠️ **Ritagliata da `--duration`, mai aggiunta**: la baseline riempie il resto della finestra. |
-| `--rate 5000` | Il picco *è* il tetto. Un profilo modella il traffico **solo fino a** `--rate`, mai oltre. |
+| `--profile spike` | The load shape. Others: `constant` (default), `soak`, `ramp`. |
+| `--spike-base 200` | Baseline rate (default: ceiling ÷ 5). |
+| `--spike-secs 30` | Peak duration. ⚠️ **Carved out of `--duration`, never added to it**: the baseline fills the rest of the window. |
+| `--rate 5000` | The peak *is* the ceiling. A profile shapes traffic **only up to** `--rate`, never above it. |
 
 ---
 
-### 39 — Endurance / soak, con watchdog
+### 39 — Endurance / soak, with a watchdog
 
 ```sh
 jinrai $A --url $URL --profile soak --rate 500 --duration 3600 \
   --watchdog --slo-max-5xx-rate 0.05 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--profile soak` | Tenuta piatta lunga: fa emergere leak e degradi lenti. |
-| `--duration 3600` | Un'ora. |
-| `--watchdog` | **Interrompe il run** quando uno SLO di rate è violato per più finestre consecutive. Può solo **fermare** il traffico, mai aumentarlo. Inerte senza almeno un `--slo-max-*-rate` da guardare (viene segnalato). |
-| `--slo-max-5xx-rate 0.05` | Ciò che il watchdog guarda. |
+| `--profile soak` | A long flat hold: it surfaces leaks and slow degradation. |
+| `--duration 3600` | One hour. |
+| `--watchdog` | **Aborts the run** when a rate SLO is breached for several consecutive windows. It can only ever **stop** traffic, never increase it. Inert without at least one `--slo-max-*-rate` to watch (it warns). |
+| `--slo-max-5xx-rate 0.05` | What the watchdog watches. |
 
-Regolabili: `--watchdog-window <SECS>` (finestra di campionamento, default 5) e
-`--watchdog-breaches <K>` (finestre consecutive prima di abortire, default 3).
+Tunable: `--watchdog-window <SECS>` (sample window, default 5) and
+`--watchdog-breaches <K>` (consecutive breaching windows before abort, default 3).
 
-**Da leggere:** un abort da watchdog stampa `outcome` in **rosso** ed esce con
-codice ≠ 0.
+**How to read it:** a watchdog abort prints `outcome` in **red** and exits
+non-zero.
 
 ---
 
@@ -808,34 +810,34 @@ jinrai $A --url $URL --profile ramp --ramp-start 100 --ramp-steps 10 \
   --rate 5000 --duration 300 $REQ
 ```
 
-| Switch | Cosa fa qui |
+| Switch | What it does here |
 |---|---|
-| `--profile ramp` | Sale a gradini da `--ramp-start` fino al tetto. |
-| `--ramp-start 100` | Rate iniziale (default 0). |
-| `--ramp-steps 10` | Numero di gradini di uguale durata (default 10). |
+| `--profile ramp` | Steps up from `--ramp-start` to the ceiling. |
+| `--ramp-start 100` | Starting rate (default 0). |
+| `--ramp-steps 10` | Number of equal-length steps (default 10). |
 
 ---
 
-## Fuori scope, e perché
+## Out of scope, and why
 
-| Use case | Perché non c'è |
+| Use case | Why it is not here |
 |---|---|
-| **UDP DNS / NTP Reflection** | Richiede lo spoofing dell'IP sorgente. jinrai non ha alcun percorso di spoofing **per progetto**: l'indirizzo sorgente viene sempre dal routing reale, in ogni modo, incapsulamento GRE incluso. È la garanzia su cui poggia il fatto che questo strumento sia usabile in casa. |
-| Smurf / Fraggle / amplificazione | Stessa ragione: sono attacchi per riflessione. |
-| Ping of Death / teardrop / Boink | Crash di stack storici, non test di resilienza. |
-| Rotazione UA/Referer in stile HULK | Evasione di firme vendor, non carico. |
-| Renegoziazione TLS | Sostanzialmente superata da TLS 1.3. |
+| **UDP DNS / NTP reflection** | Requires source-IP spoofing. jinrai has no spoofing path **by design**: the source address always comes from real routing, in every mode, GRE encapsulation included. That is the guarantee that makes this tool usable in-house. |
+| Smurf / Fraggle / amplification | Same reason: they are reflection attacks. |
+| Ping of Death / teardrop / Boink | Historical stack crashes, not resilience tests. |
+| HULK-style UA/Referer rotation | Vendor-signature evasion, not load. |
+| TLS renegotiation | Largely moot on TLS 1.3. |
 
 ---
 
-## Come si legge il summary
+## Reading the run summary
 
-Ogni run finisce con questo blocco. Su terminale è colorato
+Every run ends with this block. On a terminal it is coloured
 (`--color auto|always|never`).
 
 ```
 ==== run summary =========================================================
- target     http://192.168.178.41/
+ target     http://10.0.0.10/
  module     L7 / l7-http-get  (HTTP/1.1 forced)
  window     60.0s elapsed of 60.0s planned, rate cap 2000/s
  started    2026-08-03T09:14:02Z
@@ -852,84 +854,81 @@ Ogni run finisce con questo blocco. Su terminale è colorato
 ==========================================================================
 ```
 
-| Colore | Significato |
+| Colour | Meaning |
 |---|---|
-| 🟢 **verde** | il run ha fatto il suo lavoro: `completed`, `failed 0`, `2xx`, `SLO: PASS`, `ran to completion` |
-| 🟡 **giallo** | un caveat sul **nostro** lato: `bound by`, `not offered`, errno locali (EMFILE, EADDRNOTAVAIL…), abort dell'operatore, `4xx` |
-| 🔴 **rosso** | fallimento e gli errori del target: `failed`, `5xx`, errno remoti, `SLO: FAIL`, abort del watchdog, il `WARNING` di run vuoto |
+| 🟢 **green** | the run did what it set out to do: `completed`, `failed 0`, `2xx`, `SLO: PASS`, `ran to completion` |
+| 🟡 **yellow** | a caveat about **our** side: `bound by`, `not offered`, local errno buckets (EMFILE, EADDRNOTAVAIL…), an operator abort, `4xx` |
+| 🔴 **red** | failure, and the target's own errors: `failed`, `5xx`, remote errno buckets, `SLO: FAIL`, a watchdog abort, the hollow-run `WARNING` |
 
-Le righe da non ignorare mai:
+The lines never to skip:
 
-- **`attempts … achieved (…% del tetto)`** — dice se il carico chiesto è stato
-  davvero prodotto. Senza questa riga un risultato si legge come "il target ha
-  retto" anche quando il generatore non è mai arrivato al rate.
-- **`bound by`** (gialla) — compare quando il run non ha raggiunto il tetto e
-  **nomina il vincolo**. Una percentuale bassa con **zero fallimenti** è la riga
-  più fraintendibile che questo strumento possa stampare: sembra identica a un
-  target che assorbe la differenza. Se dice `the generator, not the target` o
-  `concurrency, not the target`, quel divario **non è carico assorbito**.
-- **`of which`** — il breakdown dove "completato" copre esiti che significano
-  cose opposte: per vettore nei run multi-vector, parsed/rifiutato nei test TLS
-  hello, declinato/senza risposta per websocket e sse.
-- **`failed` + i bucket errno** — dicono **di chi** è la colpa. `ECONNREFUSED`,
-  `ETIMEDOUT`, `ECONNRESET` sono comportamento del target (il risultato che
-  cercavi); `EMFILE`, `ENFILE`, `ENOBUFS`, `EADDRNOTAVAIL` sono un tetto della
-  **tua** macchina e non dicono niente sul target.
-- **`WARNING`** — 0 completati con soli fallimenti: non è stato testato niente,
-  e il processo esce con codice ≠ 0. Un `completed 0` è **rosso**, non verde, e
-  in quel caso anche `outcome` diventa giallo: "ran to completion" verde sopra un
-  WARNING rosso sarebbe esattamente il falso-verde da evitare.
-
----
-
-## Verifica dell'audit log
-
-```sh
-jinrai --verify-audit /home/c2/runs.jsonl
-```
-
-Ricalcola l'intera catena di hash e stampa ogni record in forma leggibile.
-Esce 0 se è intatta, ≠ 0 nominando il primo punto di rottura. La catena
-**continua tra un processo e l'altro**: è questo che rende rilevabile un run
-cancellato in mezzo.
-
-Onestà sui limiti: è **evidenza di manomissione, non non-ripudio**. Chi riscrive
-l'intero file può ricalcolare una catena pulita; chiudere quel buco richiede HMAC
-o un'ancora esterna, ed è fuori scope.
+- **`attempts … achieved (…% of the cap)`** — says whether the load that was
+  asked for was actually produced. Without it, a result reads as "the target
+  coped" even when the generator never reached the rate.
+- **`bound by`** (yellow) — appears when the run did not reach its cap, and
+  **names the constraint**. A low percentage with **zero failures** is the most
+  misreadable line this tool can print: it looks exactly like a target absorbing
+  the difference. If it says `the generator, not the target` or `concurrency,
+  not the target`, that shortfall is **not absorbed load**.
+- **`of which`** — the breakdown for cases where "completed" covers outcomes
+  that mean opposite things: per vector in multi-vector runs, parsed vs. refused
+  in the TLS hello tests, declined vs. unanswered for websocket and sse.
+- **`failed` plus the errno buckets** — they say **whose** failure it was.
+  `ECONNREFUSED`, `ETIMEDOUT` and `ECONNRESET` are target behaviour (the result
+  you came for); `EMFILE`, `ENFILE`, `ENOBUFS` and `EADDRNOTAVAIL` are a ceiling
+  on **your** host and say nothing about the target.
+- **`WARNING`** — 0 completions with only failures: nothing was tested, and the
+  process exits non-zero. A `completed 0` is **red**, not green, and in that case
+  `outcome` turns yellow too: a green "ran to completion" above a red WARNING
+  would be exactly the confidently-wrong green to avoid.
 
 ---
 
-## I modi out-of-state e il firewall Proxmox
-
-Il firewall del datacenter Proxmox scarta **ogni** flood L4 fuori stato — `ack`,
-`fin`, `rst`, `urg`, `cwr`, `ece`, `syn-ack`, `syn-fin`, `syn-rst`, `xmas`,
-`null` — con una regola generata da PVE in cima alla catena:
-
-```
--A PVEFW-FORWARD -m conntrack --ctstate INVALID -j DROP
-```
-
-`sendto()` riesce comunque dentro la VM, quindi **jinrai riporta
-`5000 completed (100%), failed 0` mentre al target non arriva niente**. Non c'è
-segnale nel summary che il run era vuoto: la sonda va fatta fuori.
-
-Diagnosi, sull'host `pve`:
+## Verifying the audit log
 
 ```sh
-iptables -Z                                  # azzera i contatori
-# ...lancia il run...
-iptables -L PVEFW-FORWARD -nvx | head        # ~N pkt sulla regola INVALID = firma
+jinrai --verify-audit ./runs.jsonl
 ```
 
-Per farli passare: `enable: 0` in `/etc/pve/firewall/cluster.fw`, verifica che
-`iptables -L -n | grep -c PVEFW` arrivi a 0, **e rimetti tutto dopo** — riguarda
-ogni VM dell'host, non solo quella sotto test.
+Recomputes the whole hash chain and prints every record in readable form. Exits 0
+if it is intact, non-zero naming the first break. The chain **continues across
+processes**, which is what makes a deleted middle run detectable.
 
-Passano invece senza toccare niente: `syn`, `tcp-options`, `udp`, `tcp`, `data`,
-i tre modi ICMP e tutto L7, perché aprono stato conntrack legittimo.
+Honest about the limit: this is **tamper-evidence, not non-repudiation**. Anyone
+who rewrites the whole file can recompute a clean chain; closing that needs an
+HMAC or an external anchor, and it is out of scope.
 
-Non diagnosticare mai da Wireshark su una terza macchina: cattura alla sorgente.
+---
+
+## When a run reaches nothing
+
+A stateful firewall, IDS or middlebox anywhere on the path can drop out-of-state
+segments before they are delivered — typically every mode at tests 12 and 13:
+`ack`, `fin`, `rst`, `urg`, `cwr`, `ece`, `syn-ack`, `syn-fin`, `syn-rst`,
+`xmas`, `null`.
+
+**The local `sendto()` still succeeds**, so jinrai reports
+`50000 completed (100%), failed 0` for a run that reached nothing at all. There
+is no signal in the summary — the send succeeded, and the tool cannot see past
+its own NIC. Confirming delivery has to happen off-tool.
+
+Capture **at the source** to prove what left, and **on the target itself** to
+prove what arrived:
 
 ```sh
-tcpdump -ni any 'host 192.168.178.41 and tcp port 445'
+# on the host running jinrai
+tcpdump -ni any 'host <target> and tcp port 445'
+
+# on the target
+tcpdump -ni any 'host <source> and tcp port 445'
 ```
+
+Never diagnose this from a third machine: a host that is neither source nor
+target sees whatever the switching fabric happens to give it, which is not
+evidence either way. If the target's own firewall keeps counters, zero them
+before the run and read them after — a counter matching the run's unit count on
+an "invalid state" rule is the signature.
+
+The modes that always get through, because they open legitimate connection
+state: `syn`, `tcp-options`, `udp`, `tcp`, `data`, the three ICMP modes, and all
+of L7.
