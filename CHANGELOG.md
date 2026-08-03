@@ -14,6 +14,50 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.41.0] — 2026-08-03
+
+Colour in the run summary. The block already said everything an operator needs;
+what it did not do was let them find it. `completed`, `failed`, `2xx`, `5xx`,
+`ABORTED` and `ran to completion` all arrive as the same grey text, so the one
+number that decides whether the test passed has to be located by reading the
+labels — which is exactly what a tester at the end of a run does not do.
+
+### Added
+
+- **`--color <auto|always|never>`** (default `auto`). `auto` paints only when
+  stdout is a terminal, `$NO_COLOR` is unset and `$TERM` is not `dumb`, so a
+  redirected or piped report is byte-for-byte the plain block it has always been.
+- Three senses, not a palette: **green** = the run did what it set out to do
+  (`completed > 0`, `failed 0`, `2xx`, `SLO: PASS`, `ran to completion`),
+  **yellow** = a caveat about *our* side (`bound by`, `not offered`, the local
+  errno ceilings, an operator abort, `4xx`), **red** = failure and the target's
+  own errors (`failed`, `5xx`, a remote errno, `SLO: FAIL`, a watchdog abort,
+  the hollow-run `WARNING`). Anything finer would be decoration.
+- `Palette` in `jinrai-metrics`, taken by `render_summary` as a parameter rather
+  than sniffed from the environment inside it: the same report is read on a
+  terminal and written to a file, and only the caller knows which.
+
+### Changed
+
+- **A completion count of zero is red, and a hollow run's outcome is yellow.**
+  `completed` is not a green row by name — `0 (0.0%)` is the worst line the block
+  can print, and "ran to completion" above a red `WARNING` would be the
+  confidently-wrong green this whole block exists to prevent. An empty status
+  class stays plain for the same reason in reverse: painting `5xx 0 (0.0%)` red
+  puts alarm on the healthiest possible line.
+- The one-line `--output line` form is untouched. It is the scriptable one, and a
+  stable line is worth more there than a readable one.
+
+### Verified
+
+Colour cannot move a line break: the wrapper measures visible width with escapes
+skipped, and a test asserts the painted and plain blocks have identical line
+counts *and* identical per-line widths over a report that wraps in four places.
+A second test asserts the plain palette emits no escape byte at all. Live
+loopback runs confirm both readings — a clean UDP flood (green completions,
+green `failed 0`) and a refused TCP connect flood (red `0 (0.0%)`, red
+`ECONNREFUSED`, yellow outcome, red `WARNING`). Suite 309 green, clippy clean.
+
 ## [0.40.0] — 2026-08-03
 
 IP fragmentation and GRE. Every primitive jinrai had so far put **one packet** on
@@ -1928,7 +1972,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.40.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.41.0...HEAD
+[0.41.0]: https://github.com/h4b00b/jinrai/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/h4b00b/jinrai/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/h4b00b/jinrai/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/h4b00b/jinrai/compare/v0.37.0...v0.38.0
