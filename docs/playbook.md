@@ -4,7 +4,7 @@ One section per row of a test plan, with the ready-to-paste command and an
 explanation of **every switch in it**, so whoever runs the test knows exactly
 what lands on the wire and how to read the result.
 
-Reference version: **0.41.0**.
+Reference version: **0.42.0**.
 
 ---
 
@@ -13,8 +13,8 @@ Reference version: **0.41.0**.
 - [Setup](#setup)
 - [The mandatory flags, explained once](#the-mandatory-flags-explained-once)
 - [L3/L4 test cases](#l3l4-test-cases) — 1–19
-- [L7 test cases](#l7-test-cases) — 20–36
-- [Capacity test cases](#capacity-test-cases) — 37–40
+- [L7 test cases](#l7-test-cases) — 20–38
+- [Capacity test cases](#capacity-test-cases) — 39–42
 - [Out of scope, and why](#out-of-scope-and-why)
 - [Reading the run summary](#reading-the-run-summary)
 - [Verifying the audit log](#verifying-the-audit-log)
@@ -738,9 +738,68 @@ jinrai $A --url $URL --l7-method get \
 
 ---
 
+### 37 — QUIC handshake flood
+
+The same asymmetry as case 32, one step earlier and over UDP: the server
+decrypts an Initial, parses a ClientHello and **signs with its private key** for
+a client that has proved only that it can receive one round trip.
+
+Run it even when case 32 was fine. HTTP/3 is normally a different code path
+behind a different protocol, and the rate limit protecting 443/TCP is often
+simply absent from 443/UDP.
+
+```sh
+jinrai $A --url https://$T/ --l7-method quic-handshake --max-connections 200 \
+  --rate 500 --duration 60 $REQ
+```
+
+| Switch | What it does here |
+|---|---|
+| `--l7-method quic-handshake` | **`https://` only** — there is no plaintext QUIC. Negotiates ALPN `h3`. The ceiling counts handshakes per second. |
+| `--max-connections 200` | Handshakes **in flight**, not total. A target that stalls mid-handshake would otherwise turn the rate into an ever-growing socket count on your own box. |
+| `--url https://...` | The certificate is **not verified**, for the same reason as case 32: the boundary is the authorized, pinned host. |
+
+**How to read it:** the `of which` row separates **refused** — the peer answered
+in QUIC and declined, nearly always because it does not offer `h3` — from plain
+errors. A run that is all refusals is telling you about the endpoint, not its
+capacity.
+
+---
+
+### 38 — QUICLORIS
+
+Slowloris carried to HTTP/3: a proper control stream with `SETTINGS`, then a
+request stream whose `HEADERS` frame promises 4 KiB and delivers one byte per
+tick.
+
+Why this is not case 27 again: an HTTP/1.1 Slowloris is retired by a
+request-header read timeout, which every mainstream server grew. QUIC's
+equivalent budget is the **idle timeout** — and a connection that is dribbling is
+never idle, so the timer that reclaims an abandoned QUIC connection never fires.
+Whether anything else reclaims it is the question this run answers.
+
+```sh
+jinrai $A --url https://$T/ --l7-method quicloris --slow-connections 300 \
+  --drip-ms 10000 --rate 50 --duration 300 $REQ
+```
+
+| Switch | What it does here |
+|---|---|
+| `--l7-method quicloris` | **`https://` only**, ALPN `h3`. Nothing sent is malformed — the request is merely never finished. |
+| `--slow-connections 300` | The real bound: connections opened and then **held** for the whole run. |
+| `--drip-ms 10000` | One byte of the unfinished `HEADERS` frame every 10s. |
+| `--rate 50` | Connections **opened** per second — how fast the 300 are reached, not how fast bytes flow. |
+| `--duration 300` | How long they are held. This is the measurement. |
+
+**How to read it:** if all 300 hold for the whole run with no errors, the target
+has no concurrent-connection cap, no per-IP limit and no reaper on its HTTP/3
+listener.
+
+---
+
 ## Capacity test cases
 
-### 37 — Breaking point (knee)
+### 39 — Breaking point (knee)
 
 Steps up to the ceiling and **stops at the first step that breaks the SLO**,
 reporting the knee of the capacity curve.
@@ -762,7 +821,7 @@ Y/s*.
 
 ---
 
-### 38 — Burst / autoscaling
+### 40 — Burst / autoscaling
 
 Holds a baseline, jumps to the ceiling, falls back: the shape that tests how
 fast autoscaling reacts.
@@ -781,7 +840,7 @@ jinrai $A --url $URL --profile spike --spike-base 200 --spike-secs 30 \
 
 ---
 
-### 39 — Endurance / soak, with a watchdog
+### 41 — Endurance / soak, with a watchdog
 
 ```sh
 jinrai $A --url $URL --profile soak --rate 500 --duration 3600 \
@@ -803,7 +862,7 @@ non-zero.
 
 ---
 
-### 40 — Ramp
+### 42 — Ramp
 
 ```sh
 jinrai $A --url $URL --profile ramp --ramp-start 100 --ramp-steps 10 \
@@ -824,6 +883,7 @@ jinrai $A --url $URL --profile ramp --ramp-start 100 --ramp-steps 10 \
 |---|---|
 | **UDP DNS / NTP reflection** | Requires source-IP spoofing. jinrai has no spoofing path **by design**: the source address always comes from real routing, in every mode, GRE encapsulation included. That is the guarantee that makes this tool usable in-house. |
 | Smurf / Fraggle / amplification | Same reason: they are reflection attacks. |
+| QUIC Retry / token-replay amplification, QUIC reflection via the cert exchange | Same reason again, and worth naming explicitly because QUIC is the protocol most easily turned into a reflector: every variant needs a **forged Initial**. Cases 37–38 bind an ordinary client UDP socket and let the OS assign the source, which is the whole difference between a QUIC load test and a QUIC reflector. |
 | Ping of Death / teardrop / Boink | Historical stack crashes, not resilience tests. |
 | HULK-style UA/Referer rotation | Vendor-signature evasion, not load. |
 | TLS renegotiation | Largely moot on TLS 1.3. |

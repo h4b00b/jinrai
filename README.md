@@ -189,7 +189,43 @@ whether the target survives.
 | `h2-window-update` / `h2-priority` | flow-control updates / priority-tree reshuffles | CVE-2019-9514 / -9513 |
 | `h2-empty-data` | zero-length `DATA` frames without `END_STREAM` | CVE-2019-9518 |
 
-### 5. Volume and buffers (lab) — "what happens at packet scale?"
+### 5. HTTP/3 and QUIC — "does the UDP front door have the same locks?"
+
+| Goal | Method |
+|---|---|
+| **QUIC handshake flood** — complete a handshake, drop it, repeat | `--l7-method quic-handshake` |
+| **QUICLORIS** — hold connections on a request that never finishes | `--l7-method quicloris` |
+
+Worth running separately from their TCP counterparts, because an HTTP/3 endpoint
+is usually a *different* code path reached over a *different* protocol, and the
+rate limits, connection caps and idle reapers protecting the TCP front door are
+frequently absent from the UDP one. Both are `https`-only — there is no plaintext
+QUIC — and both speak ALPN `h3`.
+
+`quic-handshake` is `tls-handshake` with the asymmetry made worse: QUIC moves the
+crypto *further forward*, so the server parses a ClientHello and signs with its
+private key for a client that has proved nothing beyond being able to receive one
+round trip. `--max-connections` caps handshakes in flight.
+
+`quicloris` is Slowloris carried to HTTP/3: a real control stream with `SETTINGS`,
+then a request stream whose `HEADERS` frame promises far more than ever arrives,
+dribbled a byte per `--drip-ms`. The reason it is not just Slowloris again is that
+QUIC's equivalent of a request-header read timeout is the **idle timeout** — and a
+connection dribbling bytes is never idle, so the budget that retires an abandoned
+QUIC connection does not fire on it. `--slow-connections` is the ceiling.
+
+Read the answer split, as with the TLS hellos: **refused** means the peer answered
+in QUIC and declined — almost always that the target speaks QUIC but not `h3`,
+which is a finding about the endpoint, not about its capacity. **Errors** mean
+nothing came back at all. Because a dropped QUIC Initial produces no `ECONNREFUSED`
+and no `RST` — just silence — a run that reaches nothing looks exactly like a run
+against a filtered path. Read it as "not reached", never as "withstood".
+
+Neither primitive spoofs: jinrai sends from a real, OS-assigned UDP source, which
+is what keeps QUIC — the protocol easiest to turn into a reflector — a direct test
+here. Retry/token-replay amplification is out of scope by design.
+
+### 6. Volume and buffers (lab) — "what happens at packet scale?"
 
 | Goal | Mode |
 |---|---|
@@ -199,7 +235,7 @@ whether the target survives.
 | IP reassembly table (fragmented datagrams the target must hold and rebuild) | `--layer l3 --l4-mode udp-frag` \| `tcp-frag` |
 | GRE decapsulation path (IP protocol 47) | `--layer l3 --l4-mode gre` |
 
-### 6. Stateful middlebox behaviour (lab, raw sockets) — "does the firewall/IDS handle this correctly?"
+### 7. Stateful middlebox behaviour (lab, raw sockets) — "does the firewall/IDS handle this correctly?"
 
 These probe *handling*, not volume: how a connection tracker, IDS or TCP stack
 reacts to control flags it should never see.
@@ -230,6 +266,8 @@ reinterpreted per family, and a flag belonging to another family is inert
 | `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
 | `tls-big-hello` / `tls-sni-bomb` | hellos/sec | `--max-connections` (default 1024) | same as above |
 | every `h2-*` | frames/sec (cycles/sec for `h2-made-you-reset`) | *nothing* — one connection, frames paced by `--rate` | same as above |
+| `quic-handshake` | handshakes/sec | `--max-connections` (in flight, default 1024) | same as above |
+| `quicloris` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (dribble tick) | same as above |
 | l4 `tcp` | connection attempts/sec | `--concurrency` (open sockets), `--connect-timeout-ms` | `--slo-*`, `--profile` |
 | l4 `data` | writes/sec | `--concurrency`, `--payload-size` | same |
 | l4 `udp` | datagrams/sec | `--payload-size` (stateless — no footprint to bound) | same |
@@ -334,6 +372,21 @@ jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method tls-handshake \
 # did the work, `refused with an alert` is the healthy answer.
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method tls-big-hello \
        --url https://api.staging.internal/ --rate 200 --duration 60
+
+# QUIC handshake flood: the same asymmetry as tls-handshake, over UDP and one
+# step earlier — the server signs before the client has proved anything. Worth
+# running even when tls-handshake was fine: the HTTP/3 listener is usually a
+# different code path, and often the one without the rate limit.
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method quic-handshake \
+       --url https://api.staging.internal/ --rate 200 --duration 60
+
+# QUICLORIS: 300 HTTP/3 connections, each holding one request stream whose
+# HEADERS frame never finishes, a byte every 10s. Nothing is malformed, and a
+# dribbling connection is never idle — so the QUIC idle timeout does not retire
+# it. If all 300 hold for the whole run with no errors, nothing else does either.
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method quicloris \
+       --url https://api.staging.internal/ --slow-connections 300 \
+       --drip-ms 10000 --rate 50 --duration 300
 
 # HTTP/2 rapid reset (CVE-2023-44487). Every h2-* method takes this exact shape;
 # only the method name changes:
@@ -598,6 +651,14 @@ outside every `--allow` rule aborts the entire run. Those techniques exist to
 hide the sender or to borrow someone else's bandwidth; a test of your own
 infrastructure needs neither.
 
+This is the line the QUIC primitives sit closest to, so it is worth stating
+twice: `quic-handshake` and `quicloris` send from a real, OS-assigned UDP source
+on an ordinary client socket. There is no source-address option in that code
+path, which is the whole difference between a QUIC load test and a QUIC
+reflector — every amplification variant needs a spoofed Initial. QUIC Retry /
+token-replay amplification and reflection via the certificate exchange are out of
+scope by design, not merely unimplemented.
+
 ---
 
 # Part II — Reference
@@ -645,6 +706,8 @@ counts as a unit of `--rate`, see
 | `sse` | long-lived transport | a normal `Accept: text/event-stream` GET, held open and drained — the server keeps it open by design |
 | `tls-big-hello` | TLS parser | one well-formed ClientHello inflated to the 16 KiB record ceiling: a 2048-entry cipher-suite list the server must intersect against its own, padded out with the RFC 7685 `padding` extension. No handshake is completed; https-only |
 | `tls-sni-bomb` | TLS parser | the same connection budget spent on the SNI alone: a ~12 KiB `server_name` built from legal ≤63-byte DNS labels, so it survives syntax validation and reaches the virtual-host lookup (and whatever logs the name on rejection); https-only |
+| `quic-handshake` | QUIC | complete a full QUIC handshake, drop it, repeat concurrently — the TLS-handshake asymmetry moved forward, since the server parses a ClientHello and signs for a client that has proved only that it can receive one round trip; https-only, ALPN `h3` |
+| `quicloris` | QUIC | hold HTTP/3 connections, each carrying a proper control stream with `SETTINGS` and one request stream whose `HEADERS` frame promises 4 KiB and delivers a byte per `--drip-ms`. A dribbling connection is never idle, so QUIC's idle timeout — the budget that retires an abandoned connection — never fires; https-only, ALPN `h3` |
 
 The slow modes and the long-lived transports support https targets (the handshake
 accepts any server certificate); `websocket` and `sse` pin ALPN to `http/1.1`, so
@@ -1055,10 +1118,10 @@ not an expressible program state; it fails to compile.
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
 - **Phase 7** — protocol coverage ✅: TCP-flag floods (ACK/FIN/RST, URG/CWR/ECE, SYN-ACK, SYN+FIN/SYN+RST, Xmas/NULL), TCP options bomb, TCP data/PSH-ACK flood, ICMP/L3 query floods (echo/timestamp/address-mask), the HTTP/1.1 slow family (Slowloris/RUDY/slow-read) and keep-alive exhaustion, WebSocket/SSE session exhaustion, TLS slow modes + handshake flood + ClientHello/SNI parser stress, and the HTTP/2 family (rapid-reset, MadeYouReset, CONTINUATION, SETTINGS/PING, WINDOW_UPDATE/PRIORITY, empty-DATA, HPACK bomb)
+- **Phase 7b** — HTTP/3 & QUIC ✅: handshake flood + QUICLORIS
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
 
-Still open beyond Phase 8: HTTP/3 & QUIC (handshake flood, QUICLORIS — needs a
-QUIC dependency, an unmade decision), and IPv6 for the raw L3/L4 primitives
-(`tcp-connect` and `data` already do IPv6; the raw modes are IPv4-only).
+Still open beyond Phase 8: IPv6 for the raw L3/L4 primitives (`tcp-connect` and
+`data` already do IPv6; the raw modes are IPv4-only).
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
