@@ -89,6 +89,9 @@ pub use h2_stream_flood::{H2StreamFloodEngine, H2StreamKind};
 pub mod tls_flood;
 pub use tls_flood::TlsHandshakeEngine;
 
+pub mod long_lived;
+pub use long_lived::{LongLivedConfig, LongLivedEngine, LongLivedKind};
+
 mod tls;
 
 /// Which HTTP request shape to generate. Every variant reuses the *same*

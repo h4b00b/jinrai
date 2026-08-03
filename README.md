@@ -134,7 +134,20 @@ slot. Cheap for the client, which is exactly the point.
 | Classic **Slowloris** — hold connections with never-finished request headers | `--l7-method slowloris` |
 | **RUDY** — oversized `Content-Length`, body trickled one byte at a time | `--l7-method slowbody` |
 | **Slow read** — complete request, then refuse to drain the response | `--l7-method slow-read` |
+| **WebSocket sessions** — a correct upgrade, then hold the session open | `--l7-method websocket` |
+| **SSE streams** — a correct `text/event-stream` GET, held open | `--l7-method sse` |
 | Accept backlog / conntrack table, below HTTP | `--layer l4 --l4-mode tcp --concurrency 256` |
+
+The last two are the awkward ones to defend against, because nothing about them
+is abusive: a WebSocket or SSE endpoint is *designed* to keep the connection for
+as long as the client wants it, so the request-header and body read timeouts that
+retire a Slowloris connection never fire. What they measure is whether anything
+else does — a concurrent-session cap, a per-IP limit, an idle-session reaper. If
+a run holds `--slow-connections` sessions for the whole `--duration` with zero
+errors, the answer is no. Both take `http(s)` URLs (the handshake *is* an HTTP
+request, so `https://` is `wss://`), and the summary reports a server **declining**
+the transport separately from a connection that never got an answer — a run that
+is all declines is pointing at the path in your URL, not at the target's capacity.
 
 ### 3. Handshake cost — "is the crypto the bottleneck?"
 
@@ -191,6 +204,7 @@ reinterpreted per family, and a flag belonging to another family is inert
 |---|---|---|---|
 | `get` / `post` / `head` | requests/sec | `--max-connections` (default 1024; `0` = unbounded), `--request-timeout-ms`, `--drain-timeout-ms` | — |
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
+| `websocket` / `sse` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (Ping tick, `websocket` only) | same as above |
 | `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
 | every `h2-*` | frames/sec (cycles/sec for `h2-made-you-reset`) | *nothing* — one connection, frames paced by `--rate` | same as above |
 | l4 `tcp` | connection attempts/sec | `--concurrency` (open sockets), `--connect-timeout-ms` | `--slo-*`, `--profile` |
@@ -260,6 +274,14 @@ jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method slowloris \
        --url https://api.staging.internal/ --slow-connections 200 \
        --drip-ms 10000 --rate 50 --duration 300
+
+# WebSocket session exhaustion: 500 correctly-upgraded sessions, held for the
+# whole run, kept alive with an empty Ping every 15s. Swap the method for `sse`
+# to do the same with an event-stream (which needs no keep-alive at all).
+# NOTE: https:// is how you say wss:// — the upgrade IS an HTTP/1.1 request.
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method websocket \
+       --url https://api.staging.internal/ws --slow-connections 500 \
+       --drip-ms 15000 --rate 100 --duration 300
 
 # TLS handshake flood (THC-SSL-DoS): full handshake, immediate drop, repeat
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method tls-handshake \
@@ -541,9 +563,13 @@ counts as a unit of `--rate`, see
 | `h2-made-you-reset` | HTTP/2 | complete request then a zero-increment `WINDOW_UPDATE` so the **server** resets the stream (CVE-2025-8671, "MadeYouReset") — evades Rapid-Reset mitigations |
 | `h2-empty-data` | HTTP/2 | open a stream, then flood zero-length `DATA` frames without `END_STREAM` (CVE-2019-9518) |
 | `h2-bomb` | HTTP/2 | HPACK 1-byte-reference header amplification + `INITIAL_WINDOW_SIZE=0` so the amplified memory stays pinned (CVE-2026-49975, "HTTP/2 Bomb") |
+| `websocket` | long-lived transport | complete the RFC 6455 upgrade, then hold the session open with a masked empty `Ping` every `--drip-ms`. Nothing is slow or malformed, so no header/body read timeout applies |
+| `sse` | long-lived transport | a normal `Accept: text/event-stream` GET, held open and drained — the server keeps it open by design |
 
-The slow modes support https targets (slow-TLS; the handshake accepts any server
-certificate). All the `h2-*` primitives negotiate h2 via ALPN for `https` and
+The slow modes and the long-lived transports support https targets (the handshake
+accepts any server certificate); `websocket` and `sse` pin ALPN to `http/1.1`, so
+a target that also offers h2 cannot negotiate a protocol the upgrade could not run
+over. All the `h2-*` primitives negotiate h2 via ALPN for `https` and
 prior-knowledge h2c for `http`.
 
 ### Timeouts and the end of the run
@@ -779,7 +805,11 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** — protocol coverage: TCP-flag floods (ACK/FIN/RST) ✅, TCP anomaly floods (Xmas/NULL) ✅, TCP data/PSH-ACK flood ✅, TLS slow modes ✅, TLS handshake flood ✅, ICMP/L3 ✅, HTTP/2 rapid-reset ✅, HTTP/2 CONTINUATION flood ✅, HTTP/2 SETTINGS/PING floods ✅
+- **Phase 7** — protocol coverage ✅: TCP-flag floods (ACK/FIN/RST, URG/CWR/ECE, SYN-ACK, SYN+FIN/SYN+RST, Xmas/NULL), TCP options bomb, TCP data/PSH-ACK flood, ICMP/L3 query floods (echo/timestamp/address-mask), the HTTP/1.1 slow family (Slowloris/RUDY/slow-read) and keep-alive exhaustion, WebSocket/SSE session exhaustion, TLS slow modes + handshake flood, and the HTTP/2 family (rapid-reset, MadeYouReset, CONTINUATION, SETTINGS/PING, WINDOW_UPDATE/PRIORITY, empty-DATA, HPACK bomb)
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
+
+Still open beyond Phase 8: HTTP/3 & QUIC (handshake flood, QUICLORIS — needs a
+QUIC dependency, an unmade decision), and IPv6 for the raw L3/L4 primitives
+(`tcp-connect` and `data` already do IPv6; the raw modes are IPv4-only).
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.

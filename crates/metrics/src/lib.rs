@@ -880,6 +880,33 @@ mod tests {
         assert!(!out.contains("the generator, not the target"), "{out}");
     }
 
+    /// A connection-holding run (slowloris, websocket, sse) opens up to its
+    /// ceiling and then stops opening, so it *always* sits far below the rate
+    /// cap with zero failures — the exact shape the generator note fires on, and
+    /// the one case where its conclusion is wrong: this host could have opened
+    /// far more, the operator asked it not to. Declaring the ceiling is what
+    /// keeps the note quiet, and it measures no per-attempt latency, so the
+    /// concurrency note has nothing to say either.
+    #[test]
+    fn a_declared_connection_ceiling_silences_both_shortfall_notes() {
+        let r = RunReport {
+            layer_label: "L7 l7-websocket".into(),
+            units_sent: 25,
+            ..Default::default() // no errors, no latency, not aborted
+        };
+        let c = RunContext {
+            layer: "L7".into(),
+            mode: "l7-websocket".into(),
+            rate_per_sec: 50,
+            planned: Duration::from_secs(5),
+            elapsed: Duration::from_secs(5),
+            concurrency: Some(25),
+            ..ctx_l4()
+        };
+        let out = render_summary(&r, &c, None);
+        assert!(!out.contains("bound by"), "{out}");
+    }
+
     /// `elapsed` says how long the run was, never *when* it was — and "when" is
     /// what lines the block up against the target's own logs. Both ends must be
     /// on screen, and the finish must bracket the window rather than fall inside
