@@ -14,6 +14,17 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+### Documentation
+
+- **`docs/playbook.md`** — one test-plan row per section, each with the ready
+  command and a table explaining **every switch in it**, plus what lands on the
+  wire and how to read the result. Written for the operators running the lab, so
+  it is in Italian and uses the lab's own addresses. Covers the whole use-case
+  list (L3/L4 1–19, L7 20–36, capacity 37–40), what is out of scope and why, the
+  colour key of the run summary, audit-log verification, and the Proxmox
+  out-of-state drop that makes eleven of the raw modes report a full run while
+  nothing reaches the target.
+
 ## [0.41.0] — 2026-08-03
 
 Colour in the run summary. The block already said everything an operator needs;

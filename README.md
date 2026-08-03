@@ -9,6 +9,10 @@ infrastructure. Covers L3/L4 and L7. Built in-house and validated in-house.
 > allowlist is passed at runtime (multiple CIDR blocks), never hard-coded,
 > because different campaigns target different networks.
 
+> **Test plan in hand?** [`docs/playbook.md`](docs/playbook.md) maps a test-plan
+> row to a ready command and explains **every switch in it**, one case at a time
+> (in Italian, for the operators running the lab).
+
 ## Contents
 
 **[Part I — Operating jinrai](#part-i--operating-jinrai)** · start here, it is
