@@ -773,9 +773,12 @@ fn run_l7(
     // Phase-6 profile validation, fail-closed before any traffic: knee discovery
     // is meaningless without a rate SLO to detect the breaking point against.
     if args.discover_knee && !args.slo.has_rate_thresholds() {
-        return Err("--discover-knee needs a rate SLO to detect the knee \
-                    (add e.g. --slo-max-5xx-rate or --slo-max-error-rate)"
-            .into());
+        return Err(audit_refusal(
+            &mut audit,
+            "arguments",
+            "--discover-knee needs a rate SLO to detect the knee \
+             (add e.g. --slo-max-5xx-rate or --slo-max-error-rate)",
+        )?);
     }
 
     // Build the selected engine and authorize its datum up front. Both engines
@@ -995,6 +998,15 @@ fn run_l7(
     );
 
     if args.discover_knee {
+        audit_record(&mut audit, AuditEvent::completed(&report, None))?;
+        // Discovery succeeds whether or not a knee was found (an operator Ctrl-C
+        // still aborts); it is not a pass/fail run. But "not pass/fail" is not
+        // "always green": a run that completed nothing discovered nothing either,
+        // and "the target held the full ramp" is then a claim about a target we
+        // never reached — the most confidently-wrong line this tool can print. So
+        // the hollow-run check applies here too, and it runs BEFORE the conclusion
+        // is printed rather than after it.
+        check_l7_reached_something(&report)?;
         match report.knee {
             Some(k) => println!(
                 "breaking point: sustained {} req/s within SLO, breached at {} req/s",
@@ -1005,9 +1017,6 @@ fn run_l7(
                 args.rate
             ),
         }
-        audit_record(&mut audit, AuditEvent::completed(&report, None))?;
-        // Discovery succeeds whether or not a knee was found (an operator Ctrl-C
-        // still aborts); it is not a pass/fail run.
         return Ok(());
     }
 
@@ -1064,12 +1073,20 @@ fn check_l7_outcome(report: &RunReport, verdict: Option<&SloVerdict>) -> Result<
             return Err(format!("target did not meet SLO — {v}"));
         }
     }
-    // A run where every single attempt failed exercised nothing, and must not
-    // report success — the same policy L3/L4 already applies (`check_l4_outcome`).
-    // Every L7 primitive counts a unit once it got somewhere (a response, an
-    // established slow connection, a sent frame), so 0 units with only failures
-    // means the target was never reached. Without this, `--http-version 2` against
-    // an HTTP/1.1-only target exits 0 having sent no valid request at all.
+    check_l7_reached_something(report)
+}
+
+/// A run where every single attempt failed exercised nothing, and must not report
+/// success — the same policy L3/L4 already applies (`check_l4_outcome`). Every L7
+/// primitive counts a unit once it got somewhere (a response, an established slow
+/// connection, a sent frame), so 0 units with only failures means the target was
+/// never reached. Without this, `--http-version 2` against an HTTP/1.1-only target
+/// exits 0 having sent no valid request at all.
+///
+/// Split out from [`check_l7_outcome`] because knee discovery has no SLO verdict
+/// to check but still must not report a conclusion about a target it never
+/// reached.
+fn check_l7_reached_something(report: &RunReport) -> Result<(), String> {
     if report.units_sent == 0 && report.errors > 0 {
         return Err(format!(
             "L7 run completed 0 of {} attempts: target unreachable, refusing, or \
@@ -1455,19 +1472,35 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 }
             }
             "--port" => {
-                port = Some(
-                    next_val(&mut it, "--port")?
-                        .parse()
-                        .map_err(|_| "invalid --port".to_string())?,
-                );
+                let raw = next_val(&mut it, "--port")?;
+                let v: u16 = raw.parse().map_err(|_| "invalid --port".to_string())?;
+                // Port 0 is not a port an operator can mean here: it is the
+                // kernel's "pick one" sentinel for *binding*, and as a
+                // destination the raw packet builder rewrites it to 1. Refuse it
+                // rather than send traffic to a port nobody asked for — the same
+                // policy the other meaningless zeros get.
+                if v == 0 {
+                    return Err("--port 0 is not a destination port (got 0)".to_string());
+                }
+                port = Some(v);
             }
             "--payload-size" => {
                 payload_size =
                     parse_capped(&mut it, "--payload-size", MAX_PAYLOAD_SIZE as u64)? as usize;
             }
             "--concurrency" => {
-                concurrency =
-                    parse_capped(&mut it, "--concurrency", MAX_CONNECTIONS as u64)? as usize
+                let v = parse_capped(&mut it, "--concurrency", MAX_CONNECTIONS as u64)?;
+                // Clamped to 1 downstream, which makes `--concurrency 0` read as
+                // "no concurrency" and behave as "one". An operator who typed a
+                // zero meant something; we cannot tell what, so we say so.
+                if v == 0 {
+                    return Err(
+                        "--concurrency 0 would send nothing; it is clamped to 1 downstream, \
+                         so say 1 if that is what you mean"
+                            .to_string(),
+                    );
+                }
+                concurrency = v as usize;
             }
             "--connect-timeout-ms" => {
                 connect_timeout_ms = parse_capped(&mut it, "--connect-timeout-ms", MAX_TIMEOUT_MS)?;
@@ -1533,15 +1566,18 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 slo.max_p99_micros = Some(ms.saturating_mul(1000));
             }
             "--watchdog" => watchdog = true,
+            // Capped like every other numeric flag: the window becomes a
+            // `Duration` added to an `Instant`, and the breach count bounds a
+            // loop. Both were the last two flags parsing straight into their
+            // types with no ceiling.
             "--watchdog-window" => {
-                watchdog_window_secs = next_val(&mut it, "--watchdog-window")?
-                    .parse()
-                    .map_err(|_| "invalid --watchdog-window".to_string())?;
+                watchdog_window_secs =
+                    parse_capped(&mut it, "--watchdog-window", MAX_DURATION_SECS)?;
             }
             "--watchdog-breaches" => {
-                watchdog_breaches = next_val(&mut it, "--watchdog-breaches")?
-                    .parse()
-                    .map_err(|_| "invalid --watchdog-breaches".to_string())?;
+                watchdog_breaches =
+                    parse_capped(&mut it, "--watchdog-breaches", MAX_WATCHDOG_BREACHES as u64)?
+                        as u32;
             }
             "--audit-log" => audit_log = Some(next_val(&mut it, "--audit-log")?),
             "--verify-audit" => verify_audit = Some(next_val(&mut it, "--verify-audit")?),
@@ -1555,6 +1591,16 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     // above the ceiling is a contradiction the operator can see and we cannot
     // resolve for them (is the ceiling wrong, or the floor?), so refuse it here
     // rather than silently flattening the shape they asked for.
+    // Opposite instructions about the one file that makes a run accountable.
+    // `--audit-log` won and the opt-out was silently ignored — a harmless
+    // outcome here, but the wrong precedent on this flag: an operator who passed
+    // both cannot be assumed to have meant the recorded one, and guessing is not
+    // ours to do when the answer is "was this run on the record".
+    if no_audit && audit_log.is_some() {
+        return Err(
+            "--no-audit and --audit-log contradict each other: pass one or the other".to_string(),
+        );
+    }
     if ramp_start > rate {
         return Err(format!(
             "--ramp-start {ramp_start} exceeds the --rate ceiling {rate}: a ramp cannot \
@@ -1675,6 +1721,12 @@ const MAX_DURATION_SECS: u64 = 86_400;
 /// value is also used as an allocation size, so an unbounded one aborts the
 /// process on a capacity overflow before a single packet is sent.
 const MAX_CONNECTIONS: usize = 1_048_576;
+
+/// Upper bound on `--watchdog-breaches`. The watchdog aborts after this many
+/// consecutive breaching windows, so `breaches × window` is how long a target may
+/// stay in breach before the run stops. Beyond a thousand the watchdog is not
+/// watching anything a run would outlive.
+const MAX_WATCHDOG_BREACHES: u32 = 1_000;
 
 /// Upper bound on `--ramp-steps`. Each step is a materialised stage in a `Vec`,
 /// so an unbounded count is an allocation request, not a load shape.
@@ -2023,6 +2075,60 @@ mod tests {
     fn help_requests_nothing_to_run() {
         assert!(parse(&["--help"]).unwrap().is_none());
         assert!(parse(&["-h"]).unwrap().is_none());
+    }
+
+    /// Zeros that the code silently reinterpreted into something else. Each one
+    /// is a value the operator typed and did not get: `--port 0` became port 1 in
+    /// the packet builder, `--concurrency 0` was clamped to 1. The rest of the
+    /// parser refuses meaningless zeros; these two were the exceptions.
+    #[test]
+    fn zero_valued_flags_are_refused_rather_than_reinterpreted() {
+        let base = ["--allow", "10.0.0.0/8", "--layer", "l4", "--target", "10.1.2.3"];
+        for (flag, value) in [("--port", "0"), ("--concurrency", "0")] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend([flag, value]);
+            let err = parse(&argv).expect_err(&format!("{flag} 0 must be refused"));
+            assert!(err.contains(flag), "the refusal must name the flag: {err}");
+        }
+        // The same flags with a meaningful value still parse.
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--port", "80", "--concurrency", "8"]);
+        let a = args_of(&argv);
+        assert_eq!(a.port, Some(80));
+        assert_eq!(a.concurrency, 8);
+    }
+
+    /// Two flags giving opposite instructions about whether the run is on the
+    /// record. `--audit-log` used to win and the opt-out was dropped in silence.
+    #[test]
+    fn no_audit_and_audit_log_together_are_refused() {
+        let err = parse(&[
+            "--allow",
+            "10.0.0.0/8",
+            "--url",
+            "http://10.1.2.3/",
+            "--no-audit",
+            "--audit-log",
+            "/tmp/jinrai-test.log",
+        ])
+        .expect_err("contradictory audit flags must be refused");
+        assert!(err.contains("--no-audit"), "{err}");
+        assert!(err.contains("--audit-log"), "{err}");
+    }
+
+    /// The last two numeric flags that parsed straight into their types with no
+    /// ceiling. The window becomes a `Duration` added to an `Instant`.
+    #[test]
+    fn watchdog_flags_are_capped_like_every_other_numeric() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"];
+        for (flag, value) in
+            [("--watchdog-window", "999999999"), ("--watchdog-breaches", "999999999")]
+        {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend([flag, value]);
+            let err = parse(&argv).expect_err(&format!("{flag} must be capped"));
+            assert!(err.contains("at most"), "the refusal must name the ceiling: {err}");
+        }
     }
 
     // ---- the pre-traffic gates, every layer -----------------------------

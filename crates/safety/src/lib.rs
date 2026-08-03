@@ -86,7 +86,18 @@ fn parse_entry(entry: &str) -> Result<Rule, AllowParseError> {
     if let Ok(ip) = t.parse::<IpAddr>() {
         let cidr = match ip {
             IpAddr::V4(a) => Cidr::from(a),
-            IpAddr::V6(a) => Cidr::from(a),
+            // The same refusal the CIDR parser makes, for the same reason: a
+            // mapped entry authorizes nothing and does so silently. Without this
+            // the two spellings disagreed — `--allow ::ffff:10.0.0.1/128` was
+            // rejected loudly while the bare `--allow ::ffff:10.0.0.1` built an
+            // inert /128 the operator believed had opened something. Fail-closed
+            // either way, but only one of them tells them so.
+            IpAddr::V6(a) => {
+                if a.to_ipv4_mapped().is_some() {
+                    return Err(AllowParseError::Cidr(CidrParseError::Ipv4Mapped(t.to_string())));
+                }
+                Cidr::from(a)
+            }
         };
         return Ok(Rule::Ip(cidr));
     }
@@ -533,6 +544,24 @@ mod tests {
         // It is NOT a DNS rule: the numeric string is not authorized as a host.
         assert!(!a.permits_host("10.0.0.5"));
         assert!(!a.permits_host("::1"));
+    }
+
+    #[test]
+    fn bare_ipv4_mapped_entry_is_refused_like_its_cidr_spelling() {
+        // Regression: the CIDR path refused `::ffff:10.0.0.1/128` loudly, but the
+        // bare-IP path built a /128 rule from the same address — a rule that
+        // `contains` then always refuses. Fail-closed, but the operator believed
+        // they had authorized a host and had not, which is the exact failure the
+        // mapped check exists to prevent. Both spellings must answer the same way.
+        for entry in ["::ffff:10.0.0.1", "::FFFF:192.168.1.7"] {
+            let err = Allowlist::from_patterns([entry]).unwrap_err();
+            assert!(
+                matches!(err, AllowParseError::Cidr(CidrParseError::Ipv4Mapped(_))),
+                "{entry} should be refused as v4-mapped, got {err:?}"
+            );
+        }
+        // Ordinary bare literals of both families are unaffected.
+        assert!(Allowlist::from_patterns(["10.0.0.5", "::1", "2001:db8::1"]).is_ok());
     }
 
     #[test]

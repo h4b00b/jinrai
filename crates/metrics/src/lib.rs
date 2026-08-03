@@ -178,6 +178,20 @@ pub fn render_summary(
         "attempts",
         &format!("{attempts} total, {effective:.1}/s achieved{}", achieved_hint(effective, ctx)),
     ));
+    // Load the generator never offered, because its own in-flight budget was
+    // full. Not an attempt and not an error — but without it, "the target
+    // absorbed everything" and "we never sent it" print identically.
+    if report.not_offered > 0 {
+        out.push_str(&row(
+            "  not offered",
+            &format!(
+                "{} attempt{} skipped — our in-flight budget was saturated, not the \
+                 target's capacity (raise --concurrency to offer more)",
+                report.not_offered,
+                if report.not_offered == 1 { "" } else { "s" }
+            ),
+        ));
+    }
     out.push_str(&row(
         "completed",
         &format!("{} {}", report.units_sent, share(report.units_sent, attempts)),

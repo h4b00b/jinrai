@@ -309,9 +309,10 @@ pub struct AuditLog {
 
 impl AuditLog {
     /// Open (creating if absent) the log at `path`, attributing records to
-    /// `operator`. Refuses to open a log whose tail record is unparsable or whose
-    /// tail hash does not recompute, so we never append onto a broken chain
-    /// (fail-closed).
+    /// `operator`. Verifies the **entire** existing chain and refuses to open a
+    /// log with any unparsable record, any record whose hash does not recompute,
+    /// or any break in the `prev` linkage — so we never append onto a broken
+    /// chain (fail-closed). Equivalent to what [`verify`] checks.
     ///
     /// Takes an **exclusive advisory lock** for the lifetime of the log. Reading
     /// the tail and appending to it is a read-modify-write on shared state: two
@@ -357,46 +358,73 @@ impl AuditLog {
 
         // Recover chain state from any existing content, now that the lock makes
         // "what the file ends with" a stable answer.
-        let mut last = None;
-        for line in BufReader::new(&file).lines() {
+        //
+        // The WHOLE chain is verified here, not just the tail. Recomputing the
+        // tail's hash was already necessary — trusting the stored value would mean
+        // a log whose last record had been edited still accepted new, correctly
+        // chained records, and the forgery would then sit *below* verified history,
+        // exactly the shape a reviewer is least likely to question. But the tail
+        // alone left the same hole one line further up: a record edited in the
+        // MIDDLE of the file, with the last line intact, opened cleanly and honest
+        // records were chained onto poisoned history — discoverable only if
+        // somebody later happened to run `--verify-audit`.
+        //
+        // Finding the end of the file already reads every line, so full
+        // verification costs one SHA-256 per record and nothing else. Opening the
+        // log is the natural checkpoint for it.
+        let mut expected_prev = GENESIS.to_string();
+        let mut last: Option<(u64, String)> = None;
+        for (idx, line) in BufReader::new(&file).lines().enumerate() {
+            let lineno = idx + 1;
             let line = line.map_err(|e| AuditError::io(&path, e))?;
-            if !line.trim().is_empty() {
-                last = Some(line);
+            if line.trim().is_empty() {
+                continue;
             }
+            let (body, stored) = split_body_hash(&line).ok_or_else(|| AuditError::Corrupt {
+                path: path.clone(),
+                line: lineno,
+                detail: "record is not a well-formed audit line (no hash field)".into(),
+            })?;
+            if sha256_hex(body.as_bytes()) != stored {
+                return Err(AuditError::Tampered {
+                    path: path.clone(),
+                    line: lineno,
+                    detail: "record hash does not match its contents (edited in place); \
+                             refusing to append to a broken chain (run --verify-audit)"
+                        .into(),
+                });
+            }
+            let prev = extract_prev(body).ok_or_else(|| AuditError::Corrupt {
+                path: path.clone(),
+                line: lineno,
+                detail: "record has no readable prev field".into(),
+            })?;
+            if prev != expected_prev {
+                return Err(AuditError::Tampered {
+                    path: path.clone(),
+                    line: lineno,
+                    detail: "record's prev hash breaks the chain (a record was removed, \
+                             reordered, or inserted); refusing to append to a broken \
+                             chain (run --verify-audit)"
+                        .into(),
+                });
+            }
+            let seq = extract_seq(&line).ok_or_else(|| AuditError::Corrupt {
+                path: path.clone(),
+                line: lineno,
+                detail: "record has no readable seq".into(),
+            })?;
+            expected_prev = stored.to_string();
+            last = Some((seq, expected_prev.clone()));
         }
         let (seq, prev_hash) = match last {
-            Some(line) => {
-                // Recompute the tail's own hash before chaining onto it. Trusting
-                // the stored value would mean a log whose last record had been
-                // edited still accepted new, correctly-chained records — the
-                // forgery would then sit *below* verified history, which is
-                // exactly the shape a reviewer is least likely to question.
-                let (body, stored) =
-                    split_body_hash(&line).ok_or_else(|| AuditError::Corrupt {
-                        path: path.clone(),
-                        line: 0,
-                        detail: "existing log's last record has no readable hash".into(),
-                    })?;
-                if sha256_hex(body.as_bytes()) != stored {
-                    return Err(AuditError::Tampered {
-                        path: path.clone(),
-                        line: 0,
-                        detail: "existing log's last record does not match its own hash; \
-                                 refusing to append to a broken chain (run --verify-audit)"
-                            .into(),
-                    });
-                }
-                let seq = extract_seq(&line).ok_or_else(|| AuditError::Corrupt {
-                    path: path.clone(),
-                    line: 0,
-                    detail: "existing log's last record has no readable seq".into(),
-                })?;
+            Some((seq, hash)) => {
                 let next = seq.checked_add(1).ok_or_else(|| AuditError::Corrupt {
                     path: path.clone(),
                     line: 0,
                     detail: "existing log's sequence number is at the maximum".into(),
                 })?;
-                (next, stored.to_string())
+                (next, hash)
             }
             None => (0, GENESIS.to_string()),
         };
@@ -871,6 +899,39 @@ mod tests {
             matches!(err, AuditError::Tampered { .. }),
             "expected a tamper refusal, got: {err}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same hole one line further up: `open` verified only the tail, so a
+    /// record edited in the MIDDLE of the file with an intact last line opened
+    /// cleanly and got honest records chained onto poisoned history. `open` reads
+    /// every line anyway, so it verifies every line.
+    #[test]
+    fn appending_onto_an_edited_middle_record_is_refused() {
+        let path = tmp_path("edited-middle");
+        let mut log = AuditLog::open(&path, "operator").unwrap();
+        log.record(&authorized_event()).unwrap();
+        log.record(&authorized_event()).unwrap();
+        log.record(&authorized_event()).unwrap();
+        drop(log);
+
+        // Edit the middle record only; the tail record is untouched and still
+        // recomputes to its own stored hash.
+        let lines: Vec<String> =
+            std::fs::read_to_string(&path).unwrap().lines().map(String::from).collect();
+        assert_eq!(lines.len(), 3);
+        let edited = lines[1].replace("10.0.0.9", "10.0.0.1");
+        assert_ne!(edited, lines[1], "the test must actually change the record");
+        std::fs::write(&path, format!("{}\n{}\n{}\n", lines[0], edited, lines[2])).unwrap();
+
+        let err = match AuditLog::open(&path, "operator") {
+            Err(e) => e,
+            Ok(_) => panic!("a log with an edited middle record must not be appendable"),
+        };
+        match err {
+            AuditError::Tampered { line, .. } => assert_eq!(line, 2, "names the edited record"),
+            other => panic!("expected a tamper refusal, got: {other}"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 

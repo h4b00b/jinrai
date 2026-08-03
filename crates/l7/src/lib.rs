@@ -586,8 +586,14 @@ impl StressModule for L7Engine {
         // Compile the load profile into constant-rate stages (default: one flat
         // stage at the rate cap for the whole duration — the historical load).
         // Every stage is clamped to the plan's rate cap: a profile shapes traffic
-        // only *up to* the operator's `--rate` ceiling, never above it. Stages
-        // that would emit nothing (rate 0 or zero duration) are dropped.
+        // only *up to* the operator's `--rate` ceiling, never above it.
+        //
+        // Only zero-*duration* stages are dropped: they occupy no time, so keeping
+        // them would change nothing. A zero-*rate* stage is kept, because it is a
+        // silent stage rather than an absent one — it holds its slot in the shape
+        // for its full duration. Dropping it shortened the run and pulled every
+        // later rate forward, so `--ramp-start 0` reported a shape it had not
+        // actually run. See `RateCap`'s docs and `LoadStage::is_silent`.
         let profile = self
             .profile
             .unwrap_or(LoadProfile::Constant { rate: plan.rate_cap, duration: plan.duration });
@@ -595,7 +601,7 @@ impl StressModule for L7Engine {
             .stages()
             .into_iter()
             .map(|s| LoadStage { rate: s.rate.clamped_to(plan.rate_cap), duration: s.duration })
-            .filter(|s| s.rate.per_second > 0 && !s.duration.is_zero())
+            .filter(|s| !s.duration.is_zero())
             .collect();
 
         // Build the runtime here so `core` stays runtime-agnostic.
@@ -673,7 +679,7 @@ impl StressModule for L7Engine {
         let errno_w = errno.clone();
         let wd_flag = aborted_by_watchdog.clone();
 
-        let (aborted, knee) = rt.block_on(async move {
+        let (aborted, knee, skipped) = rt.block_on(async move {
             // Inline health-watchdog: a background task that trips the shared
             // kill-switch on sustained SLO breach. It only STOPS traffic. (Off
             // during knee discovery — see the `watchdog` filter above.)
@@ -693,6 +699,8 @@ impl StressModule for L7Engine {
             let mut tasks: JoinSet<()> = JoinSet::new();
             let mut aborted = false;
             let mut knee: Option<Knee> = None;
+            // Ticks the concurrency cap refused to dispatch — load never offered.
+            let mut skipped: u64 = 0;
 
             // Concurrency cap (≈ concurrent keep-alive connections). A tick that
             // cannot get a permit is skipped, not queued, so the load holds at
@@ -753,6 +761,16 @@ impl StressModule for L7Engine {
                         break;
                     }
 
+                    // Reap finished tasks every tick. A `JoinSet` holds each task's
+                    // completed output until it is joined, so joining only after the
+                    // run loop made our own memory grow with `rate × duration` — the
+                    // semaphore caps what is *in flight*, not what has finished and
+                    // is waiting to be collected. An hour-long run is exactly when a
+                    // generator must not be the thing that falls over. Reaped before
+                    // the permit check so a saturated tick still collects (that is
+                    // precisely when tasks are completing).
+                    while tasks.try_join_next().is_some() {}
+
                     // Concurrency cap: if all `n` connection slots are busy, skip
                     // this tick rather than pile on. The permit is held for the
                     // request's lifetime and released when it completes, so at
@@ -760,7 +778,15 @@ impl StressModule for L7Engine {
                     let permit = match &sem {
                         Some(sem) => match sem.clone().try_acquire_owned() {
                             Ok(p) => Some(p),
-                            Err(_) => continue,
+                            // Every connection slot is busy. Counted, because a
+                            // skipped tick is load the target never saw: without
+                            // it, a run bound by our own --max-connections and one
+                            // bound by the target's capacity print the same
+                            // summary. See `RunReport::not_offered`.
+                            Err(_) => {
+                                skipped += 1;
+                                continue;
+                            }
                         },
                         None => None,
                     };
@@ -915,7 +941,7 @@ impl StressModule for L7Engine {
             if let Some(handle) = watchdog_task {
                 handle.abort();
             }
-            (aborted, knee)
+            (aborted, knee, skipped)
         });
 
         // Every traffic task is joined or cancelled by now, so nothing is left to
@@ -965,6 +991,7 @@ impl StressModule for L7Engine {
             // The fast flood's completions all mean the same thing; the status
             // classes above are the breakdown that matters here.
             detail: None,
+            not_offered: skipped,
         })
     }
 }
@@ -1645,6 +1672,46 @@ mod tests {
 
         assert!(report.units_sent > 0, "ramp should have sent something");
         assert!(report.knee.is_none(), "no discovery => no knee");
+        assert!(!report.aborted_early);
+    }
+
+    #[test]
+    fn silent_ramp_stages_still_take_their_time() {
+        // Regression: a ramp from zero produces stages whose rate truncates to 0,
+        // and the engine used to filter those out. Dropping them shortened the run
+        // and pulled every later rate forward, so the shape in the summary was not
+        // the shape that ran. A silent stage is silent, not absent.
+        //
+        // start=0, end=5, steps=20 over 1000ms => 50ms stages, and the first three
+        // rates (5*1/20, 5*2/20, 5*3/20) all truncate to 0. Skipping them would
+        // finish 150ms early.
+        let (port, stop, handle) = spawn_http_server("200 OK");
+        let url = format!("http://127.0.0.1:{port}/");
+        let profile = LoadProfile::Ramp {
+            start: RateCap::new(0),
+            end: RateCap::new(5),
+            duration: Duration::from_millis(1000),
+            steps: 20,
+        };
+        assert_eq!(
+            profile.stages().iter().filter(|s| s.is_silent()).count(),
+            3,
+            "this profile is only a regression test while it still has silent stages"
+        );
+        let mut engine =
+            L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_profile(profile);
+        let plan = loopback_plan(&engine, 1000, 1000);
+        let began = std::time::Instant::now();
+        let report = engine.execute(&plan).expect("the run should execute");
+        let elapsed = began.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(
+            elapsed >= Duration::from_millis(950),
+            "the silent stages must hold their slots: ran {elapsed:?}, expected ~1000ms \
+             (skipping them gives ~850ms)"
+        );
         assert!(!report.aborted_early);
     }
 

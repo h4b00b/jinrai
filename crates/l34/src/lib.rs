@@ -86,11 +86,19 @@ enum Emission {
     Sent { latency: Option<Duration> },
     /// The attempt failed, bucketed by the OS error behind it.
     Failed(ErrnoBucket),
-    /// No outcome to record at this tick. The attempt is either in flight on a
-    /// worker (and will be counted when it resolves) or was never admitted
-    /// because every in-flight slot was busy. Only the pooled connect flood
-    /// produces this; every other mode resolves inline.
+    /// The attempt is in flight on a worker and will be counted when it resolves.
+    /// Only the pooled connect flood produces this; every other mode resolves
+    /// inline.
     Deferred,
+    /// The attempt was never admitted: every in-flight slot was busy and nothing
+    /// could be evicted, so this unit was never offered to the target.
+    ///
+    /// Distinct from [`Emission::Deferred`], which the two shared a variant with
+    /// until it became clear they are opposite claims — deferred load lands and is
+    /// counted later, dropped load never existed. Merged, a saturated pool
+    /// produced a run whose summary was indistinguishable from a target that
+    /// absorbed everything.
+    Dropped,
 }
 
 /// Classify an I/O failure into a reporting bucket. Thin alias for the shared
@@ -301,7 +309,7 @@ impl L34Engine {
                 }
                 let ip = ips[idx % ips.len()];
                 idx += 1;
-                match sender.send(ip, self.config.port, &mut tally) {
+                match sender.send(ip, self.config.port, &mut tally, plan) {
                     Ok(e) => tally.record(e),
                     // An `Err` here is never a per-packet failure: the send path
                     // classifies those into `Emission::Failed(bucket)` itself.
@@ -360,6 +368,8 @@ struct Tally {
     /// cannot supply.
     residency_micros: u128,
     residency_n: u64,
+    /// Units the pool refused to admit — see [`RunReport::not_offered`].
+    not_offered: u64,
 }
 
 impl Tally {
@@ -370,6 +380,7 @@ impl Tally {
             errno: ErrnoTally::default(),
             residency_micros: 0,
             residency_n: 0,
+            not_offered: 0,
             // 1us .. 60s at 3 significant figures — bounded memory regardless of
             // how long the run holds, unlike retaining every sample.
             latency: Histogram::new_with_bounds(1, 60_000_000, 3)
@@ -412,6 +423,10 @@ impl Tally {
             // Nothing resolved at this tick; the counters move when the worker
             // that owns the attempt reports back.
             Emission::Deferred => {}
+            // Never offered. Not an attempt (the target never saw it) and not an
+            // error (nothing failed), so it is counted on its own and disclosed
+            // separately — see `RunReport::not_offered`.
+            Emission::Dropped => self.not_offered += 1,
         }
     }
 
@@ -435,6 +450,7 @@ impl Tally {
             } else {
                 0
             },
+            not_offered: self.not_offered,
             ..Default::default()
         }
     }
@@ -516,6 +532,28 @@ pub fn effective_parallelism(concurrency: usize) -> usize {
     concurrency.clamp(1, MAX_CONNECT_WORKERS)
 }
 
+/// The most connections `--l4-mode data` will hold open at once.
+///
+/// The connect flood has had a hard ceiling ([`MAX_CONNECT_WORKERS`]) since it
+/// grew worker threads, but the data flood's pool was bounded only by
+/// `--concurrency` and, past that, by the process descriptor limit. "The OS will
+/// stop us" is not a limit this crate gets to rely on: the baseline requires hard
+/// concurrency ceilings, and the failure it prevents (EMFILE part-way through a
+/// run) is a measurement of our own box rather than of the target.
+///
+/// Every slot here is one descriptor held for the whole run, and 64 Ki of them is
+/// already far past any lab this tool is pointed at — so like the other ceilings,
+/// it never shapes a real test, it only catches the typo.
+const MAX_DATA_CONNECTIONS: usize = 65_536;
+
+/// The pool ceiling a data flood will actually hold, given a `--concurrency`
+/// budget. Public for the same reason as [`effective_parallelism`]: the summary
+/// must attribute a shortfall to the ceiling that applied, not to one we clamped
+/// away.
+pub fn effective_data_connections(concurrency: usize) -> usize {
+    concurrency.clamp(1, MAX_DATA_CONNECTIONS)
+}
+
 /// Stack size for a connect worker. The thread does nothing but block in
 /// `connect_timeout` and hand the result back, so the default 8 MiB reservation
 /// is pure waste at 512 threads.
@@ -543,6 +581,11 @@ const ABORT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// polled promptly when the pool is saturated; under load a result almost always
 /// lands within microseconds and the wait returns early.
 const BACKPRESSURE_WAIT: Duration = Duration::from_millis(25);
+
+/// How often a blocking call on the run thread comes up for air to check the kill
+/// switch. Matches the pacing loop's own granularity (`interruptible_sleep`), so
+/// no single step of a run delays an abort by more than one of these.
+const KILL_POLL: Duration = Duration::from_millis(50);
 
 /// What one worker's connect attempt produced.
 enum ConnectOutcome {
@@ -715,7 +758,7 @@ impl ConnectPool {
                 self.held.pop_front();
             }
             if !self.has_slot() {
-                return Emission::Deferred;
+                return Emission::Dropped;
             }
         }
         match self.work.as_ref() {
@@ -725,8 +768,9 @@ impl ConnectPool {
                     Emission::Deferred
                 }
                 // The queue is momentarily full (a worker has not yet returned to
-                // `recv`); skip this tick rather than block the pacer.
-                Err(mpsc::TrySendError::Full(_)) => Emission::Deferred,
+                // `recv`); skip this tick rather than block the pacer. Skipped is
+                // not offered, so it is disclosed as such.
+                Err(mpsc::TrySendError::Full(_)) => Emission::Dropped,
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     Emission::Failed(ErrnoBucket::Internal)
                 }
@@ -803,14 +847,20 @@ impl Sender {
                 Ok(Sender::Udp { sock, payload })
             }
             L4Mode::TcpConnect => Ok(Sender::Tcp(ConnectPool::new(cap, connect_timeout)?)),
-            L4Mode::Data => Ok(Sender::TcpData {
-                conns: Vec::with_capacity(cap),
-                // Non-zero, bounded payload for each PSH-ACK write.
-                payload: vec![0u8; payload_size.clamp(1, MAX_DATA_PAYLOAD)],
-                cap,
-                timeout: connect_timeout,
-                idx: 0,
-            }),
+            L4Mode::Data => {
+                // Hard ceiling, like the connect flood's. `cap` also sizes the
+                // allocation below, so an unclamped `--concurrency` was a
+                // multi-megabyte reservation before the first handshake.
+                let cap = effective_data_connections(cap);
+                Ok(Sender::TcpData {
+                    conns: Vec::with_capacity(cap),
+                    // Non-zero, bounded payload for each PSH-ACK write.
+                    payload: vec![0u8; payload_size.clamp(1, MAX_DATA_PAYLOAD)],
+                    cap,
+                    timeout: connect_timeout,
+                    idx: 0,
+                })
+            }
             L4Mode::Icmp | L4Mode::IcmpTimestamp | L4Mode::IcmpAddressMask => {
                 // Refusal, not `expect`. Today the outer arm guarantees this is
                 // `Some`, but that guarantee lives in a match arm somebody will
@@ -864,7 +914,16 @@ impl Sender {
         }
     }
 
-    fn send(&mut self, ip: IpAddr, port: u16, tally: &mut Tally) -> Result<Emission, L34Error> {
+    /// `plan` is threaded in for the kill switch: `--l4-mode data` opens its
+    /// connections with a blocking connect on this thread, and that call has to be
+    /// abortable or the run's abort bound becomes `--connect-timeout-ms`.
+    fn send(
+        &mut self,
+        ip: IpAddr,
+        port: u16,
+        tally: &mut Tally,
+        plan: &RunPlan,
+    ) -> Result<Emission, L34Error> {
         match self {
             Sender::Udp { sock, payload } => Ok(
                 match sock.send_to(payload, SocketAddr::new(ip, port)) {
@@ -884,17 +943,13 @@ impl Sender {
                 // it with a write — this ramps the pool up. Once full, we sustain
                 // data by round-robining a write onto an existing connection.
                 if conns.len() < *cap {
-                    let began = Instant::now();
-                    let mut stream =
-                        match TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout) {
-                            Ok(s) => s,
-                            Err(e) => return Ok(Emission::Failed(classify_io(&e))),
-                        };
-                    let elapsed = began.elapsed();
-                    let _ = stream.set_write_timeout(Some(*timeout));
-                    write_pshack(&mut stream, payload);
-                    conns.push(stream);
-                    return Ok(Emission::Sent { latency: Some(elapsed) });
+                    return Ok(open_and_prime(
+                        SocketAddr::new(ip, port),
+                        *timeout,
+                        payload,
+                        conns,
+                        plan,
+                    ));
                 }
                 // Round-robin one connection; a full send buffer is pressure
                 // applied (counts as sent), a real error retires the connection
@@ -905,21 +960,17 @@ impl Sender {
                 match write_pshack(&mut conns[i], payload) {
                     // A write onto an established connection has no handshake to time.
                     WriteOutcome::Sent => Ok(Emission::Sent { latency: None }),
-                    WriteOutcome::Dead => {
+                    WriteOutcome::Dead(_) => {
                         // Retire the dead connection *first* so replacing it cannot
                         // transiently exceed the cap.
                         conns.swap_remove(i);
-                        let began = Instant::now();
-                        let mut stream =
-                            match TcpStream::connect_timeout(&SocketAddr::new(ip, port), *timeout) {
-                                Ok(s) => s,
-                                Err(e) => return Ok(Emission::Failed(classify_io(&e))),
-                            };
-                        let elapsed = began.elapsed();
-                        let _ = stream.set_write_timeout(Some(*timeout));
-                        write_pshack(&mut stream, payload);
-                        conns.push(stream);
-                        Ok(Emission::Sent { latency: Some(elapsed) })
+                        Ok(open_and_prime(
+                            SocketAddr::new(ip, port),
+                            *timeout,
+                            payload,
+                            conns,
+                            plan,
+                        ))
                     }
                 }
             }
@@ -977,8 +1028,10 @@ enum WriteOutcome {
     /// Data was written, OR the send buffer was full (a blocked/timed-out write) —
     /// both mean pressure was applied to the target, so both count as a unit sent.
     Sent,
-    /// The connection failed (reset / broken pipe): retire and replace it.
-    Dead,
+    /// The connection failed (reset / broken pipe): retire and replace it. Carries
+    /// the classified failure so a priming write that dies is reported as what it
+    /// was, rather than as a connection successfully added to the pool.
+    Dead(ErrnoBucket),
 }
 
 /// Write `payload` to an established connection, flushing so the OS emits a
@@ -992,7 +1045,96 @@ fn write_pshack(stream: &mut TcpStream, payload: &[u8]) -> WriteOutcome {
         Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
             WriteOutcome::Sent
         }
-        Err(_) => WriteOutcome::Dead,
+        Err(e) => WriteOutcome::Dead(classify_io(&e)),
+    }
+}
+
+/// Open one data-flood connection, prime it with a PSH-ACK write, and add it to
+/// the pool.
+///
+/// The priming write's outcome used to be discarded, so a connection the target
+/// reset the instant it was established still went into the pool and still
+/// counted as a unit sent — a dead descriptor occupying a slot that the pool
+/// would then never refill, because `conns.len()` said it was full. Only a
+/// connection that actually took data is kept.
+fn open_and_prime(
+    addr: SocketAddr,
+    timeout: Duration,
+    payload: &[u8],
+    conns: &mut Vec<TcpStream>,
+    plan: &RunPlan,
+) -> Emission {
+    let began = Instant::now();
+    let mut stream = match connect_abortable(addr, timeout, plan) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return Emission::Failed(classify_io(&e)),
+        // Aborted mid-handshake. The SYN went out, so this is offered load that
+        // never got an answer — the bucket that exists for exactly that — not a
+        // unit we declined to send.
+        None => return Emission::Failed(ErrnoBucket::Abandoned),
+    };
+    let elapsed = began.elapsed();
+    let _ = stream.set_write_timeout(Some(timeout));
+    match write_pshack(&mut stream, payload) {
+        WriteOutcome::Sent => {
+            conns.push(stream);
+            Emission::Sent { latency: Some(elapsed) }
+        }
+        WriteOutcome::Dead(bucket) => Emission::Failed(bucket),
+    }
+}
+
+/// `TcpStream::connect_timeout`, made abortable.
+///
+/// The data flood opens its connections on the run thread, and a blocking
+/// `connect_timeout` cannot be interrupted — so with `--connect-timeout-ms 60000`
+/// an operator's Ctrl-C was ignored for up to a minute, in a tool that promises a
+/// ~250ms abort. The pacing loop's kill-switch checks are only as good as the
+/// longest thing that happens between two of them.
+///
+/// So the connect runs on its own thread and this waits on it in kill-poll
+/// slices. On abort the thread is **detached rather than joined**: it is blocked
+/// in the same uninterruptible call, so joining it would reintroduce exactly the
+/// wait we are removing. It exits on its own within one connect timeout and drops
+/// whatever socket it produced. This is the same trade the connect pool already
+/// makes at shutdown.
+///
+/// Returns `None` if the kill switch tripped before the handshake resolved.
+fn connect_abortable(
+    addr: SocketAddr,
+    timeout: Duration,
+    plan: &RunPlan,
+) -> Option<Result<TcpStream, std::io::Error>> {
+    // A timeout we can afford to sit through in full costs no thread: the abort
+    // is already within the promised bound.
+    if timeout <= ABORT_DRAIN_GRACE {
+        return Some(TcpStream::connect_timeout(&addr, timeout));
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    let spawned = thread::Builder::new()
+        .name("jinrai-data-connect".into())
+        .stack_size(CONNECT_WORKER_STACK)
+        .spawn(move || {
+            // The receiver is gone on abort; the send simply fails and the
+            // stream is dropped (closed) as this thread unwinds.
+            let _ = tx.send(TcpStream::connect_timeout(&addr, timeout));
+        });
+    if spawned.is_err() {
+        // Out of threads: fall back to the blocking call. A slow abort beats
+        // failing a run the operator asked for.
+        return Some(TcpStream::connect_timeout(&addr, timeout));
+    }
+    loop {
+        match rx.recv_timeout(KILL_POLL) {
+            Ok(res) => return Some(res),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if plan.kill.is_tripped() {
+                    return None;
+                }
+            }
+            // The worker vanished without reporting: nothing more to wait for.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -1342,6 +1484,21 @@ mod tests {
             effective_parallelism(usize::MAX),
             MAX_CONNECT_WORKERS,
             "but an absurd budget still stops at the thread ceiling"
+        );
+    }
+
+    /// The data flood's pool had no ceiling of its own — `--concurrency` went
+    /// straight through to a `Vec::with_capacity` and a descriptor per slot, so
+    /// the only thing stopping it was EMFILE part-way through the run. Baseline
+    /// item 2 asks for a hard concurrency limit, not for the OS to intervene.
+    #[test]
+    fn the_data_pool_has_a_ceiling_of_its_own() {
+        assert_eq!(effective_data_connections(0), 1, "never a zero-connection pool");
+        assert_eq!(effective_data_connections(1024), 1024, "ordinary budgets pass through");
+        assert_eq!(
+            effective_data_connections(usize::MAX),
+            MAX_DATA_CONNECTIONS,
+            "an absurd budget stops at the descriptor ceiling, not at EMFILE"
         );
     }
 

@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 authors.workspace = true
-description = "Authorization gate: allowlist, kill-switch, rate caps. std-only by policy."
+# Rate caps are NOT here — `RateCap` is a core type. The manifest used to claim
+# them, which is the wrong way round for a trust anchor: a reader auditing where
+# the ceilings are enforced should not be sent to the one crate that has none.
+description = "Authorization gate: allowlist and kill-switch. std-only by policy."
 
 [dependencies]
 # NONE. This crate is the trust anchor and stays dependency-free on purpose.

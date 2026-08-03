@@ -14,6 +14,107 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.36.0] — 2026-08-03
+
+Code-review remediation. No new primitives — this release is about the run
+reporting what actually happened.
+
+Three of these are the same failure in different clothes: the tool drew a
+confident conclusion from a run that had not earned it. A ramp that skipped its
+own silent stages reported a shape it never ran; a discovery run that reached
+nothing printed "the target held the full ramp"; a saturated pool dropped
+attempts that appeared in no counter, so "the target absorbed everything" and "we
+never offered it" printed identically.
+
+### Fixed
+
+- **A zero-rate load stage is silent, not absent (L7).** The engine filtered
+  stages with `rate == 0` out of the compiled profile, which is exactly the
+  regression `RateCap`'s own documentation describes: `--ramp-start 0
+  --duration 60` with 10 steps finished early and reached every later rate ahead
+  of schedule, so the shape in the summary was not the shape that ran. The
+  silent-stage handler further down the same function had been dead code since.
+  Only zero-*duration* stages are dropped now, and a regression test asserts the
+  wall time of a ramp whose first three stages truncate to rate 0.
+- **Knee discovery no longer reports a hollow run as success.** The
+  `--discover-knee` path returned `Ok(())` unconditionally, bypassing the
+  check that every other L7 run goes through. Against an unreachable target it
+  printed "no breaking point found: target held the full ramp" and exited 0 — the
+  confidently-wrong green that `a_run_that_tested_nothing_is_a_failure` exists to
+  prevent. The check now runs *before* the conclusion is printed.
+- **`--l4-mode data` is abortable again.** Connections were opened with a
+  blocking `TcpStream::connect_timeout` on the pacing thread, and the kill switch
+  is only polled between units — so `--connect-timeout-ms 60000` meant Ctrl-C was
+  ignored for up to a minute, in a crate that documents a 250 ms abort bound. The
+  connect now runs on its own thread and is waited on in kill-poll slices;
+  aborting detaches it and reports the attempt as `abandoned` rather than
+  pretending it never happened.
+- **A data-flood connection that dies on its priming write is no longer counted
+  as sent.** `write_pshack`'s result was discarded, so a connection the target
+  reset immediately still entered the pool — a dead descriptor occupying a slot
+  the pool would then never refill, because `conns.len()` said it was full.
+- **In-run memory no longer grows with `rate × duration` (L7).** Three engines
+  (`fast`, `tls-handshake`, `tls-*-hello`) spawned a task per tick but joined the
+  `JoinSet` only after the run loop. Tokio retains a completed task's output until
+  it is joined, so the concurrency semaphore bounded what was *in flight* and
+  nothing bounded what had finished. Finished tasks are now reaped each tick.
+- **`--allow ::ffff:10.0.0.1` is refused like its CIDR spelling.** The bare-IP
+  path built a `/128` rule that `contains` always refuses, while the equivalent
+  `--allow ::ffff:10.0.0.1/128` was rejected loudly. Fail-closed either way, but
+  only one of them told the operator that the rule they wrote authorizes nothing.
+
+### Security
+
+- **The audit log verifies its whole chain at `open`, not just its tail.**
+  Recomputing only the last record left the same hole one line further up: a
+  record edited in the *middle* of the file, with an intact last line, opened
+  cleanly and got honest records chained onto poisoned history — discoverable
+  only if somebody later happened to run `--verify-audit`. Finding the end of the
+  file already reads every line, so full verification costs one SHA-256 per
+  record. (Baseline item 5.)
+- **`--l4-mode data` has a hard connection ceiling.** The pool was bounded by
+  `--concurrency` and, past that, by the process descriptor limit; there was no
+  in-crate equivalent of `MAX_CONNECT_WORKERS`. "The OS will stop us" is not a
+  limit this crate gets to rely on, and the failure it allowed — EMFILE part-way
+  through a run — measures our own box rather than the target. (Baseline item 2.)
+- **`Cidr` is sealed.** It was a public enum with public fields, so
+  `Cidr::V4 { network, prefix: 200 }` — a block matching by a mask the parser
+  would never produce — was an ordinary safe expression in the crate whose stated
+  job is that invalid states are unrepresentable. Now a newtype over a private
+  representation, like `DnsRule`. (Baseline item 7.)
+- **An unevaluatable SLO is reported as such, instead of silently failing the
+  target.** `SloSpec::validate` existed but nothing called it, so a library caller
+  with `max_error_rate: Some(-0.5)` got a threshold every possible observation
+  exceeds: a healthy target "FAILED" and the summary named a breach that never
+  happened. Out-of-range thresholds now surface as
+  `SloBreach::InvalidThreshold`, which blames the spec rather than the target.
+  (Baseline item 7.)
+- **Contradictory and meaningless flags are refused rather than reinterpreted.**
+  `--no-audit` together with `--audit-log` (opposite instructions about whether
+  the run is on the record — the log used to win silently); `--port 0`, which the
+  packet builder rewrote to port 1; `--concurrency 0`, clamped to 1 downstream.
+  `--watchdog-window` and `--watchdog-breaches` now go through `parse_capped`
+  like every other numeric flag.
+- **One pre-traffic refusal was unaudited.** `--discover-knee` without a rate SLO
+  returned a bare error while the audit log was already open, so the refusal left
+  no record. It is audited like every other refusal now.
+
+### Added
+
+- **`not offered` in the run summary.** Attempts the generator declined to make
+  because its own in-flight budget was saturated — L34's pool backpressure and
+  L7's concurrency-capped ticks — were counted nowhere: no `sent`, no `error`, no
+  disclosure. Deliberately kept out of `attempts()` so it cannot drag an SLO rate:
+  these are our shortfall, not the target's failures. But a non-zero count says
+  the binding constraint was on this side of the wire, which is the difference
+  between a result and a measurement of our own box.
+
+### Notes
+
+- `jinrai-safety`'s manifest advertised "rate caps", which live in `jinrai-core`.
+  Corrected — a reader auditing where the ceilings are enforced should not be sent
+  to the one crate that has none.
+
 ## [0.35.0] — 2026-08-03
 
 The work a TLS server does **before** it has decided to trust you.
@@ -1556,7 +1657,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/h4b00b/jinrai/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/h4b00b/jinrai/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/h4b00b/jinrai/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/h4b00b/jinrai/compare/v0.32.0...v0.33.0
