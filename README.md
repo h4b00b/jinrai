@@ -118,6 +118,10 @@ L7 fast methods. Realistic traffic, fully classified, safe to point at staging.
 | Read-path capacity | `--l7-method get` |
 | Write-path capacity | `--l7-method post --body '{...}'` |
 | Make sure you are testing the origin, not a cache/CDN | add `--cache-bust` |
+| Nothing cacheable anywhere: every URI unique and non-existent | add `--random-path` |
+| The same, but on endpoints that exist | add `--path-file endpoints.txt` |
+| The query no cache can serve (search-field flood) | add `--search-param q` |
+| A new server-side session per request (session exhaustion) | add `--session-cookie JSESSIONID` |
 | **Find the breaking point automatically** | `--profile ramp --discover-knee --slo-max-5xx-rate 0.01` |
 | Burst tolerance / autoscaling reaction | `--profile spike --spike-secs 30` |
 | Slow degradation, leaks, GC pressure | `--profile soak --duration 3600` |
@@ -251,6 +255,23 @@ jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method post \
        --url https://api.staging.internal/ingest --body '{"probe":1}' \
        --cache-bust --rate 200 --duration 60
+
+# Random-path flood: every request asks for a URI that does not exist, so nothing
+# is cacheable and the origin answers (and logs) all of it
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://www.staging.internal/ --random-path --rate 500 --duration 60
+
+# Valid-random flood: same idea, but drawn from endpoints that DO exist, so the
+# load lands on real handlers rather than the 404 path
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://api.staging.internal/ --path-file endpoints.txt \
+       --rate 500 --duration 60
+
+# Search-field flood + session exhaustion: a fresh term AND a fresh session per
+# request — neither the cache nor the session store can absorb any of it
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
+       --url https://www.staging.internal/search --search-param q \
+       --session-cookie JSESSIONID --rate 500 --duration 120
 
 # Breaking point: ramp to the ceiling, stop at the first stage that breaks the SLO
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
@@ -591,6 +612,52 @@ accepts any server certificate); `websocket` and `sse` pin ALPN to `http/1.1`, s
 a target that also offers h2 cannot negotiate a protocol the upgrade could not run
 over. All the `h2-*` primitives negotiate h2 via ALPN for `https` and
 prior-knowledge h2c for `http`.
+
+### Request shaping — when every request must differ
+
+The fast flood sends one identical request N times. That measures a single
+endpoint's ceiling, and it is the wrong shape for four floods that are asked for
+by name. All four are the same primitive — vary the request per unit — and all
+four apply to `get`/`post`/`head` only:
+
+| flag | flood | what the target has to do |
+| --- | --- | --- |
+| `--cache-bust` | upstream jamming | a unique `_cb=<n>` query, so a CDN/cache cannot serve a stored response and every request reaches the origin |
+| `--random-path` | random-path flood | a fresh random path segment per request, so every URI is one that does not exist: nothing is cacheable, and the origin generates (and usually logs) a 404 for all of it |
+| `--path-file <PATH>` | valid-random flood | draw the path from a list of endpoints that *do* exist, so the load lands on real handlers instead of the 404 path |
+| `--search-param <NAME>` | search-field flood | a fresh random term as `NAME=<term>` — the one query a cache can never serve and a backend can rarely index its way out of. Query for `get`/`head`, form-encoded body for `post` (where it replaces `--body`) |
+| `--session-cookie <NAME>` | session exhaustion | a distinct, unrecognised `NAME=<value>` cookie per request, so the target allocates or looks up session state for each one rather than reusing a single session for the whole run |
+
+They compose. Session exhaustion against a search endpoint, with nothing
+cacheable anywhere in it:
+
+```bash
+jinrai $REQ --url https://staging.internal/search --allow '*.staging.internal' \
+       --search-param q --session-cookie JSESSIONID --cache-bust \
+       --rate 500 --duration 120 --slo-max-p99-ms 2000
+```
+
+A path list is one path per line; `#` comments and blank lines are skipped:
+
+```
+# checkout flow
+/api/cart
+/api/cart/items?limit=50
+/api/checkout/summary
+```
+
+**Only the path, query, body and cookie are ever touched — never the host.** The
+authorization and the pinned DNS resolution are properties of the origin, so a
+variation that could move the origin would void both. For generated paths that
+holds by construction. For a `--path-file` it does not, so every entry is joined
+against the authorized URL and checked to land on the same origin **before the
+run starts**; an entry that would move it **refuses the run** rather than being
+skipped at request time. The syntax rule (`/` start, no `//`) is the first gate,
+the joined-origin check is the one that does not depend on out-guessing URL
+normalisation.
+
+The run summary and `--dry-run` both name what varied, so a run with a 100% 4xx
+rate reads as the random-path flood it was rather than a target problem.
 
 ### Timeouts and the end of the run
 

@@ -95,6 +95,9 @@ pub use long_lived::{LongLivedConfig, LongLivedEngine, LongLivedKind};
 pub mod tls_hello;
 pub use tls_hello::{TlsHelloEngine, TlsHelloKind};
 
+pub mod vary;
+pub use vary::{parse_path_list, PathMode, Variation};
+
 mod tls;
 
 /// Which HTTP request shape to generate. Every variant reuses the *same*
@@ -171,11 +174,12 @@ pub struct RequestSpec {
     pub headers: Vec<(String, String)>,
     /// Request body sent with each POST (ignored for GET/HEAD).
     pub body: Option<Vec<u8>>,
-    /// Cache-buster: append a unique `_cb=<n>` query parameter to every request
-    /// so caches/CDNs cannot serve a stored response. Only the **query** is
-    /// mutated — never the host — so the datum authorization and the pinned DNS
-    /// resolution still hold for every request.
-    pub cache_bust: bool,
+    /// How each request differs from the last: cache-busting, random or
+    /// list-drawn paths, a fresh search term, a fresh session cookie. Only the
+    /// **path, query, body and cookie** are ever mutated — never the host — so
+    /// the datum authorization and the pinned DNS resolution still hold for
+    /// every request. See [`crate::vary`].
+    pub variation: Variation,
     /// Which HTTP version to speak (default: whatever the client negotiates).
     pub http_version: HttpVersion,
 }
@@ -187,7 +191,7 @@ impl RequestSpec {
             method: L7Method::Get,
             headers: Vec::new(),
             body: None,
-            cache_bust: false,
+            variation: Variation::default(),
             http_version: HttpVersion::Auto,
         }
     }
@@ -211,6 +215,11 @@ pub enum L7Error {
     Refused(SafetyError),
     /// A header name/value could not be parsed.
     BadHeader(String),
+    /// The `--path-file` list contained an entry that is not a path on the
+    /// authorized target. Refusing the whole run is the point: an entry that
+    /// moves the origin would send load past the gate, and skipping it silently
+    /// would run a different list than the operator wrote.
+    BadPathList(String),
     /// Building the HTTP client failed.
     Client(String),
 }
@@ -225,6 +234,7 @@ impl std::fmt::Display for L7Error {
             L7Error::NoAddresses => write!(f, "host resolved to no addresses"),
             L7Error::Refused(e) => write!(f, "datum refused by safety gate: {e}"),
             L7Error::BadHeader(s) => write!(f, "invalid header: {s}"),
+            L7Error::BadPathList(s) => write!(f, "unusable --path-file: {s}"),
             L7Error::Client(s) => write!(f, "failed to build HTTP client: {s}"),
         }
     }
@@ -543,6 +553,12 @@ impl L7Engine {
         };
         let client = builder.build().map_err(|e| L7Error::Client(e.to_string()))?;
 
+        // An operator-supplied path list is the one variation that could move
+        // the run off the authorized origin, so it is checked against the URL
+        // the gate approved — here, before a single request exists, and once
+        // rather than per request.
+        self.spec.variation.check_paths(&datum.url).map_err(L7Error::BadPathList)?;
+
         Ok((client, datum.url))
     }
 
@@ -662,8 +678,15 @@ impl StressModule for L7Engine {
         // Per-request shape, captured once and shared across dispatched tasks.
         let method = self.spec.method;
         let body = self.spec.body.clone().map(Arc::new);
-        let cache_bust = self.spec.cache_bust;
-        let cb_counter = Arc::new(AtomicU64::new(0));
+        let variation = Arc::new(self.spec.variation.clone());
+        // A POST carries its search term in the body; GET/HEAD carry it in the
+        // query. Decided once, not per request.
+        let body_search = matches!(method, L7Method::Post);
+        // The per-request unit counter. Every generated token is a hash of
+        // (run seed, this counter), so no dispatched task ever touches shared
+        // generator state — at the rates this engine reaches, a locked RNG on
+        // the request path would be the run's own bottleneck.
+        let unit_counter = Arc::new(AtomicU64::new(0));
 
         // Clones move into the runtime; the originals are read back afterwards.
         let sent_w = sent.clone();
@@ -805,29 +828,46 @@ impl StressModule for L7Engine {
                     let protos = protos_w.clone();
                     let errno = errno_w.clone();
                     let body = body.clone();
-                    let cb_counter = cb_counter.clone();
+                    let variation = variation.clone();
+                    let unit_counter = unit_counter.clone();
                     tasks.spawn(async move {
                         // Hold the connection-cap permit for the whole request;
                         // dropping it at task end frees a slot for the next tick.
                         let _permit = permit;
-                        // Cache-buster touches ONLY the query string, so the host
-                        // remains the gate-authorized, DNS-pinned one.
-                        let req_url = if cache_bust {
-                            let mut u = url;
-                            let n = cb_counter.fetch_add(1, Ordering::Relaxed);
-                            u.query_pairs_mut().append_pair("_cb", &n.to_string());
-                            u
+                        // Variation touches ONLY the path, query, body and
+                        // cookie, so the host remains the gate-authorized,
+                        // DNS-pinned one. A path list is checked against the
+                        // origin at setup, before any of this runs.
+                        let varied = if variation.is_fixed() {
+                            vary::Varied { url, cookie: None, form_body: None }
                         } else {
-                            url
+                            let n = unit_counter.fetch_add(1, Ordering::Relaxed);
+                            variation.apply(&url, n, body_search)
                         };
-                        let req = match method {
-                            L7Method::Get => client.get(req_url),
-                            L7Method::Head => client.head(req_url),
-                            L7Method::Post => match &body {
-                                Some(bytes) => client.post(req_url).body(bytes.as_ref().clone()),
-                                None => client.post(req_url),
+                        let mut req = match method {
+                            L7Method::Get => client.get(varied.url),
+                            L7Method::Head => client.head(varied.url),
+                            L7Method::Post => match (&varied.form_body, &body) {
+                                // A generated search term replaces `--body`;
+                                // the CLI refuses the two together, so reaching
+                                // here with both is a caller that built the spec
+                                // by hand and gets the search flood it asked for.
+                                (Some(form), _) => client
+                                    .post(varied.url)
+                                    .header(
+                                        reqwest::header::CONTENT_TYPE,
+                                        "application/x-www-form-urlencoded",
+                                    )
+                                    .body(form.clone()),
+                                (None, Some(bytes)) => {
+                                    client.post(varied.url).body(bytes.as_ref().clone())
+                                }
+                                (None, None) => client.post(varied.url),
                             },
                         };
+                        if let Some(cookie) = varied.cookie {
+                            req = req.header(reqwest::header::COOKIE, cookie);
+                        }
                         let started = Instant::now();
                         match req.send().await {
                             Ok(resp) => {
@@ -1104,7 +1144,10 @@ pub(crate) fn module_error(what: String, e: L7Error) -> ModuleError {
         | L7Error::InvalidUrl(_)
         | L7Error::UnsupportedScheme(_)
         | L7Error::MissingHost
-        | L7Error::BadHeader(_) => ModuleError::Refused(msg),
+        | L7Error::BadHeader(_)
+        // A path list that would leave the authorized origin is jinrai saying no
+        // to what was asked for, not the host failing to provide something.
+        | L7Error::BadPathList(_) => ModuleError::Refused(msg),
         L7Error::Dns(_) | L7Error::NoAddresses | L7Error::Client(_) => ModuleError::Setup(msg),
     }
 }
