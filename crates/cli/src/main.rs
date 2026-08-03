@@ -27,8 +27,8 @@ use jinrai_l34::{L34Config, L34Engine, L4Mode, PortOrder, PortSet};
 use jinrai_l7::{
     H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
     H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, LongLivedConfig, LongLivedEngine,
-    LongLivedKind, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, TlsHelloEngine,
-    TlsHelloKind, WatchdogConfig,
+    LongLivedKind, PathMode, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, TlsHelloEngine,
+    TlsHelloKind, Variation, WatchdogConfig, parse_path_list,
 };
 use jinrai_metrics::{AuditEvent, AuditLog, RunContext};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
@@ -219,9 +219,32 @@ OPTIONS:
                           HTTP/1.1 by construction and the h2-* methods are HTTP/2
                           by construction, so this flag does not apply to them.
     --body <STRING>       Request body sent with each POST (l7-method post)
-    --cache-bust          Append a unique _cb=<n> query to every l7 request so
-                          caches/CDNs cannot serve a stored response (query only;
-                          the host is never altered)
+
+    Request shaping (get/post/head flood only — every request differs from the
+    last). All of these touch the path, query, body or cookie ONLY: the host is
+    never altered, so the authorized datum and the pinned DNS resolution hold for
+    every request.
+    --cache-bust          Append a unique _cb=<n> query so caches/CDNs cannot
+                          serve a stored response
+    --random-path         Append a fresh random segment to the URL path, so every
+                          request asks for a URI that does not exist — the
+                          random-path flood: nothing is cacheable and the origin
+                          answers (and usually logs) all of it
+    --path-file <PATH>    Draw the path from a file instead: one path per line,
+                          '#' comments and blank lines skipped, every entry a
+                          path on the target starting with a single '/'. The
+                          valid-random flood — load lands on real handlers rather
+                          than the 404 path. An entry that would move the run to
+                          another origin REFUSES the run; it is not skipped
+    --search-param <NAME> Send a fresh random term as NAME=<term> on every
+                          request — the search-field flood: the one query a cache
+                          can never serve. Goes in the query for get/head and in
+                          a form-encoded body for post (where it replaces --body)
+    --session-cookie <NAME>  Send a distinct, unrecognised NAME=<value> cookie on
+                          every request (JSESSIONID, PHPSESSID, connect.sid, …),
+                          so the target allocates or looks up session state per
+                          request instead of reusing one session for the run —
+                          session exhaustion
     --max-connections <N> Cap concurrent in-flight requests (~concurrent keep-alive
                           connections) for the fast get/post/head flood and the
                           one-connection-per-unit TLS methods (tls-handshake,
@@ -409,7 +432,11 @@ struct Args {
     http_version: HttpVersion,
     output: OutputForm,
     body: Option<String>,
-    cache_bust: bool,
+    /// How each l7 request differs from the last: `--cache-bust`,
+    /// `--random-path` / `--path-file`, `--search-param`, `--session-cookie`.
+    /// One struct because they are one feature — the request is not the same
+    /// request twice — and because the engine takes them as one.
+    variation: Variation,
     slow_connections: usize,
     drip_ms: u64,
     max_connections: usize,
@@ -684,16 +711,17 @@ fn lab_ack_required(args: &Args) -> Result<(), String> {
 /// Recorded as a refusal at stage `dry-run` so the trail cannot be misread: the
 /// `RunAuthorized` record above it is real, and this is what says no traffic
 /// followed it.
-/// `ports` is the l3/l4 destination-port label (`None` for l7, which targets with
-/// a URL, and for the portless ICMP modes). A dry run's whole job is to print the
-/// run that was about to happen, and once `--port` can name a whole range that is
-/// not answered by the mode name alone.
+/// `detail` is a `(label, value)` line specific to the layer: the destination
+/// port set for l3/l4, what varies per request for l7. A dry run's whole job is
+/// to print the run that was about to happen, and neither of those is answered
+/// by the mode name alone once a run can span a port range or send a different
+/// request every time.
 fn dry_run_summary(
     audit: &mut Option<&mut AuditLog>,
     module: &dyn StressModule,
     plan: &RunPlan,
     args: &Args,
-    ports: Option<&str>,
+    detail: Option<(&str, String)>,
 ) -> Result<(), String> {
     audit_record(
         audit,
@@ -708,8 +736,8 @@ fn dry_run_summary(
         "  targets     {}",
         plan.targets.iter().map(target_label).collect::<Vec<_>>().join(", ")
     );
-    if let Some(ports) = ports {
-        println!("  destination {ports}");
+    if let Some((name, value)) = detail {
+        println!("  {name:<11} {value}");
     }
     println!("  allow rules {}", args.allow.join(", "));
     println!("  rate        {}/sec (ceiling)", args.rate);
@@ -828,7 +856,7 @@ fn run_l7(
                 method,
                 headers: args.headers.clone(),
                 body: args.body.clone().map(String::into_bytes),
-                cache_bust: args.cache_bust,
+                variation: args.variation.clone(),
                 http_version: args.http_version,
             };
             let mut engine = L7Engine::new(gate, spec)
@@ -964,7 +992,13 @@ fn run_l7(
 
     let plan = RunPlan { targets, rate_cap, duration, kill };
     if args.dry_run {
-        return dry_run_summary(&mut audit, engine.as_ref(), &plan, args, None);
+        return dry_run_summary(
+            &mut audit,
+            engine.as_ref(),
+            &plan,
+            args,
+            args.variation.label().map(|v| ("varying", v)),
+        );
     }
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let started = std::time::Instant::now();
@@ -991,6 +1025,12 @@ fn run_l7(
     if is_fast {
         if let Some(v) = args.http_version.forced_label() {
             notes.push(v.to_string());
+        }
+        // What differed between requests. Without this, a random-path run and a
+        // plain GET flood print identical summaries, and the 404 rate in one of
+        // them looks like a target problem rather than the test.
+        if let Some(v) = args.variation.label() {
+            notes.push(format!("varying: {v}"));
         }
         if args.max_connections > 0 {
             notes.push(format!("max {} concurrent connections", args.max_connections));
@@ -1174,7 +1214,8 @@ fn run_l4(
     // Taken before the set moves into the engine config, for the audit record,
     // the summary note, and the dry-run print.
     let port_label = ports.label();
-    let dry_run_ports = if args.l4_mode.is_icmp() { None } else { Some(port_label.as_str()) };
+    let dry_run_ports =
+        if args.l4_mode.is_icmp() { None } else { Some(("destination", port_label.clone())) };
 
     let authorized = match gate.authorize_all(args.targets.iter().copied()) {
         Ok(t) => t,
@@ -1341,6 +1382,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut output = OutputForm::Human;
     let mut body = None;
     let mut cache_bust = false;
+    let mut random_path = false;
+    let mut path_file: Option<String> = None;
+    let mut search_param: Option<String> = None;
+    let mut session_cookie: Option<String> = None;
     let mut slow_connections = 100usize;
     let mut drip_ms = 10_000u64;
     let mut max_connections = jinrai_l7::DEFAULT_MAX_CONNS;
@@ -1460,6 +1505,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             }
             "--body" => body = Some(next_val(&mut it, "--body")?),
             "--cache-bust" => cache_bust = true,
+            "--random-path" => random_path = true,
+            "--path-file" => path_file = Some(next_val(&mut it, "--path-file")?),
+            "--search-param" => search_param = Some(next_val(&mut it, "--search-param")?),
+            "--session-cookie" => session_cookie = Some(next_val(&mut it, "--session-cookie")?),
             "--slow-connections" => {
                 slow_connections =
                     parse_capped(&mut it, "--slow-connections", MAX_CONNECTIONS as u64)? as usize;
@@ -1685,6 +1734,66 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             ("--target", &["--url", "--header", "--l7-method", "--max-connections"][..])
         }
     };
+    // Reported through the same warning as the rest when the run is not l7 at all.
+    let wrong_layer: Vec<&str> = match layer {
+        Layer::L7 => wrong_layer.to_vec(),
+        Layer::L3 | Layer::L4 => {
+            wrong_layer.iter().chain(SHAPING_FLAGS.iter()).copied().collect()
+        }
+    };
+    // The request-variation flags. Each contradiction below is two flags giving
+    // opposite instructions about what a request should contain; picking a
+    // winner would run something the operator did not ask for.
+    if random_path && path_file.is_some() {
+        return Err("--random-path and --path-file both decide the path: --random-path \
+                    generates one that does not exist, --path-file draws one that does. \
+                    Pick the flood you mean."
+            .to_string());
+    }
+    if body.is_some() && search_param.is_some() {
+        return Err("--body and --search-param both decide the POST body: --search-param \
+                    replaces it with a fresh form-encoded term per request. Drop one."
+            .to_string());
+    }
+    for (flag, value) in [("--search-param", &search_param), ("--session-cookie", &session_cookie)] {
+        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(format!("{flag} needs a name, got an empty one"));
+        }
+    }
+    let path = match &path_file {
+        Some(p) => {
+            // Read at parse time so a missing or unusable list fails before the
+            // lab acknowledgement and the audit record, not after.
+            let contents = std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read --path-file {p}: {e}"))?;
+            PathMode::FromList(std::sync::Arc::new(parse_path_list(&contents)?))
+        }
+        None if random_path => PathMode::RandomSegment,
+        None => PathMode::Fixed,
+    };
+    let variation = Variation::new(cache_bust, path, search_param, session_cookie);
+
+    // Request shaping applies to the fast get/post/head flood. The other l7
+    // methods build their own requests (or raw frames), so a variation flag
+    // there is a silent no-op — exactly the "the run I described is not the run
+    // that happened" this warns about. (`--cache-bust` was silently ignored the
+    // same way before these flags existed; it joins the warning rather than
+    // staying the one quiet exception.)
+    if matches!(layer, Layer::L7) && !matches!(l7_kind, L7Kind::Fast(_)) {
+        let shaping: Vec<&str> = SHAPING_FLAGS
+            .iter()
+            .copied()
+            .filter(|f| seen.iter().any(|s| s == f))
+            .collect();
+        if !shaping.is_empty() {
+            eprintln!(
+                "warning: {} shape the request, which only the get/post/head flood builds \
+                 — ignored for this --l7-method",
+                shaping.join(", "),
+            );
+        }
+    }
+
     let ignored: Vec<&str> =
         wrong_layer.iter().copied().filter(|f| seen.iter().any(|s| s == f)).collect();
     if !ignored.is_empty() {
@@ -1709,7 +1818,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         http_version,
         output,
         body,
-        cache_bust,
+        variation,
         slow_connections,
         drip_ms,
         max_connections,
@@ -1744,6 +1853,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
 
 /// The flags whose whole point is being given more than once.
 const REPEATABLE_FLAGS: &[&str] = &["--allow", "--target", "--header"];
+
+/// The flags that shape each individual request. Only the fast get/post/head
+/// flood builds requests one at a time, so anywhere else they are a no-op and
+/// the operator is told so rather than left with a run that quietly did
+/// something simpler than what they typed.
+const SHAPING_FLAGS: &[&str] =
+    &["--cache-bust", "--random-path", "--path-file", "--search-param", "--session-cookie"];
 
 /// Take a flag's value, refusing one that is obviously the next flag.
 ///
@@ -2174,6 +2290,71 @@ mod tests {
             argv.extend(["--port", spec]);
             assert_eq!(args_of(&argv).port.as_deref(), Some(spec));
         }
+    }
+
+    /// Two flags that both decide what a request contains. Picking a winner
+    /// would run something the operator did not ask for, so both pairs refuse.
+    #[test]
+    fn contradictory_request_shaping_flags_are_refused() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"];
+        for extra in [
+            vec!["--random-path", "--path-file", "whatever.txt"],
+            vec!["--body", "x=1", "--search-param", "q"],
+        ] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend(extra.iter().copied());
+            assert!(parse(&argv).is_err(), "{extra:?} must be refused");
+        }
+    }
+
+    /// A parameter name is the whole flag; an empty one would send `=<term>`,
+    /// which is not the request the operator described.
+    #[test]
+    fn shaping_flags_need_a_name() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"];
+        for flag in ["--search-param", "--session-cookie"] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend([flag, "  "]);
+            let err = parse(&argv).expect_err("an empty name must be refused");
+            assert!(err.contains(flag), "the refusal must name the flag: {err}");
+        }
+    }
+
+    /// A `--path-file` that cannot be read must fail while parsing arguments —
+    /// before the lab acknowledgement and before the audit record — not after
+    /// the run is already authorized.
+    #[test]
+    fn an_unreadable_path_file_fails_at_parse_time() {
+        let argv = [
+            "--allow",
+            "10.0.0.0/8",
+            "--url",
+            "http://10.1.2.3/",
+            "--path-file",
+            "no/such/file/here.txt",
+        ];
+        let err = parse(&argv).expect_err("a missing path file must be refused");
+        assert!(err.contains("--path-file"), "{err}");
+    }
+
+    /// The default is the historical shape: one identical request, N times.
+    #[test]
+    fn requests_are_unvaried_unless_a_shaping_flag_says_otherwise() {
+        let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]);
+        assert!(a.variation.is_fixed());
+        assert_eq!(a.variation.label(), None);
+
+        let b = args_of(&[
+            "--allow",
+            "10.0.0.0/8",
+            "--url",
+            "http://10.1.2.3/",
+            "--random-path",
+            "--session-cookie",
+            "JSESSIONID",
+        ]);
+        assert!(!b.variation.is_fixed());
+        assert_eq!(b.variation.label().as_deref(), Some("random path, fresh session"));
     }
 
     /// `--port-order` defaults to the deterministic walk, so a command line that

@@ -14,6 +14,84 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-08-03
+
+The L7 counterpart to 0.37.0's port sets. The fast flood sent one identical
+request N times, which measures a single endpoint's ceiling and is the wrong
+shape for four floods asked for by name. All four are the same missing
+primitive: vary the request per unit.
+
+### Added
+
+- **`--random-path`** — a fresh random segment appended to the URL path, so every
+  request asks for a URI that does not exist. The random-path flood: nothing is
+  cacheable, and the origin generates (and usually logs) all of it.
+- **`--path-file <PATH>`** — draw the path from a list of endpoints that *do*
+  exist, one per line, `#` comments and blank lines skipped. The valid-random
+  flood: load lands on real handlers rather than the 404 path.
+- **`--search-param <NAME>`** — a fresh random term as `NAME=<term>` per request.
+  The search-field flood, and the one query a cache can never serve. Query for
+  `get`/`head`, form-encoded body (with the matching `Content-Type`) for `post`,
+  where it replaces `--body`. The term is a pronounceable lowercase word, not a
+  hex blob: a hex blob is equally uncacheable, but a term that looks like a term
+  reaches the same code path a real query does.
+- **`--session-cookie <NAME>`** — a distinct, unrecognised `NAME=<value>` cookie
+  per request, so the target allocates or looks up session state for each one
+  instead of reusing a single session for the whole run. Session exhaustion.
+- New `l7::vary` module (`Variation`, `PathMode`), and the shaping applies to the
+  fast `get`/`post`/`head` flood only. The other l7 methods build their own
+  requests or raw frames, so a shaping flag there is now **warned about** rather
+  than silently ignored — `--cache-bust` included, which had been the quiet
+  exception since it was added.
+
+### Security
+
+- **A `--path-file` entry that would move the run to another origin refuses the
+  run.** This is the one variation that could send authorized-looking load past
+  the gate, so it gets two gates: a syntax rule at load time (an entry must start
+  with a single `/`) that names the offending line, and — because syntax is the
+  wrong thing to trust when URL joining has its own normalisation rules for
+  backslashes and protocol-relative forms — a check of the *joined result*
+  against the authorized origin, run once at setup before any request exists. An
+  offending entry is never silently skipped: skipping means the operator's list
+  ran differently than it reads. New `L7Error::BadPathList`, classified as a
+  `Refused` (a policy event), not a `Setup` failure.
+- Everything else touches the path, query, body and cookie **only**. The host is
+  never altered, so the datum authorization and the pinned DNS resolution hold
+  for every request of the run — for generated paths by construction, since
+  `path_segments_mut`/`query_pairs_mut` cannot reach the host.
+
+### Changed
+
+- The run summary and `--dry-run` both name what varied (`varying: random path,
+  fresh session`), so a run with a 100% 4xx rate reads as the random-path flood
+  it was rather than as a target problem. `dry_run_summary` now takes a
+  `(label, value)` detail line — the port set for l3/l4, the variation for l7.
+- `RequestSpec.cache_bust: bool` became `RequestSpec.variation: Variation`.
+- Contradictions are refused rather than resolved: `--random-path` with
+  `--path-file` (both decide the path), `--body` with `--search-param` (both
+  decide the POST body), and an empty name for either `--search-param` or
+  `--session-cookie`. A `--path-file` that cannot be read fails at argument-parse
+  time, before the lab acknowledgement and the audit record.
+
+No new dependency. Tokens are a splitmix64 hash of `(per-run seed, unit counter)`
+rather than draws from a shared generator — at the rates this engine dispatches
+at, a locked RNG on the request path would be the run's own bottleneck. Distinct
+salts per field so the path, the list index, the term and the cookie of one unit
+are not the same value wearing four hats. The per-run seed means two runs do not
+replay each other's URIs, so a cache warmed by the first cannot absorb the
+second.
+
+### Verified
+
+Live against a recording HTTP server, 400 requests per run: baseline 1 distinct
+path/query/cookie/body (unchanged); `--random-path` **400 distinct paths**;
+`--path-file` drew exactly its 3 entries, splitting `/app/d?x=1` into path and
+query correctly; `--search-param` **400 distinct queries** (GET) and **400
+distinct bodies** (POST); `--session-cookie` **400 distinct cookies**; all four
+together compose. A list entry on another origin refused the run with exit 1
+naming the line. Suite 292 green, clippy clean.
+
 ## [0.37.0] — 2026-08-03
 
 Destination ports become a **set**. Every release until now sent a whole L3/L4
@@ -1714,7 +1792,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/h4b00b/jinrai/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/h4b00b/jinrai/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/h4b00b/jinrai/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/h4b00b/jinrai/compare/v0.34.0...v0.35.0
