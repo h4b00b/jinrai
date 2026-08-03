@@ -13,6 +13,7 @@ use socket2::Protocol;
 use jinrai_core::Layer;
 
 use crate::packet::IPPROTO_RAW;
+use crate::ports::PortSet;
 
 /// Which L4 primitive to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +250,10 @@ impl L4Mode {
 #[derive(Debug, Clone)]
 pub struct L34Config {
     pub mode: L4Mode,
-    pub port: u16,
+    /// Destination port(s). A one-port set is the ordinary single-service test;
+    /// a range or list is what the random-port and carpet-bombing shapes need.
+    /// The ICMP modes are portless and carry an unused single set.
+    pub ports: PortSet,
     /// UDP payload size in bytes (ignored by TCP/SYN). Capped to a sane MTU-ish
     /// ceiling to avoid accidental fragmentation surprises.
     pub payload_size: usize,

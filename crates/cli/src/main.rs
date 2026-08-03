@@ -23,7 +23,7 @@ use jinrai_core::{
     Layer, LoadProfile, ModuleError, RateCap, RunPlan, RunReport, SloSpec, SloVerdict,
     StressModule,
 };
-use jinrai_l34::{L34Config, L34Engine, L4Mode};
+use jinrai_l34::{L34Config, L34Engine, L4Mode, PortOrder, PortSet};
 use jinrai_l7::{
     H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
     H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, LongLivedConfig, LongLivedEngine,
@@ -53,7 +53,16 @@ REQUIRED:
 
     For --layer l3/l4:
     --target <IP>      Target address (repeatable). Must match an IP/CIDR --allow.
-    --port <N>         Target port (required for l3/l4, except --l4-mode icmp).
+                       Several targets in one run is the carpet-bombing shape:
+                       the load is spread over all of them, so no single
+                       destination address carries the whole run.
+    --port <SPEC>      Target port(s) (required for l3/l4, except --l4-mode icmp).
+                       A single port (443), a comma list (80,443,8080), an
+                       inclusive range (1000-2000), or a mix (80,8000-8100).
+                       Port 0 is refused. A range is how the random-port and
+                       carpet-bombing shapes are driven: most of it has no
+                       listener, so the target must generate a refusal (RST /
+                       ICMP port-unreachable) and track a flow per port.
 
 REQUIRED FOR ANY RUN THAT EMITS TRAFFIC:
     --ack-lab          Acknowledgement that this run targets an authorized,
@@ -263,6 +272,20 @@ OPTIONS:
     --connect-timeout-ms <MS>  How long one l4 connection attempt may stay
                           unresolved before it is abandoned and counted in the
                           `timeout` errno bucket (default: 500)
+    --port-order <ORD>    How an l3/l4 run walks a multi-port --port spec:
+                            sequential  (default) in the order written, advancing
+                                        once per pass over the targets, so the
+                                        run enumerates the whole target x port
+                                        cross-product. Deterministic; identical
+                                        to previous releases for a single port
+                            random      draw a port per packet. This is what a
+                                        test plan means by 'random ports':
+                                        consecutive packets are unrelated, so a
+                                        rule keyed on one port sees a trickle
+                                        rather than the run
+                          Only the DESTINATION port varies. The source address is
+                          never spoofed and the source port stays deterministic —
+                          see the no-spoofing guardrail in the README.
     --payload-size <N>    Payload bytes per unit (default: 64) — UDP datagram size
                           (l4-mode udp) or PSH-ACK write size (l4-mode data)
     --rate <N>            Rate cap, units/sec (default: 100, max 10000000). This
@@ -394,7 +417,12 @@ struct Args {
     drain_timeout_ms: u64,
     layer: Layer,
     l4_mode: L4Mode,
-    port: Option<u16>,
+    /// The `--port` spec as typed (single port, list, or ranges), kept as a
+    /// string so the run's audit record and error messages quote what the
+    /// operator wrote. Validated at parse time; turned into a `PortSet` once
+    /// `--port-order` is also known.
+    port: Option<String>,
+    port_order: PortOrder,
     payload_size: usize,
     concurrency: usize,
     connect_timeout_ms: u64,
@@ -656,11 +684,16 @@ fn lab_ack_required(args: &Args) -> Result<(), String> {
 /// Recorded as a refusal at stage `dry-run` so the trail cannot be misread: the
 /// `RunAuthorized` record above it is real, and this is what says no traffic
 /// followed it.
+/// `ports` is the l3/l4 destination-port label (`None` for l7, which targets with
+/// a URL, and for the portless ICMP modes). A dry run's whole job is to print the
+/// run that was about to happen, and once `--port` can name a whole range that is
+/// not answered by the mode name alone.
 fn dry_run_summary(
     audit: &mut Option<&mut AuditLog>,
     module: &dyn StressModule,
     plan: &RunPlan,
     args: &Args,
+    ports: Option<&str>,
 ) -> Result<(), String> {
     audit_record(
         audit,
@@ -675,6 +708,9 @@ fn dry_run_summary(
         "  targets     {}",
         plan.targets.iter().map(target_label).collect::<Vec<_>>().join(", ")
     );
+    if let Some(ports) = ports {
+        println!("  destination {ports}");
+    }
     println!("  allow rules {}", args.allow.join(", "));
     println!("  rate        {}/sec (ceiling)", args.rate);
     println!("  duration    {}s", args.duration_secs);
@@ -928,7 +964,7 @@ fn run_l7(
 
     let plan = RunPlan { targets, rate_cap, duration, kill };
     if args.dry_run {
-        return dry_run_summary(&mut audit, engine.as_ref(), &plan, args);
+        return dry_run_summary(&mut audit, engine.as_ref(), &plan, args, None);
     }
     println!("running module '{}' ({:?})...", engine.name(), engine.layer());
     let started = std::time::Instant::now();
@@ -1116,21 +1152,29 @@ fn run_l4(
             "--layer l3/l4 requires at least one --target <IP>",
         )?);
     }
-    // ICMP is portless; every other mode targets a port.
-    let port = if args.l4_mode.is_icmp() {
-        args.port.unwrap_or(0)
-    } else {
-        match args.port {
-            Some(p) => p,
-            None => {
-                return Err(audit_refusal(
-                    &mut audit,
-                    "arguments",
-                    "--layer l3/l4 requires --port <N> (except the icmp* modes)",
-                )?)
-            }
+    // ICMP is portless; every other mode targets a port (or a set of them).
+    let ports = match args.port.as_deref() {
+        Some(spec) => match PortSet::parse(spec, args.port_order) {
+            Ok(set) => set,
+            // Unreachable in practice — the spec was validated when it was
+            // parsed off the command line — but a refusal here is still audited
+            // rather than unwrapped, because this is the last point before the
+            // set decides where packets go.
+            Err(e) => return Err(audit_refusal(&mut audit, "arguments", &e)?),
+        },
+        None if args.l4_mode.is_icmp() => PortSet::single(0),
+        None => {
+            return Err(audit_refusal(
+                &mut audit,
+                "arguments",
+                "--layer l3/l4 requires --port <SPEC> (except the icmp* modes)",
+            )?)
         }
     };
+    // Taken before the set moves into the engine config, for the audit record,
+    // the summary note, and the dry-run print.
+    let port_label = ports.label();
+    let dry_run_ports = if args.l4_mode.is_icmp() { None } else { Some(port_label.as_str()) };
 
     let authorized = match gate.authorize_all(args.targets.iter().copied()) {
         Ok(t) => t,
@@ -1155,18 +1199,27 @@ fn run_l4(
     let plan = RunPlan { targets: authorized, rate_cap, duration, kill };
     let mut module = L34Engine::new(L34Config {
         mode: args.l4_mode,
-        port,
+        ports,
         payload_size: args.payload_size,
         concurrency: args.concurrency,
         connect_timeout: Duration::from_millis(args.connect_timeout_ms),
     });
 
     // Record the authorized run (targets + rules + params) before any traffic.
+    // The port set goes in the mode string rather than a field of its own: a run
+    // may now span a whole range, so "which primitive ran" is not fully answered
+    // without it, and the pre-traffic record is the only one a refused or aborted
+    // run leaves behind. (The completion record carries it inside `layer_label`.)
+    let audited_mode = if args.l4_mode.is_icmp() {
+        module.name().to_string()
+    } else {
+        format!("{} on {}", module.name(), port_label)
+    };
     audit_record(
         &mut audit,
         AuditEvent::RunAuthorized {
             layer: format!("{:?}", module.layer()),
-            mode: module.name().to_string(),
+            mode: audited_mode,
             rate_per_sec: args.rate,
             duration_secs: args.duration_secs,
             targets: plan.targets.iter().map(target_label).collect(),
@@ -1187,7 +1240,7 @@ fn run_l4(
         return Err(format!("refusing L3/L4 run: {e}"));
     }
     if args.dry_run {
-        return dry_run_summary(&mut audit, &module, &plan, args);
+        return dry_run_summary(&mut audit, &module, &plan, args, dry_run_ports);
     }
     println!("running module '{}' ({:?})...", module.name(), module.layer());
     let started = std::time::Instant::now();
@@ -1204,7 +1257,7 @@ fn run_l4(
     let mut notes = if args.l4_mode.is_icmp() {
         Vec::new() // ICMP is portless
     } else {
-        vec![format!("port {port}")]
+        vec![port_label.clone()]
     };
     // Only the connection-holding modes are bounded by --concurrency; restating it
     // for a stateless flood would suggest a limit that does not exist.
@@ -1295,7 +1348,8 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut drain_timeout_ms = jinrai_l7::DEFAULT_DRAIN_GRACE.as_millis() as u64;
     let mut layer = Layer::L7;
     let mut l4_mode = L4Mode::Udp;
-    let mut port = None;
+    let mut port: Option<String> = None;
+    let mut port_order = PortOrder::default();
     let mut payload_size = 64usize;
     let mut concurrency = jinrai_l34::DEFAULT_CONCURRENCY;
     let mut connect_timeout_ms = jinrai_l34::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64;
@@ -1472,17 +1526,16 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 }
             }
             "--port" => {
+                // Parsed here only to reject a malformed spec at argument time;
+                // the set is rebuilt once `--port-order` is known, since the
+                // flags may arrive in either order.
                 let raw = next_val(&mut it, "--port")?;
-                let v: u16 = raw.parse().map_err(|_| "invalid --port".to_string())?;
-                // Port 0 is not a port an operator can mean here: it is the
-                // kernel's "pick one" sentinel for *binding*, and as a
-                // destination the raw packet builder rewrites it to 1. Refuse it
-                // rather than send traffic to a port nobody asked for — the same
-                // policy the other meaningless zeros get.
-                if v == 0 {
-                    return Err("--port 0 is not a destination port (got 0)".to_string());
-                }
-                port = Some(v);
+                PortSet::parse(&raw, PortOrder::Sequential)?;
+                port = Some(raw);
+            }
+            "--port-order" => {
+                let raw = next_val(&mut it, "--port-order")?;
+                port_order = PortOrder::parse(&raw)?;
             }
             "--payload-size" => {
                 payload_size =
@@ -1621,11 +1674,16 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     // adapting an l4 command line into an l7 one should be told which parts did
     // not come across — not have the whole thing rejected.
     let (targeting, wrong_layer) = match layer {
-        Layer::L7 => ("--url", ["--target", "--port", "--concurrency", "--connect-timeout-ms"]),
-        Layer::L3 | Layer::L4 => (
-            "--target",
-            ["--url", "--header", "--l7-method", "--max-connections"],
+        // Slices, not fixed arrays: the two lists no longer happen to be the
+        // same length, and padding one to match the other is not a reason to
+        // warn about a flag.
+        Layer::L7 => (
+            "--url",
+            &["--target", "--port", "--port-order", "--concurrency", "--connect-timeout-ms"][..],
         ),
+        Layer::L3 | Layer::L4 => {
+            ("--target", &["--url", "--header", "--l7-method", "--max-connections"][..])
+        }
     };
     let ignored: Vec<&str> =
         wrong_layer.iter().copied().filter(|f| seen.iter().any(|s| s == f)).collect();
@@ -1660,6 +1718,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         layer,
         l4_mode,
         port,
+        port_order,
         payload_size,
         concurrency,
         connect_timeout_ms,
@@ -2094,8 +2153,46 @@ mod tests {
         let mut argv: Vec<&str> = base.to_vec();
         argv.extend(["--port", "80", "--concurrency", "8"]);
         let a = args_of(&argv);
-        assert_eq!(a.port, Some(80));
+        assert_eq!(a.port.as_deref(), Some("80"));
         assert_eq!(a.concurrency, 8);
+    }
+
+    /// A malformed `--port` spec must be refused while parsing arguments, not
+    /// discovered later. The spec decides where every packet of the run goes,
+    /// so "it turned out to be nonsense" is not something to learn after the
+    /// lab acknowledgement and the audit record are already behind us.
+    #[test]
+    fn port_specs_are_validated_at_parse_time() {
+        let base = ["--allow", "10.0.0.0/8", "--layer", "l4", "--target", "10.1.2.3"];
+        for spec in ["0", "80,0", "100-80", "80,,443", "http", "70000"] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend(["--port", spec]);
+            assert!(parse(&argv).is_err(), "--port {spec:?} must be refused");
+        }
+        for spec in ["443", "80,443,8080", "1000-2000", "80,8000-8100"] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend(["--port", spec]);
+            assert_eq!(args_of(&argv).port.as_deref(), Some(spec));
+        }
+    }
+
+    /// `--port-order` defaults to the deterministic walk, so a command line that
+    /// worked before port sets existed still produces the same traffic.
+    #[test]
+    fn port_order_defaults_to_sequential_and_rejects_unknown_values() {
+        let base = ["--allow", "10.0.0.0/8", "--layer", "l4", "--target", "10.1.2.3"];
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--port", "1000-2000"]);
+        assert_eq!(args_of(&argv).port_order, PortOrder::Sequential);
+
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--port", "1000-2000", "--port-order", "random"]);
+        assert_eq!(args_of(&argv).port_order, PortOrder::Random);
+
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--port", "1000-2000", "--port-order", "shuffle"]);
+        let err = parse(&argv).expect_err("an unknown order must be refused");
+        assert!(err.contains("--port-order"), "the refusal must name the flag: {err}");
     }
 
     /// Two flags giving opposite instructions about whether the run is on the

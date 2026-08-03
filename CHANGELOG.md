@@ -14,6 +14,63 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-08-03
+
+Destination ports become a **set**. Every release until now sent a whole L3/L4
+run to exactly one port, which is right for a single-service test and wrong for
+the two shapes a test plan asks for by name — random-port floods and carpet
+bombing. Both are the same missing primitive: a set of ports, and a rule for
+picking one per packet.
+
+### Added
+
+- **`--port` takes a spec, not a number.** A single port (`443`), a comma list
+  (`80,443,8080`), an inclusive range (`1000-2000`), or a mix (`80,8000-8100`).
+  Held as ranges rather than an expanded list, so `1-65535` is a legitimate spec
+  that costs two integers. Port 0 is still refused, everywhere it can appear in a
+  spec.
+- **`--port-order <sequential|random>`.** `sequential` (the default) walks the set
+  in the order written, advancing once per pass over the targets so a multi-target
+  run enumerates the whole target x port cross-product — advancing per *unit*
+  instead would lock each target to its own port whenever the target and port
+  counts share a factor, which is the opposite of what a carpet-bombing run is
+  asked to produce. `random` draws a port per packet: consecutive packets are
+  unrelated, so a rule keyed on one port sees a trickle rather than the run.
+  A single-port run is byte-for-byte what it was before either flag existed.
+- **Carpet bombing** now falls out of the two flags together: `--target` was
+  already repeatable, so several destination addresses x a port range is one
+  command line. Documented in the README with both the UDP and the raw-SYN shape.
+
+The draw uses a hand-rolled xorshift64\* seeded from the clock, not a new
+dependency — the requirement is "spread the load over the range", not
+unpredictability, and nothing security-relevant rests on the sequence. `below()`
+uses Lemire multiply-shift so the low ports of a range are not favoured by modulo
+bias.
+
+**The guardrail is unchanged and this is deliberate:** only the *destination*
+port varies. The source address is never spoofed and the source port stays
+deterministic. Source-port randomisation is the neighbouring move that makes
+flows unattributable, and it is absent for the same reason source-IP spoofing is.
+
+### Changed
+
+- The run label and both audit records name the set (`ports 1000-2000 (random)`)
+  rather than a single port. The pre-traffic `RunAuthorized` record carries it
+  too — a run may now span a whole range, so "which primitive ran" is not fully
+  answered without it, and that record is the only one a refused or aborted run
+  leaves behind.
+- `--port-order` is listed among the flags an `--layer l7` run warns about as
+  not-applicable, alongside `--port`.
+
+### Verified
+
+Loopback run, 50 UDP sockets bound across `31000-31049`, `--port-order random`
+at 2000/s for 3s: **all 50 ports received traffic**, 6000 datagrams observed,
+94–144 per port against an expected 120 — the spread is real on the wire, not
+just in the picker. Unit tests cover both orders' coverage of their set, spec
+rejection (`0`, `80,0`, `100-80`, `80,,443`, `70000`, ...), and the full
+`1-65535` range. Suite 277 green, clippy clean.
+
 ## [0.36.0] — 2026-08-03
 
 Code-review remediation. No new primitives — this release is about the run
@@ -1657,7 +1714,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/h4b00b/jinrai/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/h4b00b/jinrai/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/h4b00b/jinrai/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/h4b00b/jinrai/compare/v0.33.0...v0.34.0

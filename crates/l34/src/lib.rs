@@ -58,8 +58,10 @@
 mod mode;
 mod pace;
 mod packet;
+mod ports;
 
 pub use mode::{L34Config, L4Mode, DEFAULT_CONCURRENCY, DEFAULT_CONNECT_TIMEOUT};
+pub use ports::{PortOrder, PortSet, Rng};
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -252,7 +254,11 @@ impl L34Engine {
         let label = if self.config.mode.is_icmp() {
             format!("L3 {} {targets_suffix}", self.config.mode.label())
         } else {
-            format!("L4 {} -> port {} {targets_suffix}", self.config.mode.label(), self.config.port)
+            format!(
+                "L4 {} -> {} {targets_suffix}",
+                self.config.mode.label(),
+                self.config.ports.label()
+            )
         };
 
         // Rate 0 => send nothing (this is a safety control, honoured before we
@@ -269,6 +275,9 @@ impl L34Engine {
         let mut tally = Tally::new();
         let mut aborted = false;
         let mut idx = 0usize;
+        // Only consulted by `PortOrder::Random`; constructed either way because
+        // the alternative is an `Option` unwrapped inside the hot loop.
+        let mut rng = Rng::from_clock();
 
         // How many units share one tick, and how long that tick lasts. Below the
         // resolution a sleep can actually deliver, one-unit-per-sleep makes the
@@ -308,8 +317,17 @@ impl L34Engine {
                     break 'run;
                 }
                 let ip = ips[idx % ips.len()];
+                // The port advances once per full pass over the targets, not per
+                // unit. Advancing per unit would lock each target to its own
+                // port whenever the target count and the port count share a
+                // factor — with two targets and two ports, target A only ever
+                // sees port 1 — which is the opposite of what a carpet-bombing
+                // run is asked to produce. Dividing enumerates the whole
+                // target x port cross-product instead. (The random order ignores
+                // the counter entirely.)
+                let port = self.config.ports.pick((idx / ips.len()) as u64, &mut rng);
                 idx += 1;
-                match sender.send(ip, self.config.port, &mut tally, plan) {
+                match sender.send(ip, port, &mut tally, plan) {
                     Ok(e) => tally.record(e),
                     // An `Err` here is never a per-packet failure: the send path
                     // classifies those into `Emission::Failed(bucket)` itself.
@@ -1159,7 +1177,7 @@ mod tests {
     fn config(mode: L4Mode, port: u16, payload_size: usize) -> L34Config {
         L34Config {
             mode,
-            port,
+            ports: PortSet::single(port),
             payload_size,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -1837,6 +1855,91 @@ mod tests {
 
         let mut buf = [0u8; 64];
         assert!(listener.recv_from(&mut buf).is_ok(), "listener should receive at least one datagram");
+    }
+
+    /// The port set has to reach *every* port in it, not just the first one.
+    /// A spec that parses correctly but is only ever asked for `nth(0)` would
+    /// pass every unit test in `ports` and still send the whole run to one
+    /// port — a random-port test that is not one, which is worse than not
+    /// having the feature.
+    ///
+    /// Four listeners on ephemeral ports; the run must deliver to all four.
+    #[test]
+    fn a_port_set_delivers_to_every_port_in_it() {
+        let _fd = fd_guard();
+        let listeners: Vec<UdpSocket> = (0..4)
+            .map(|_| {
+                let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                s
+            })
+            .collect();
+        let spec = listeners
+            .iter()
+            .map(|s| s.local_addr().unwrap().port().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let ports = PortSet::parse(&spec, PortOrder::Sequential).expect("spec parses");
+        assert_eq!(ports.count(), 4);
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(L34Config {
+            mode: L4Mode::Udp,
+            ports,
+            payload_size: 16,
+            concurrency: DEFAULT_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        });
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
+        assert!(report.units_sent >= 4, "sent {} units, too few to cover the set", report.units_sent);
+        assert_eq!(report.errors, 0);
+        // The label names the set, not a single port — an operator reading the
+        // summary must be able to tell which shape ran.
+        assert!(report.layer_label.contains("ports "), "label was {:?}", report.layer_label);
+
+        let mut buf = [0u8; 64];
+        for (i, l) in listeners.iter().enumerate() {
+            assert!(l.recv_from(&mut buf).is_ok(), "port {i} of the set received nothing");
+        }
+    }
+
+    /// The random order must also cover the set. It picks per unit rather than
+    /// walking, so "every port got traffic" is the property that separates a
+    /// working draw from a generator stuck on one value.
+    #[test]
+    fn the_random_port_order_covers_its_set_too() {
+        let _fd = fd_guard();
+        let listeners: Vec<UdpSocket> = (0..4)
+            .map(|_| {
+                let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                s
+            })
+            .collect();
+        let spec = listeners
+            .iter()
+            .map(|s| s.local_addr().unwrap().port().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(L34Config {
+            mode: L4Mode::Udp,
+            ports: PortSet::parse(&spec, PortOrder::Random).expect("spec parses"),
+            payload_size: 16,
+            concurrency: DEFAULT_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        });
+        // 400 draws over 4 ports: missing one has probability (3/4)^400, which is
+        // not a flake worth designing around.
+        let report = engine.execute(&plan(vec![t], 400, 1)).expect("the run should execute");
+        assert_eq!(report.errors, 0);
+        assert!(report.layer_label.contains("random"), "label was {:?}", report.layer_label);
+
+        let mut buf = [0u8; 64];
+        for (i, l) in listeners.iter().enumerate() {
+            assert!(l.recv_from(&mut buf).is_ok(), "port {i} of the set received nothing");
+        }
     }
 
 

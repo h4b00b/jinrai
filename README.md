@@ -63,7 +63,7 @@ same five decisions:
 | Decision | Flag(s) | |
 |---|---|---|
 | **Where am I allowed to send?** | `--allow` (repeatable) | An IP/CIDR (`10.0.0.0/8`) or a DNS pattern (`*.staging.internal`). No default: with an empty allowlist the run is refused. A rule that could never match — an IPv4-mapped entry like `::ffff:10.0.0.1/128` — is refused too, rather than sitting there looking like it authorized something. |
-| **Which target?** | `--url` (L7), or `--target` + `--port` (L3/L4) | Checked against the allowlist before a single byte is sent. |
+| **Which target?** | `--url` (L7), or `--target` + `--port` (L3/L4) | Checked against the allowlist before a single byte is sent. `--target` repeats and `--port` takes a range — that pair is [carpet bombing](#random-ports-and-carpet-bombing). |
 | **Which pressure?** | `--layer`, then `--l7-method` / `--l4-mode` | This is "the attack" — see [the catalogue](#the-catalogue). |
 | **How hard?** | `--rate`, plus a concurrency ceiling | `--rate` is a hard safety ceiling, never exceeded by anything. Which ceiling flag applies depends on the method — see [the knob table](#rate-concurrency-and-which-knobs-apply). |
 | **How long?** | `--duration`, optionally shaped by `--profile` | |
@@ -658,12 +658,50 @@ ever stop traffic, never generate it, and it is inert without at least one
 
 ## L3/L4 reference
 
-Requires raw target IPs matching a CIDR `--allow` and a `--port` (except the
-ICMP modes), on top of the `--ack-lab` acknowledgement every layer needs. `udp`/`tcp`/`data` need
+Requires raw target IPs matching a CIDR `--allow` and a `--port` (a single port,
+a list, or a range — except for the ICMP modes, which are portless), on top of
+the `--ack-lab` acknowledgement every layer needs. `udp`/`tcp`/`data` need
 no privilege, and `tcp`/`data` work over IPv4 **and** IPv6; the raw-socket modes
 (`syn`/`ack`/`fin`/`rst`/`urg`/`cwr`/`ece`/`syn-ack`/`syn-fin`/`syn-rst`/`xmas`/
 `null`/`tcp-options`/`icmp`/`icmp-timestamp`/`icmp-address-mask`) need `CAP_NET_RAW`/root
 and are IPv4-only.
+
+### Random ports and carpet bombing
+
+`--port` takes a **set**, not just a number: a single port (`443`), a comma list
+(`80,443,8080`), an inclusive range (`1000-2000`), or a mix (`80,8000-8100`).
+Port 0 is refused. `--port-order` decides how a run walks it:
+
+| order | behaviour |
+| --- | --- |
+| `sequential` (default) | walk the set in the order written, advancing once per pass over the targets, so the run enumerates the whole target × port cross-product. Deterministic; for a single port it is exactly what earlier releases did |
+| `random` | draw a port per packet — consecutive packets are unrelated, so a rule keyed on one port sees a trickle rather than the run |
+
+This is what a test plan means by a **random-port flood**: most of the range has
+no listener, so the target has to generate a refusal per packet (RST, or an ICMP
+port-unreachable) and track a flow that goes nowhere, and a per-port rule no
+longer sees the whole run.
+
+Combine it with a repeated `--target` and it is **carpet bombing** — load spread
+across several destination addresses *and* several ports at once, so no single
+address/port pair looks like an attack on its own:
+
+```bash
+# UDP carpet bombing: 3 targets, 1000 ports, drawn at random per packet
+jinrai $REQ --layer l4 --l4-mode udp --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --target 10.1.2.4 --target 10.1.2.5 \
+       --port 20000-20999 --port-order random --rate 20000 --duration 60
+
+# TCP carpet bombing: same shape, SYNs instead of datagrams (needs CAP_NET_RAW)
+sudo -E jinrai $REQ --layer l4 --l4-mode syn --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --target 10.1.2.4 \
+       --port 1-65535 --port-order random --rate 50000 --duration 60
+```
+
+Only the **destination** port varies. The source address is never spoofed and the
+source port stays deterministic — source-port randomisation is the neighbouring
+move that makes flows unattributable, and it is deliberately absent for the same
+reason source-IP spoofing is.
 
 ### The flag and anomaly floods
 
