@@ -80,6 +80,32 @@ impl RateCap {
     pub fn clamped_to(self, ceiling: RateCap) -> RateCap {
         RateCap::new(self.per_second.min(ceiling.per_second))
     }
+
+    /// This cap divided across `n` concurrently-running vectors, as shares whose
+    /// **sum is exactly this cap**.
+    ///
+    /// This is the one decision that keeps `--rate` meaning what it says once a
+    /// run drives more than one primitive at a time. The alternative — giving
+    /// every vector the full cap — would make `--rate 5000` with three vectors
+    /// emit 15 000/s, so the number the operator typed, acknowledged, and had
+    /// recorded in the audit log would be a third of the traffic actually sent.
+    /// A safety ceiling that multiplies behind the operator's back is not a
+    /// ceiling.
+    ///
+    /// The remainder from the division is handed out one unit at a time to the
+    /// leading vectors rather than dropped, so the shares still sum to the cap
+    /// exactly. `n == 0` yields no shares.
+    pub fn split_across(self, n: usize) -> Vec<RateCap> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let n_u64 = n as u64;
+        let base = self.per_second / n_u64;
+        let remainder = self.per_second % n_u64;
+        (0..n_u64)
+            .map(|i| RateCap::new(base + u64::from(i < remainder)))
+            .collect()
+    }
 }
 
 /// One constant-rate segment of a run. A [`LoadProfile`] compiles to a sequence
@@ -370,6 +396,15 @@ impl ErrnoTally {
     /// Non-zero buckets in reporting order (see [`ErrnoBucket`]).
     pub fn iter(&self) -> impl Iterator<Item = (ErrnoBucket, u64)> + '_ {
         self.counts.iter().map(|(&b, &n)| (b, n))
+    }
+
+    /// Fold another tally's counts into this one — for a multi-vector run, whose
+    /// combined failure breakdown must add up across the vectors that produced
+    /// it rather than showing only one of them.
+    pub fn absorb(&mut self, other: &ErrnoTally) {
+        for (bucket, n) in other.iter() {
+            *self.counts.entry(bucket).or_insert(0) += n;
+        }
     }
 }
 
@@ -788,6 +823,29 @@ mod tests {
     fn rate_cap_interval() {
         assert_eq!(RateCap::new(0).min_interval(), None);
         assert_eq!(RateCap::new(1000).min_interval(), Some(Duration::from_millis(1)));
+    }
+
+    /// The safety property of a multi-vector run: however the cap is split, the
+    /// shares sum back to it exactly. A split that rounded each share up — or
+    /// that handed every vector the full cap — would make `--rate` mean `--rate`
+    /// times the vector count, which is the number the operator acknowledged and
+    /// the audit log recorded.
+    #[test]
+    fn splitting_a_rate_cap_never_creates_traffic() {
+        for rate in [0u64, 1, 2, 7, 100, 5000, 10_000_000] {
+            for n in 1usize..=8 {
+                let shares = RateCap::new(rate).split_across(n);
+                assert_eq!(shares.len(), n);
+                let total: u64 = shares.iter().map(|s| s.per_second).sum();
+                assert_eq!(total, rate, "rate {rate} across {n} vectors summed to {total}");
+                // The remainder is spread, not piled onto one vector: no share is
+                // more than one unit above another.
+                let max = shares.iter().map(|s| s.per_second).max().unwrap();
+                let min = shares.iter().map(|s| s.per_second).min().unwrap();
+                assert!(max - min <= 1, "shares {min}..{max} are not even for {rate}/{n}");
+            }
+        }
+        assert!(RateCap::new(100).split_across(0).is_empty());
     }
 
     /// The interval must never be zero: every engine either divides by it

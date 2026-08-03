@@ -206,6 +206,7 @@ reacts to control flags it should never see.
 | Unsolicited handshake response — a SYN-ACK answering a SYN nobody sent | `syn-ack` |
 | Illegal flag combinations (contradictory / all-set / none-set) | `syn-fin`, `syn-rst`, `xmas`, `null` |
 | Maximal 40-byte TCP option block on every SYN | `tcp-options` |
+| **Several of these at once** (multi-vector) | repeat `--l4-mode` — see [multi-vector runs](#multi-vector-runs) |
 
 ## Rate, concurrency, and which knobs apply
 
@@ -226,6 +227,7 @@ reinterpreted per family, and a flag belonging to another family is inert
 | l4 `data` | writes/sec | `--concurrency`, `--payload-size` | same |
 | l4 `udp` | datagrams/sec | `--payload-size` (stateless — no footprint to bound) | same |
 | l4 raw floods, l3 `icmp*` | packets/sec | *nothing* — stateless | same |
+| **multi-vector** (repeated `--l4-mode`) | the **total** across all vectors, split evenly between them | `--concurrency` applies per vector that holds sockets | same as the modes it runs |
 
 Two consequences worth internalising: passing `--slow-connections 500` to an
 `h2-*` method changes nothing at all, and for `--l4-mode tcp` the reachable rate
@@ -372,6 +374,13 @@ sudo -E jinrai $REQ --layer l4 --l4-mode syn --allow 10.0.0.0/8 --target 10.1.2.
 # icmp-timestamp (type 13) or icmp-address-mask (type 17)
 sudo -E jinrai $REQ --layer l3 --l4-mode icmp --allow 10.0.0.0/8 --target 10.1.2.3 \
        --rate 1000 --duration 30
+
+# Multi-vector: repeat --l4-mode and they run at the same time, splitting the one
+# --rate ceiling between them (here 10000/s each, not 30000/s each)
+sudo -E jinrai $REQ --layer l4 --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --target 10.1.2.4 \
+       --l4-mode udp --l4-mode syn --l4-mode icmp \
+       --port 20000-20999 --port-order random --rate 30000 --duration 60
 ```
 
 `sudo -E` preserves `$JINRAI_OPERATOR` so [the audit log](#the-audit-log) still
@@ -769,6 +778,51 @@ Only the **destination** port varies. The source address is never spoofed and th
 source port stays deterministic — source-port randomisation is the neighbouring
 move that makes flows unattributable, and it is deliberately absent for the same
 reason source-IP spoofing is.
+
+### Multi-vector runs
+
+`--l4-mode` is repeatable. Give it more than once and the primitives run
+**concurrently** against the same targets, in one run:
+
+```bash
+# UDP + TCP + ICMP at once, over a random port range, across two targets
+sudo -E jinrai $REQ --layer l4 --allow 10.0.0.0/8 \
+       --target 10.1.2.3 --target 10.1.2.4 \
+       --l4-mode udp --l4-mode syn --l4-mode icmp \
+       --port 20000-20999 --port-order random --rate 30000 --duration 60
+```
+
+Each vector gets its own thread, its own socket state and its own send loop, so
+a `data` write blocking on a full buffer cannot set the pace for the packet
+floods next to it. They share everything that bounds the run: one `--duration`,
+one kill-switch (Ctrl-C and the watchdog stop all of them), one audit record, one
+summary.
+
+**They also share `--rate`, and that is the point.** The ceiling is split evenly
+between the vectors — three vectors at `--rate 6000` emit 2000/s *each*, not
+6000/s each. A per-vector ceiling would make `--rate` mean `--rate` × the vector
+count, so the number the operator typed, acknowledged and had written to the
+audit log would be a fraction of the traffic actually sent, and a safety ceiling
+that multiplies behind your back is not a ceiling. A `--rate` too small to split
+(fewer units/s than vectors) is refused rather than silently rounding a vector to
+zero.
+
+The summary reports the total and a per-vector breakdown, because one total
+cannot tell "both vectors landed" from "one did all the work":
+
+```
+ attempts   2000 total, 993.7/s achieved (99% of the 1000/s cap)
+ completed  1000 (50.0%)
+   of which udp-flood 1000 sent / 0 failed at 500/s; tcp-connect-flood 0
+            sent / 1000 failed at 500/s
+```
+
+Mixing ICMP with a port mode is allowed; `--port` is still required, for the
+vectors that address one. A run whose vectors are *all* ICMP reports as L3, a
+mixed run as L4 — calling a run that floods a port "L3" because one vector is
+ICMP would understate it. Preflight checks **every** vector, so a missing
+`CAP_NET_RAW` or an unreachable IPv6 target refuses the whole run before any
+traffic rather than surfacing as one vector failing every packet.
 
 ### The flag and anomaly floods
 

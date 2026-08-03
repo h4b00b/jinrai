@@ -72,7 +72,9 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use jinrai_core::{ErrnoBucket, ErrnoTally, Layer, ModuleError, RunPlan, RunReport, StressModule};
+use jinrai_core::{
+    ErrnoBucket, ErrnoTally, Layer, ModuleError, RateCap, RunPlan, RunReport, StressModule,
+};
 
 use crate::mode::{IcmpQuery, TcpFlags};
 use crate::pace::{batch_for, interruptible_sleep};
@@ -162,11 +164,15 @@ impl std::error::Error for L34Error {}
 #[derive(Debug, Clone)]
 pub struct L34Engine {
     config: L34Config,
+    /// `StressModule::name` returns `&str`, and a multi-vector run's name is
+    /// assembled from its mode list, so it is built once here.
+    name: String,
 }
 
 impl L34Engine {
     pub fn new(config: L34Config) -> Self {
-        Self { config }
+        let name = config.label();
+        Self { config, name }
     }
 
     /// Pre-flight check so the caller can fail fast (non-zero exit) before
@@ -175,11 +181,18 @@ impl L34Engine {
     /// be present. `Ok(())` means the run can proceed. Fail-closed.
     pub fn preflight(&self, plan: &RunPlan) -> Result<(), L34Error> {
         self.check_targets(plan)?;
-        if let Some(proto) = self.config.mode.raw_socket_protocol() {
-            // Opening (and immediately dropping) the raw socket surfaces a missing
-            // CAP_NET_RAW now rather than mid-run with a zero-sent report.
-            Socket::new(Domain::IPV4, Type::RAW, Some(proto))
-                .map_err(|e| L34Error::RawSocket(e.to_string()))?;
+        // Every vector, not just the first. A multi-vector run that preflighted
+        // only its leading mode would pass, start, and then have its raw vectors
+        // fail every packet — a run that reports partial success for a privilege
+        // problem the operator could have been told about before any traffic.
+        for mode in &self.config.modes {
+            if let Some(proto) = mode.raw_socket_protocol() {
+                // Opening (and immediately dropping) the raw socket surfaces a
+                // missing CAP_NET_RAW now rather than mid-run with a zero-sent
+                // report.
+                Socket::new(Domain::IPV4, Type::RAW, Some(proto))
+                    .map_err(|e| L34Error::RawSocket(e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -196,9 +209,15 @@ impl L34Engine {
         // UDP binds an IPv4 socket and the raw-TCP builders are IPv4-only, so an
         // IPv6 target would send nothing but errors. Refuse it instead of reporting
         // a hollow "success". TCP connect handles IPv6 natively, so it is exempt.
-        if self.config.mode == L4Mode::Udp || self.config.mode.needs_raw_socket() {
-            if let Some(&ip) = ips.iter().find(|ip| ip.is_ipv6()) {
-                return Err(L34Error::Ipv6Unsupported { mode: self.config.mode, ip });
+        //
+        // Checked per vector: in a multi-vector run one IPv6-incapable mode is
+        // enough to refuse, because a run that quietly drops a vector is not the
+        // run the operator described.
+        for &mode in &self.config.modes {
+            if mode == L4Mode::Udp || mode.needs_raw_socket() {
+                if let Some(&ip) = ips.iter().find(|ip| ip.is_ipv6()) {
+                    return Err(L34Error::Ipv6Unsupported { mode, ip });
+                }
             }
         }
         Ok(())
@@ -207,16 +226,18 @@ impl L34Engine {
 
 impl StressModule for L34Engine {
     fn layer(&self) -> Layer {
-        self.config.mode.layer()
+        self.config.layer()
     }
 
     fn name(&self) -> &str {
-        self.config.mode.label()
+        // `&str` by trait contract, so a multi-vector run — whose name is built
+        // from its list — caches it on the engine rather than leaking a String.
+        &self.name
     }
 
     fn execute(&mut self, plan: &RunPlan) -> Result<RunReport, ModuleError> {
         self.run(plan).map_err(|e| {
-            let what = format!("{} {}: {e}", layer_tag(self.config.mode), self.config.mode.label());
+            let what = format!("{} {}: {e}", layer_tag(self.config.layer()), self.config.label());
             match e {
                 // The plan itself is unreachable for this primitive — a gate-level
                 // no, decided before any socket exists.
@@ -233,44 +254,167 @@ impl StressModule for L34Engine {
     }
 }
 
-/// Short OSI tag for a mode's run/error labels: `L3` for ICMP, else `L4`.
-fn layer_tag(mode: L4Mode) -> &'static str {
-    match mode.layer() {
+/// What one vector of a multi-vector run came back with: which primitive it was,
+/// the share of the ceiling it was given, and either its counters or the reason
+/// it could not run.
+type VectorResult = (L4Mode, u64, Result<(Tally, bool), L34Error>);
+
+/// Short OSI tag for a run's labels: `L3` for an all-ICMP run, else `L4`.
+fn layer_tag(layer: Layer) -> &'static str {
+    match layer {
         Layer::L3 => "L3",
         _ => "L4",
     }
 }
 
 impl L34Engine {
+    /// How the whole run labels itself in the summary and the audit log.
+    fn run_label(&self, targets: usize) -> String {
+        let suffix = format!("({} target{})", targets, if targets == 1 { "" } else { "s" });
+        let all_icmp = self.config.modes.iter().all(|m| m.is_icmp());
+        // ICMP is portless; naming a port set for an all-ICMP run would describe
+        // traffic that carries none. A mixed run does name it, because its
+        // non-ICMP vectors used it.
+        if all_icmp {
+            format!("L3 {} {suffix}", self.config.label())
+        } else {
+            format!(
+                "{} {} -> {} {suffix}",
+                layer_tag(self.config.layer()),
+                self.config.label(),
+                self.config.ports.label()
+            )
+        }
+    }
+
     fn run(&self, plan: &RunPlan) -> Result<RunReport, L34Error> {
-        // L3/L4 only ever acts on IP data, and only on a family this mode can
+        // L3/L4 only ever acts on IP data, and only on a family these modes can
         // reach. Any host-name target, empty plan, or unreachable IPv6 is refused
         // here too (not just in preflight) so `execute()` is fail-closed on its own.
         self.check_targets(plan)?;
         let ips: Vec<IpAddr> = plan.targets.iter().filter_map(|t| t.as_ip()).collect();
-
-        let targets_suffix = format!("({} target{})", ips.len(), if ips.len() == 1 { "" } else { "s" });
-        // ICMP has no port; every other mode targets a port.
-        let label = if self.config.mode.is_icmp() {
-            format!("L3 {} {targets_suffix}", self.config.mode.label())
-        } else {
-            format!(
-                "L4 {} -> {} {targets_suffix}",
-                self.config.mode.label(),
-                self.config.ports.label()
-            )
-        };
+        let label = self.run_label(ips.len());
 
         // Rate 0 => send nothing (this is a safety control, honoured before we
         // even open a socket, so it is deterministic).
-        let interval = match plan.rate_cap.min_interval() {
-            Some(i) => i,
-            None => {
-                return Ok(RunReport { layer_label: label, ..Default::default() });
+        if plan.rate_cap.min_interval().is_none() {
+            return Ok(RunReport { layer_label: label, ..Default::default() });
+        }
+
+        if !self.config.is_multi_vector() {
+            let (tally, aborted) = self.run_vector(self.config.primary(), plan, plan.rate_cap)?;
+            return Ok(tally.into_report(label, aborted));
+        }
+        self.run_multi_vector(plan, label)
+    }
+
+    /// Drive every vector at once, each on its own thread, each with its own
+    /// share of the one `--rate` ceiling.
+    ///
+    /// A thread per vector rather than one interleaved loop: each primitive
+    /// already owns blocking state — a connect pool, a raw socket, a data-flood
+    /// connection table — and interleaving them on one thread would let the
+    /// slowest (a `data` write blocking on a full buffer) set the pace for the
+    /// packet floods, which is the opposite of what running them together is
+    /// supposed to show. The shared [`KillSwitch`] and the shared deadline stop
+    /// them together.
+    fn run_multi_vector(
+        &self,
+        plan: &RunPlan,
+        label: String,
+    ) -> Result<RunReport, L34Error> {
+        let shares = plan.rate_cap.split_across(self.config.modes.len());
+        let mut merged = Tally::new();
+        let mut aborted = false;
+        let mut per_vector: Vec<String> = Vec::with_capacity(self.config.modes.len());
+        // A vector that could not start is the run's failure, not a footnote:
+        // reported after every thread is joined, so one dead vector cannot leave
+        // the others running unattended.
+        let mut first_error: Option<L34Error> = None;
+
+        let results: Vec<VectorResult> = thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .config
+                .modes
+                .iter()
+                .zip(shares.iter())
+                .map(|(&mode, &share)| {
+                    let vector_plan = RunPlan {
+                        targets: plan.targets.clone(),
+                        rate_cap: share,
+                        duration: plan.duration,
+                        kill: plan.kill.clone(),
+                    };
+                    let handle = scope.spawn(move || self.run_vector(mode, &vector_plan, share));
+                    (mode, share.per_second, handle)
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|(mode, rate, h)| {
+                    // A panicked vector is reported as a setup failure of that
+                    // vector rather than propagated: the other threads have
+                    // already been joined by then, and losing their results to
+                    // an unwind would discard traffic that was actually sent.
+                    let r = h.join().unwrap_or_else(|_| {
+                        Err(L34Error::Setup(format!("vector {} panicked", mode.label())))
+                    });
+                    (mode, rate, r)
+                })
+                .collect()
+        });
+
+        for (mode, rate, result) in results {
+            match result {
+                Ok((tally, vector_aborted)) => {
+                    aborted |= vector_aborted;
+                    per_vector.push(format!(
+                        "{} {} sent / {} failed at {}/s",
+                        mode.label(),
+                        tally.sent,
+                        tally.errors,
+                        rate
+                    ));
+                    merged.absorb(tally);
+                }
+                Err(e) => {
+                    per_vector.push(format!("{}: {e}", mode.label()));
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        let mut report = merged.into_report(label, aborted);
+        // Which vector sent what. Without it the summary is one total, and a
+        // multi-vector run whose raw vectors all failed reads the same as one
+        // where they all landed.
+        report.detail = Some(per_vector.join("; "));
+        Ok(report)
+    }
+
+    /// One vector's send loop: the whole of what a single-mode run does.
+    fn run_vector(
+        &self,
+        mode: L4Mode,
+        plan: &RunPlan,
+        rate_cap: RateCap,
+    ) -> Result<(Tally, bool), L34Error> {
+        let ips: Vec<IpAddr> = plan.targets.iter().filter_map(|t| t.as_ip()).collect();
+
+        // A share of zero means this vector was allocated no traffic. Returning
+        // an empty tally rather than opening a socket keeps `--rate 0` (and a
+        // split that rounds a vector to nothing) deterministic.
+        let interval = match rate_cap.min_interval() {
+            Some(i) => i,
+            None => return Ok((Tally::new(), false)),
         };
 
-        let mut sender = Sender::setup(&self.config)?;
+        let mut sender = Sender::setup(&self.config, mode)?;
 
         let mut tally = Tally::new();
         let mut aborted = false;
@@ -368,7 +512,7 @@ impl L34Engine {
         };
         sender.finish(&mut tally, grace);
 
-        Ok(tally.into_report(label, aborted))
+        Ok((tally, aborted))
     }
 }
 
@@ -446,6 +590,26 @@ impl Tally {
             // separately — see `RunReport::not_offered`.
             Emission::Dropped => self.not_offered += 1,
         }
+    }
+
+    /// Fold another vector's counters into this one, for a multi-vector run's
+    /// combined total.
+    ///
+    /// The latency histograms are merged rather than one being picked: HdrHistogram
+    /// addition is exact for a combined distribution, and in practice at most one
+    /// vector of a run records latency at all (only the connection-oriented modes
+    /// do). Residency is summed as a numerator/denominator pair, which is why it
+    /// is stored that way — averaging two means would weight a vector that
+    /// resolved ten attempts the same as one that resolved a million.
+    fn absorb(&mut self, other: Tally) {
+        self.sent += other.sent;
+        self.errors += other.errors;
+        self.not_offered += other.not_offered;
+        self.residency_micros = self.residency_micros.saturating_add(other.residency_micros);
+        self.residency_n += other.residency_n;
+        self.errno.absorb(&other.errno);
+        // Only fails on a bounds mismatch, and every tally uses the same bounds.
+        let _ = self.latency.add(other.latency);
     }
 
     fn into_report(self, label: String, aborted: bool) -> RunReport {
@@ -854,8 +1018,8 @@ fn set_abortive_close(stream: &TcpStream) {
 }
 
 impl Sender {
-    fn setup(config: &L34Config) -> Result<Self, L34Error> {
-        let L34Config { mode, payload_size, connect_timeout, .. } = *config;
+    fn setup(config: &L34Config, mode: L4Mode) -> Result<Self, L34Error> {
+        let L34Config { payload_size, connect_timeout, .. } = *config;
         let cap = config.effective_concurrency();
         match mode {
             L4Mode::Udp => {
@@ -1176,8 +1340,21 @@ mod tests {
     /// or the attempt timeout override the field they are testing.
     fn config(mode: L4Mode, port: u16, payload_size: usize) -> L34Config {
         L34Config {
-            mode,
+            modes: vec![mode],
             ports: PortSet::single(port),
+            payload_size,
+            concurrency: DEFAULT_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    /// A config for a given vector list, at the shipped defaults — for the tests
+    /// that care about which primitives run rather than where they aim.
+    fn config_modes(modes: Vec<L4Mode>) -> L34Config {
+        let payload_size = 16;
+        L34Config {
+            modes,
+            ports: PortSet::single(9),
             payload_size,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -1884,7 +2061,7 @@ mod tests {
         assert_eq!(ports.count(), 4);
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(L34Config {
-            mode: L4Mode::Udp,
+            modes: vec![L4Mode::Udp],
             ports,
             payload_size: 16,
             concurrency: DEFAULT_CONCURRENCY,
@@ -1900,6 +2077,83 @@ mod tests {
         let mut buf = [0u8; 64];
         for (i, l) in listeners.iter().enumerate() {
             assert!(l.recv_from(&mut buf).is_ok(), "port {i} of the set received nothing");
+        }
+    }
+
+    /// The safety property of a multi-vector run, measured rather than argued:
+    /// two vectors under one `--rate` must together stay under it. Handing each
+    /// vector the full cap would double the traffic behind the number the
+    /// operator typed, acknowledged, and had written to the audit log.
+    #[test]
+    fn multi_vector_vectors_share_the_rate_ceiling_they_do_not_multiply_it() {
+        let _fd = fd_guard();
+        let udp_listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        udp_listener.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let port = udp_listener.local_addr().unwrap().port();
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let rate = 400u64;
+        let mut engine = L34Engine::new(L34Config {
+            // Two privilege-free vectors, so this runs anywhere the rest of the
+            // suite does.
+            modes: vec![L4Mode::Udp, L4Mode::TcpConnect],
+            ports: PortSet::single(port),
+            payload_size: 16,
+            concurrency: DEFAULT_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        });
+        let report = engine.execute(&plan(vec![t], rate, 1)).expect("the run should execute");
+
+        // Every attempt of every vector, against the one ceiling. The slack is
+        // for the final tick's batch, not for a second vector's worth of load:
+        // an unshared cap would land near 800.
+        assert!(
+            report.attempts() <= rate + rate / 4,
+            "{} attempts against a {rate}/s shared ceiling",
+            report.attempts()
+        );
+        assert!(report.attempts() > rate / 2, "only {} attempts — did a vector run at all?", report.attempts());
+
+        // Both vectors are named with their own numbers. A single total cannot
+        // distinguish "both landed" from "one did all the work".
+        let detail = report.detail.expect("a multi-vector run reports per-vector detail");
+        assert!(detail.contains("udp-flood"), "detail was {detail:?}");
+        assert!(detail.contains("tcp-connect-flood"), "detail was {detail:?}");
+        assert!(report.layer_label.contains("multi-vector"), "label was {:?}", report.layer_label);
+
+        let mut buf = [0u8; 64];
+        assert!(udp_listener.recv_from(&mut buf).is_ok(), "the udp vector sent nothing");
+    }
+
+    /// A mixed L3+L4 run reports as L4: calling a run that floods a port "L3"
+    /// because one of its vectors is ICMP would understate what was sent.
+    #[test]
+    fn a_mixed_vector_run_reports_the_stronger_layer() {
+        let mixed = config_modes(vec![L4Mode::Udp, L4Mode::Icmp]);
+        assert_eq!(mixed.layer(), Layer::L4);
+        assert!(mixed.label().contains("udp-flood + icmp-echo-flood"));
+
+        let all_icmp = config_modes(vec![L4Mode::Icmp, L4Mode::IcmpTimestamp]);
+        assert_eq!(all_icmp.layer(), Layer::L3);
+
+        let single = config_modes(vec![L4Mode::Syn]);
+        assert_eq!(single.label(), "tcp-syn-flood", "a one-vector run keeps its plain name");
+    }
+
+    /// Preflight must check every vector, not just the leading one. A run that
+    /// passed on its UDP vector and then failed every raw packet reports partial
+    /// success for a privilege problem the operator could have been told about
+    /// before any traffic left.
+    #[test]
+    fn preflight_refuses_an_ipv6_target_named_by_any_vector() {
+        let gate = Authorization::new(Allowlist::from_cidrs(["::/0"]).unwrap(), KillSwitch::new());
+        let t = gate.authorize("2001:db8::1".parse().unwrap()).unwrap();
+        // `tcp` alone handles IPv6 and would be accepted; the udp vector is what
+        // makes the plan unreachable, and it is second in the list.
+        let engine = L34Engine::new(config_modes(vec![L4Mode::TcpConnect, L4Mode::Udp]));
+        match engine.preflight(&plan(vec![t], 10, 1)) {
+            Err(L34Error::Ipv6Unsupported { mode, .. }) => assert_eq!(mode, L4Mode::Udp),
+            other => panic!("expected an IPv6 refusal naming the udp vector, got {other:?}"),
         }
     }
 
@@ -1924,7 +2178,7 @@ mod tests {
 
         let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
         let mut engine = L34Engine::new(L34Config {
-            mode: L4Mode::Udp,
+            modes: vec![L4Mode::Udp],
             ports: PortSet::parse(&spec, PortOrder::Random).expect("spec parses"),
             payload_size: 16,
             concurrency: DEFAULT_CONCURRENCY,
