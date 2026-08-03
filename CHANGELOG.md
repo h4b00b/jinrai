@@ -14,6 +14,81 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-08-03
+
+Multi-vector L3/L4 runs. The primitives were all there; what was missing was
+running them **at the same time**, which is how a test plan asks for them
+("UDP MultiVector", "UDP/TCP/ICMP Multivectors"). So `--l4-mode` became
+repeatable, and nothing else had to be invented.
+
+### Added
+
+- **`--l4-mode` is repeatable.** Each occurrence adds a vector; they run
+  concurrently against the same targets, one thread each. A thread per vector
+  rather than one interleaved loop because each primitive already owns blocking
+  state — a connect pool, a raw socket, a data-flood connection table — and
+  interleaving them would let the slowest (a `data` write blocking on a full
+  buffer) set the pace for the packet floods beside it, which is the opposite of
+  what running them together is supposed to show.
+- They share everything that bounds a run: one `--duration`, one kill-switch
+  (Ctrl-C and the watchdog stop all of them), one audit record, one summary.
+- Mixing ICMP with a port mode is allowed; `--port` is then still required, for
+  the vectors that address one. An all-ICMP run reports as L3, a mixed run as L4
+  — calling a run that floods a port "L3" because one vector is ICMP would
+  understate it.
+- `RateCap::split_across(n)` and `ErrnoTally::absorb` in `core`.
+
+### Security
+
+- **The `--rate` ceiling is shared between vectors, not applied per vector.**
+  Three vectors at `--rate 6000` emit 2000/s *each*. The alternative would make
+  `--rate` mean `--rate` × the vector count, so the number the operator typed,
+  acknowledged with `--ack-lab`, and had written to the audit log would be a
+  fraction of the traffic actually sent — and a safety ceiling that multiplies
+  behind the operator's back is not a ceiling. The split's shares sum to the cap
+  exactly (the remainder is spread one unit at a time, never rounded up), which
+  is asserted over a grid of rates and vector counts.
+- A `--rate` too small to split (fewer units/s than vectors) is **refused**
+  rather than rounding a vector to 0/s. A vector the operator asked for that runs
+  and sends nothing is the hollow-run shape 0.36.0 spent a release removing.
+  `--rate 0` stays the deliberate whole-run no-op it always was.
+- **Preflight checks every vector, not just the leading one.** A multi-vector run
+  that preflighted only its first mode would pass, start, and then fail every raw
+  packet — partial success reported for a `CAP_NET_RAW` problem the operator
+  could have been told about before any traffic. Same for the IPv6 refusal: one
+  IPv6-incapable vector refuses the run, because a run that quietly drops a
+  vector is not the run that was described.
+- Repeating the same mode is refused: two identical vectors are one vector at the
+  same total rate, so it is always a typo.
+
+### Changed
+
+- `L34Config.mode: L4Mode` became `modes: Vec<L4Mode>`; `L34Engine::run` is now a
+  dispatcher over a per-vector `run_vector`, so the single-vector path is
+  byte-for-byte the loop it always was.
+- The summary reports the total **and** a per-vector breakdown through the
+  existing `of which` row — one total cannot tell "both vectors landed" from "one
+  did all the work". The notes line says how many vectors share the ceiling, so a
+  per-vector count does not read as a shortfall against the full `--rate`.
+- The `bound by concurrency` note is single-vector only: it describes one pool
+  pacing one send loop, and applying it to a run whose other vectors are packet
+  floods would blame a ceiling that never touched them.
+- Run label and audit records name the vector list
+  (`multi-vector [udp-flood + tcp-connect-flood]`).
+
+**This is not Phase 8.** Declarative scenario files and multi-*source*
+orchestration are still open; this is the multi-vector shape, which turned out
+not to need either.
+
+### Verified
+
+Live on loopback with a UDP and a TCP listener counting what actually arrived.
+Single vector, `--rate 2000` for 3s: 6000 datagrams. Two vectors, same ceiling:
+**6000 total, split exactly 3000 UDP / 3000 TCP** — the shared ceiling holds on
+the wire, and an unshared one would have landed near 12 000. A three-vector dry
+run (udp + tcp + data) over a random port range across two targets prints the
+whole plan. Suite 297 green, clippy clean.
+
 ## [0.38.0] — 2026-08-03
 
 The L7 counterpart to 0.37.0's port sets. The fast flood sent one identical
@@ -1792,7 +1867,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.39.0...HEAD
+[0.39.0]: https://github.com/h4b00b/jinrai/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/h4b00b/jinrai/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/h4b00b/jinrai/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/h4b00b/jinrai/compare/v0.35.0...v0.36.0

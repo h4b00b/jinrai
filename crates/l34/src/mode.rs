@@ -249,7 +249,16 @@ impl L4Mode {
 /// Runtime configuration for an L3/L4 run.
 #[derive(Debug, Clone)]
 pub struct L34Config {
-    pub mode: L4Mode,
+    /// The primitive(s) this run drives. More than one means a **multi-vector**
+    /// run: they are emitted concurrently against the same targets, sharing the
+    /// one `--rate` ceiling between them (see [`RateCap::split_across`]).
+    ///
+    /// A `Vec` rather than a single mode because the multi-vector shapes a test
+    /// plan asks for — "UDP MultiVector", "UDP/TCP/ICMP Multivectors" — are not
+    /// a new primitive, they are the existing ones running at the same time.
+    ///
+    /// Never empty; [`L34Config::primary`] is the mode that names the run.
+    pub modes: Vec<L4Mode>,
     /// Destination port(s). A one-port set is the ordinary single-service test;
     /// a range or list is what the random-port and carpet-bombing shapes need.
     /// The ICMP modes are portless and carry an unused single set.
@@ -290,6 +299,45 @@ impl L34Config {
     /// to 1 rather than silently disabling the mode.
     pub fn effective_concurrency(&self) -> usize {
         self.concurrency.max(1)
+    }
+
+    /// The mode that names the run: the first, which for a single-vector run is
+    /// the only one. Falls back to `Udp` for the empty `modes` a caller should
+    /// not be able to build — a default beats a panic in a tool whose contract
+    /// is that a primitive which cannot start says so and returns.
+    pub fn primary(&self) -> L4Mode {
+        self.modes.first().copied().unwrap_or(L4Mode::Udp)
+    }
+
+    /// Whether this run drives more than one primitive at once.
+    pub fn is_multi_vector(&self) -> bool {
+        self.modes.len() > 1
+    }
+
+    /// Which OSI layer the run reports as. A run whose vectors are *all* ICMP is
+    /// L3; anything else is L4, including a mix — the L4 claim is the stronger
+    /// one, and calling a UDP+ICMP run "L3" would understate it.
+    pub fn layer(&self) -> Layer {
+        if !self.modes.is_empty() && self.modes.iter().all(|m| m.layer() == Layer::L3) {
+            Layer::L3
+        } else {
+            Layer::L4
+        }
+    }
+
+    /// How the run names itself: the single mode's label, or a joined list for a
+    /// multi-vector run. The list is spelled out rather than counted — "3
+    /// vectors" in a summary tells a reader nothing about what was sent.
+    pub fn label(&self) -> String {
+        match self.modes.as_slice() {
+            [one] => one.label().to_string(),
+            many => {
+                format!(
+                    "multi-vector [{}]",
+                    many.iter().map(|m| m.label()).collect::<Vec<_>>().join(" + ")
+                )
+            }
+        }
     }
 }
 

@@ -84,7 +84,16 @@ OPTIONS:
     --layer <l3|l4|l7>    Module to run (default: l7). l3 and l4 are the same
                           module — the ICMP modes report as L3, the rest as L4 —
                           so either spelling selects it.
-    --l4-mode <MODE>      L3/L4 primitive (default: udp). One of:
+    --l4-mode <MODE>      L3/L4 primitive (default: udp). REPEATABLE: give it more
+                          than once and the primitives run CONCURRENTLY against
+                          the same targets — a multi-vector run. They share the
+                          one --rate ceiling (it is split evenly between them, so
+                          three vectors at --rate 6000 emit 2000/s each, not
+                          6000/s each), share --duration, stop together on Ctrl-C
+                          or watchdog, and the summary reports the total plus a
+                          per-vector breakdown. Mixing ICMP with a port mode is
+                          allowed: --port is then still required, for the vectors
+                          that address one. One of:
                             udp | tcp | data     no privilege needed (data =
                                                  PSH-ACK data flood: real OS
                                                  connections filled with app data;
@@ -443,7 +452,9 @@ struct Args {
     request_timeout_ms: u64,
     drain_timeout_ms: u64,
     layer: Layer,
-    l4_mode: L4Mode,
+    /// The L3/L4 primitive(s) to drive. More than one is a multi-vector run:
+    /// they run concurrently and share the one --rate ceiling. Never empty.
+    l4_modes: Vec<L4Mode>,
     /// The `--port` spec as typed (single port, list, or ranges), kept as a
     /// string so the run's audit record and error messages quote what the
     /// operator wrote. Validated at parse time; turned into a `PortSet` once
@@ -1193,6 +1204,9 @@ fn run_l4(
         )?);
     }
     // ICMP is portless; every other mode targets a port (or a set of them).
+    // A run is portless only if every vector is: one non-ICMP vector in the list
+    // means the run addresses a port.
+    let portless = args.l4_modes.iter().all(|m| m.is_icmp());
     let ports = match args.port.as_deref() {
         Some(spec) => match PortSet::parse(spec, args.port_order) {
             Ok(set) => set,
@@ -1202,12 +1216,14 @@ fn run_l4(
             // set decides where packets go.
             Err(e) => return Err(audit_refusal(&mut audit, "arguments", &e)?),
         },
-        None if args.l4_mode.is_icmp() => PortSet::single(0),
+        // Portless only when EVERY vector is ICMP. A mixed run still needs a
+        // port for the vectors that address one.
+        None if portless => PortSet::single(0),
         None => {
             return Err(audit_refusal(
                 &mut audit,
                 "arguments",
-                "--layer l3/l4 requires --port <SPEC> (except the icmp* modes)",
+                "--layer l3/l4 requires --port <SPEC> (except when every --l4-mode is icmp*)",
             )?)
         }
     };
@@ -1215,7 +1231,7 @@ fn run_l4(
     // the summary note, and the dry-run print.
     let port_label = ports.label();
     let dry_run_ports =
-        if args.l4_mode.is_icmp() { None } else { Some(("destination", port_label.clone())) };
+        if portless { None } else { Some(("destination", port_label.clone())) };
 
     let authorized = match gate.authorize_all(args.targets.iter().copied()) {
         Ok(t) => t,
@@ -1239,7 +1255,7 @@ fn run_l4(
 
     let plan = RunPlan { targets: authorized, rate_cap, duration, kill };
     let mut module = L34Engine::new(L34Config {
-        mode: args.l4_mode,
+        modes: args.l4_modes.clone(),
         ports,
         payload_size: args.payload_size,
         concurrency: args.concurrency,
@@ -1251,7 +1267,7 @@ fn run_l4(
     // may now span a whole range, so "which primitive ran" is not fully answered
     // without it, and the pre-traffic record is the only one a refused or aborted
     // run leaves behind. (The completion record carries it inside `layer_label`.)
-    let audited_mode = if args.l4_mode.is_icmp() {
+    let audited_mode = if portless {
         module.name().to_string()
     } else {
         format!("{} on {}", module.name(), port_label)
@@ -1295,15 +1311,26 @@ fn run_l4(
     };
     let elapsed = started.elapsed();
 
-    let mut notes = if args.l4_mode.is_icmp() {
-        Vec::new() // ICMP is portless
+    let mut notes = if portless {
+        Vec::new() // every vector is ICMP, which carries no port
     } else {
         vec![port_label.clone()]
     };
+    // A multi-vector run splits the ceiling; saying so is what keeps a per-vector
+    // count from reading as a shortfall against the full --rate.
+    if args.l4_modes.len() > 1 {
+        notes.push(format!(
+            "{} vectors sharing the {}/s ceiling",
+            args.l4_modes.len(),
+            args.rate
+        ));
+    }
     // Only the connection-holding modes are bounded by --concurrency; restating it
-    // for a stateless flood would suggest a limit that does not exist.
-    if matches!(args.l4_mode, L4Mode::TcpConnect | L4Mode::Data) {
-        notes.push(format!("max {} sockets open at once", args.concurrency));
+    // for a stateless flood would suggest a limit that does not exist. In a
+    // multi-vector run the cap applies to each such vector separately, because
+    // each has its own pool.
+    if args.l4_modes.iter().any(|m| matches!(m, L4Mode::TcpConnect | L4Mode::Data)) {
+        notes.push(format!("max {} sockets open at once per vector", args.concurrency));
     }
     report_run(
         args,
@@ -1323,8 +1350,13 @@ fn run_l4(
             // Report the ceiling that actually applied: the pool clamps
             // simultaneous handshakes, so a larger --concurrency than that buys
             // sockets, not offered load, and the note must not imply otherwise.
-            concurrency: match args.l4_mode {
-                L4Mode::TcpConnect => Some(jinrai_l34::effective_parallelism(args.concurrency)),
+            // Single-vector only: the bound describes one pool pacing one send
+            // loop, and applying it to a run whose other vectors are packet
+            // floods would blame a ceiling that never touched them.
+            concurrency: match args.l4_modes.as_slice() {
+                [L4Mode::TcpConnect] => {
+                    Some(jinrai_l34::effective_parallelism(args.concurrency))
+                }
                 _ => None,
             },
         },
@@ -1392,7 +1424,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut request_timeout_ms = jinrai_l7::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64;
     let mut drain_timeout_ms = jinrai_l7::DEFAULT_DRAIN_GRACE.as_millis() as u64;
     let mut layer = Layer::L7;
-    let mut l4_mode = L4Mode::Udp;
+    let mut l4_modes: Vec<L4Mode> = Vec::new();
     let mut port: Option<String> = None;
     let mut port_order = PortOrder::default();
     let mut payload_size = 64usize;
@@ -1544,7 +1576,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 drain_timeout_ms = parse_capped(&mut it, "--drain-timeout-ms", MAX_TIMEOUT_MS)?;
             }
             "--l4-mode" => {
-                l4_mode = match next_val(&mut it, "--l4-mode")?.as_str() {
+                let parsed = match next_val(&mut it, "--l4-mode")?.as_str() {
                     "udp" => L4Mode::Udp,
                     "tcp" => L4Mode::TcpConnect,
                     "syn" => L4Mode::Syn,
@@ -1572,7 +1604,18 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                               icmp-address-mask)"
                         ))
                     }
+                };
+                // Repeatable: each occurrence adds a vector to a multi-vector
+                // run. The same mode twice would be two identical vectors
+                // sharing the rate — indistinguishable from one vector at the
+                // full rate, and never what an operator meant to type.
+                if l4_modes.contains(&parsed) {
+                    return Err(format!(
+                        "--l4-mode {parsed:?} given twice: repeating it adds a vector, and \
+                         two identical vectors are one vector at the same total rate"
+                    ));
                 }
+                l4_modes.push(parsed);
             }
             "--port" => {
                 // Parsed here only to reject a malformed spec at argument time;
@@ -1741,6 +1784,23 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             wrong_layer.iter().chain(SHAPING_FLAGS.iter()).copied().collect()
         }
     };
+    // Default when the flag never appeared. Kept here rather than as the
+    // initial value so "given twice" can be told from "given once".
+    let l4_modes = if l4_modes.is_empty() { vec![L4Mode::Udp] } else { l4_modes };
+    // A multi-vector run splits `--rate` between its vectors, so a cap smaller
+    // than the vector count would round some vector to zero — a vector the
+    // operator asked for that sends nothing and says so only in a detail line.
+    // Refuse instead. (`--rate 0` stays the deliberate whole-run no-op it is.)
+    if l4_modes.len() > 1 && rate > 0 && rate < l4_modes.len() as u64 {
+        return Err(format!(
+            "--rate {rate} cannot be split across {} vectors: the ceiling is shared, not \
+             per-vector, so at least one vector would be allocated 0/s. Raise --rate to at \
+             least {}.",
+            l4_modes.len(),
+            l4_modes.len()
+        ));
+    }
+
     // The request-variation flags. Each contradiction below is two flags giving
     // opposite instructions about what a request should contain; picking a
     // winner would run something the operator did not ask for.
@@ -1825,7 +1885,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         request_timeout_ms,
         drain_timeout_ms,
         layer,
-        l4_mode,
+        l4_modes,
         port,
         port_order,
         payload_size,
@@ -1852,7 +1912,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
 }
 
 /// The flags whose whole point is being given more than once.
-const REPEATABLE_FLAGS: &[&str] = &["--allow", "--target", "--header"];
+const REPEATABLE_FLAGS: &[&str] = &["--allow", "--target", "--header", "--l4-mode"];
 
 /// The flags that shape each individual request. Only the fast get/post/head
 /// flood builds requests one at a time, so anywhere else they are a no-op and
@@ -2220,7 +2280,7 @@ mod tests {
         assert!(matches!(args_of(&["--allow", "1.2.3.4", "--layer", "l3"]).layer, Layer::L3));
         assert!(USAGE.contains("--layer <l3|l4|l7>"), "help must document the l3 spelling");
         let a = args_of(&["--allow", "1.2.3.4", "--l4-mode", "icmp-timestamp"]);
-        assert!(matches!(a.l4_mode, L4Mode::IcmpTimestamp));
+        assert_eq!(a.l4_modes, vec![L4Mode::IcmpTimestamp]);
         // Every raw-TCP flag mode the help text lists must actually parse — a mode
         // documented but not wired is indistinguishable, to an operator, from one
         // that "doesn't work".
@@ -2240,7 +2300,7 @@ mod tests {
             ("tcp-options", L4Mode::TcpOptions),
         ] {
             let a = args_of(&["--allow", "1.2.3.4", "--l4-mode", spelling]);
-            assert_eq!(a.l4_mode, expected, "--l4-mode {spelling}");
+            assert_eq!(a.l4_modes, vec![expected], "--l4-mode {spelling}");
             assert!(USAGE.contains(spelling), "help must document --l4-mode {spelling}");
         }
     }
@@ -2290,6 +2350,37 @@ mod tests {
             argv.extend(["--port", spec]);
             assert_eq!(args_of(&argv).port.as_deref(), Some(spec));
         }
+    }
+
+    /// `--l4-mode` repeats into a multi-vector run, and the ceiling is shared.
+    /// A `--rate` too small to split would leave a vector the operator asked for
+    /// allocated 0/s — a vector that runs, sends nothing, and mentions it only
+    /// in a detail line.
+    #[test]
+    fn repeated_l4_modes_build_a_multi_vector_run_the_rate_can_actually_feed() {
+        let base = ["--allow", "10.0.0.0/8", "--layer", "l4", "--target", "10.1.2.3", "--port", "9"];
+
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--l4-mode", "udp", "--l4-mode", "syn", "--l4-mode", "icmp"]);
+        let a = args_of(&argv);
+        assert_eq!(a.l4_modes, vec![L4Mode::Udp, L4Mode::Syn, L4Mode::Icmp]);
+
+        // The same vector twice is one vector at the same total rate.
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--l4-mode", "udp", "--l4-mode", "udp"]);
+        let err = parse(&argv).expect_err("a repeated mode must be refused");
+        assert!(err.contains("given twice"), "{err}");
+
+        // Three vectors need at least 3/s to each get a share.
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--l4-mode", "udp", "--l4-mode", "syn", "--l4-mode", "icmp", "--rate", "2"]);
+        let err = parse(&argv).expect_err("a rate too small to split must be refused");
+        assert!(err.contains("--rate"), "{err}");
+
+        // And --rate 0 stays the deliberate whole-run no-op it always was.
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend(["--l4-mode", "udp", "--l4-mode", "syn", "--rate", "0"]);
+        assert!(parse(&argv).is_ok(), "--rate 0 is a no-op, not an error");
     }
 
     /// Two flags that both decide what a request contains. Picking a winner
