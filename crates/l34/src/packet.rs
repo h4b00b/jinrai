@@ -19,6 +19,12 @@
 //! * **ICMP** ([`build_icmp_query`]) crafts only the ICMP message; the kernel
 //!   prepends the IPv4 header, so the source is the real one by construction and
 //!   is not expressible here at all.
+//! * **Fragments and GRE** ([`build_udp_fragments`], [`build_tcp_fragments`],
+//!   [`build_gre_packet`]) craft whole IPv4 packets like the raw-TCP path, and
+//!   take the same single source argument from the same single producer. The GRE
+//!   builder is the one place an address could be written *inside* a payload,
+//!   where no kernel would ever check it — so the packet it encapsulates carries
+//!   the host's own address too, not a chosen one.
 //!
 //! There is no reflection or amplification capability, and the ICMP builder emits
 //! only *query* messages the target answers directly — never error, redirect or
@@ -33,6 +39,21 @@ use crate::L34Error;
 /// `IPPROTO_RAW` — send-only raw IPv4 socket; the kernel takes our IP header
 /// verbatim (IP_HDRINCL is implied), so we craft the whole IPv4+TCP packet.
 pub(crate) const IPPROTO_RAW: i32 = 255;
+
+/// GRE (RFC 2784) is IP protocol 47.
+pub(crate) const IPPROTO_GRE: u8 = 47;
+
+/// IPv4 fragment offsets are counted in 8-byte blocks, so every fragment but the
+/// last must carry a length that is a multiple of 8.
+const FRAG_BLOCK: usize = 8;
+
+/// The fixed UDP header length — where a fragmented UDP datagram is cut.
+const UDP_HEADER_LEN: usize = 8;
+
+/// The 4-byte GRE header of a version-0 packet carrying no optional fields:
+/// flags and version all zero (no checksum, no key, no sequence number), then
+/// the EtherType of what is encapsulated — `0x0800`, IPv4.
+const GRE_HEADER: [u8; 4] = [0x00, 0x00, 0x08, 0x00];
 
 /// Ask the OS which local IPv4 address routes to `dst` by connecting a UDP
 /// socket (no packets are sent) and reading its local address. This is the real
@@ -148,6 +169,166 @@ pub(crate) fn build_tcp_options_syn(
     b.write(&mut out, &[])
         .map_err(|e| L34Error::Build(e.to_string()))?;
     Ok(out)
+}
+
+/// Drop the IPv4 header off a packet a builder just produced, leaving the L4
+/// bytes. The length comes from the IHL field rather than being assumed to be 20,
+/// so a builder that one day emits IP options cannot silently shift the split.
+fn ipv4_payload(packet: &[u8]) -> &[u8] {
+    match packet.first() {
+        Some(first) => {
+            let ihl = ((first & 0x0f) as usize) * 4;
+            &packet[ihl.min(packet.len())..]
+        }
+        None => packet,
+    }
+}
+
+/// Split one datagram's already-checksummed L4 bytes into IPv4 fragments.
+///
+/// The cut rule is what makes this a *test* rather than an accident of MTU: the
+/// datagram is cut at every 8-byte boundary **inside its L4 header**, and
+/// whatever is left becomes the final fragment. So the first fragment carries
+/// only part of the transport header — a fragmented TCP SYN puts its ports in
+/// fragment 0 and its *flags* in fragment 1 — and nothing on the path can read
+/// the ports, the flags, or the payload without holding the pieces and
+/// reassembling them. That reassembly state, per datagram, for as long as the
+/// target's fragment timeout, is the load being offered.
+///
+/// The source address is the caller's real one, exactly as in
+/// [`build_tcp_packet`]; fragmentation changes what a packet is cut into, never
+/// who it claims to be from.
+fn build_ipv4_fragments(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: etherparse::IpNumber,
+    inner: &[u8],
+    l4_header_len: usize,
+    id: u16,
+) -> Result<Vec<Vec<u8>>, L34Error> {
+    use etherparse::{IpFragOffset, Ipv4Header};
+
+    let mut cuts = Vec::new();
+    let mut at = FRAG_BLOCK;
+    while at <= l4_header_len && at < inner.len() {
+        cuts.push(at);
+        at += FRAG_BLOCK;
+    }
+
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0usize;
+    for end in cuts.into_iter().chain(std::iter::once(inner.len())) {
+        let chunk = &inner[start..end];
+        let len = u16::try_from(chunk.len())
+            .map_err(|_| L34Error::Build("fragment longer than an IPv4 payload".into()))?;
+        let mut header = Ipv4Header::new(len, 64, protocol, src.octets(), dst.octets())
+            .map_err(|e| L34Error::Build(e.to_string()))?;
+        // One identification value per datagram. Without it every fragment of
+        // every unit would claim to belong to the *same* datagram, and the target
+        // would keep overwriting one reassembly entry instead of accumulating the
+        // many this is meant to make it hold.
+        header.identification = id;
+        header.dont_fragment = false;
+        header.more_fragments = end < inner.len();
+        header.fragment_offset = IpFragOffset::try_new((start / FRAG_BLOCK) as u16)
+            .map_err(|e| L34Error::Build(e.to_string()))?;
+        let mut pkt = Vec::with_capacity(Ipv4Header::MIN_LEN + chunk.len());
+        // `write` recomputes the header checksum, which has to happen *after* the
+        // fragment fields are set — they are covered by it.
+        header.write(&mut pkt).map_err(|e| L34Error::Build(e.to_string()))?;
+        pkt.extend_from_slice(chunk);
+        out.push(pkt);
+        start = end;
+    }
+    Ok(out)
+}
+
+/// Build the IPv4 fragments of one UDP datagram: the 8-byte UDP header in
+/// fragment 0, the payload in fragment 1. The UDP checksum is computed over the
+/// whole datagram before it is cut, so the pieces only verify once reassembled.
+pub(crate) fn build_udp_fragments(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    id: u16,
+) -> Result<Vec<Vec<u8>>, L34Error> {
+    use etherparse::{IpNumber, PacketBuilder};
+    let b = PacketBuilder::ipv4(src.octets(), dst.octets(), 64).udp(src_port, dst_port);
+    let mut whole = Vec::with_capacity(b.size(payload.len()));
+    b.write(&mut whole, payload)
+        .map_err(|e| L34Error::Build(e.to_string()))?;
+    build_ipv4_fragments(src, dst, IpNumber::UDP, ipv4_payload(&whole), UDP_HEADER_LEN, id)
+}
+
+/// Build the IPv4 fragments of one TCP segment — a SYN, so the target must decide
+/// whether to open a connection it can only see after reassembly. A 20-byte TCP
+/// header cut on 8-byte boundaries gives three fragments (8 + 8 + 4): ports in
+/// the first, control flags in the second.
+pub(crate) fn build_tcp_fragments(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    flags: TcpFlags,
+    id: u16,
+) -> Result<Vec<Vec<u8>>, L34Error> {
+    use etherparse::IpNumber;
+    let whole = build_tcp_packet(src, dst, src_port, dst_port, seq, flags)?;
+    let inner = ipv4_payload(&whole);
+    // Data offset (high nibble of byte 12) in 4-byte words. The segment built
+    // above carries no options, so this is 20 — read rather than assumed so the
+    // cut still lands inside the header if that ever changes.
+    let header_len = inner.get(12).map_or(20, |b| ((b >> 4) as usize) * 4);
+    build_ipv4_fragments(src, dst, IpNumber::TCP, inner, header_len, id)
+}
+
+/// Build one GRE (RFC 2784) packet: an IPv4 header with protocol 47, the 4-byte
+/// version-0 GRE header, and an encapsulated IPv4/UDP datagram.
+///
+/// What this tests is the decapsulation path — a router, firewall or tunnel
+/// endpoint that accepts protocol 47 has to recognise it, strip the outer header,
+/// and hand an inner packet to the IP stack a second time, which is roughly twice
+/// the per-packet work of the flood that carries it.
+///
+/// The encapsulated datagram is addressed from the same real source to the same
+/// target. A GRE payload is the one place a source address could be written where
+/// no kernel would validate it, and this builder deliberately has no argument
+/// with which to write a different one.
+pub(crate) fn build_gre_packet(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    id: u16,
+) -> Result<Vec<u8>, L34Error> {
+    use etherparse::{IpNumber, Ipv4Header, PacketBuilder};
+    let b = PacketBuilder::ipv4(src.octets(), dst.octets(), 64).udp(src_port, dst_port);
+    let mut inner = Vec::with_capacity(b.size(payload.len()));
+    b.write(&mut inner, payload)
+        .map_err(|e| L34Error::Build(e.to_string()))?;
+
+    let body_len = u16::try_from(GRE_HEADER.len() + inner.len())
+        .map_err(|_| L34Error::Build("GRE packet longer than an IPv4 payload".into()))?;
+    let mut header = Ipv4Header::new(
+        body_len,
+        64,
+        IpNumber(IPPROTO_GRE),
+        src.octets(),
+        dst.octets(),
+    )
+    .map_err(|e| L34Error::Build(e.to_string()))?;
+    header.identification = id;
+    header.dont_fragment = false;
+
+    let mut pkt = Vec::with_capacity(Ipv4Header::MIN_LEN + body_len as usize);
+    header.write(&mut pkt).map_err(|e| L34Error::Build(e.to_string()))?;
+    pkt.extend_from_slice(&GRE_HEADER);
+    pkt.extend_from_slice(&inner);
+    Ok(pkt)
 }
 
 /// Build an ICMPv4 query-request message (echo / timestamp / address-mask) with
@@ -400,6 +581,146 @@ mod tests {
         let (_, tcp) = parse_tcp(&plain);
         assert_eq!(tcp.options.as_slice().len(), 0, "the flag floods carry no options");
         assert_eq!(tcp.data_offset(), 5, "minimum data offset when there are no options");
+    }
+
+    /// Parse a fragment into its IPv4 header and the bytes it carries.
+    fn parse_frag(pkt: &[u8]) -> (etherparse::Ipv4Header, &[u8]) {
+        etherparse::Ipv4Header::from_slice(pkt).expect("parse IPv4 header")
+    }
+
+    /// The whole point of the mode: the pieces are a datagram nobody on the path
+    /// can read without holding all of them. So the offsets have to chain, the
+    /// MF bit has to be set on all but the last, the identification has to be
+    /// shared, and gluing them back together has to reproduce the original UDP
+    /// datagram byte for byte.
+    #[test]
+    fn udp_fragments_chain_into_one_reassemblable_datagram() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let payload = [0xABu8; 64];
+        let frags = build_udp_fragments(src, dst, 40000, 53, &payload, 0x4242).unwrap();
+
+        assert_eq!(frags.len(), 2, "UDP header, then payload");
+        let mut reassembled = Vec::new();
+        for (i, frag) in frags.iter().enumerate() {
+            let (h, body) = parse_frag(frag);
+            assert_eq!(h.protocol, etherparse::IpNumber::UDP);
+            assert_eq!(h.source, src.octets(), "real source on every fragment");
+            assert_eq!(h.identification, 0x4242, "one id per datagram");
+            assert!(!h.dont_fragment, "DF must be clear on a fragment");
+            assert_eq!(
+                h.fragment_offset.value() as usize * FRAG_BLOCK,
+                reassembled.len(),
+                "fragment {i} must start where the previous one ended"
+            );
+            assert_eq!(h.more_fragments, i + 1 < frags.len(), "MF on all but the last");
+            reassembled.extend_from_slice(body);
+        }
+        assert_eq!(reassembled.len(), UDP_HEADER_LEN + payload.len());
+        assert_eq!(&reassembled[UDP_HEADER_LEN..], &payload, "payload survives the cut");
+        assert_eq!(
+            u16::from_be_bytes([reassembled[2], reassembled[3]]),
+            53,
+            "the destination port is only readable after reassembly"
+        );
+    }
+
+    /// A fragmented SYN's *flags* live past the first 8 bytes of the TCP header,
+    /// so fragment 0 carries the ports and nothing that says what the segment is.
+    #[test]
+    fn tcp_fragments_split_the_header_so_the_flags_are_not_in_the_first_fragment() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let syn = TcpFlags { syn: true, ..TcpFlags::NONE };
+        let frags = build_tcp_fragments(src, dst, 40000, 443, 99, syn, 7).unwrap();
+
+        assert_eq!(frags.len(), 3, "a 20-byte TCP header cuts into 8 + 8 + 4");
+        let (_, first) = parse_frag(&frags[0]);
+        assert_eq!(first.len(), FRAG_BLOCK, "fragment 0 is one 8-byte block");
+        assert_eq!(u16::from_be_bytes([first[2], first[3]]), 443, "ports are in fragment 0");
+
+        let mut reassembled = Vec::new();
+        for (i, frag) in frags.iter().enumerate() {
+            let (h, body) = parse_frag(frag);
+            assert_eq!(h.protocol, etherparse::IpNumber::TCP);
+            assert_eq!(h.identification, 7);
+            assert_eq!(h.more_fragments, i + 1 < frags.len());
+            reassembled.extend_from_slice(body);
+        }
+        assert_eq!(reassembled.len(), 20, "the whole segment is on the wire, in pieces");
+        // Byte 13 holds the control bits; it is in fragment 1, not fragment 0.
+        assert_eq!(reassembled[13] & 0x02, 0x02, "SYN is set once reassembled");
+        let (_, second) = parse_frag(&frags[1]);
+        assert_eq!(second[5] & 0x02, 0x02, "and it arrives in the second fragment");
+    }
+
+    /// Same guarantee as the unfragmented builders: the source is carried
+    /// verbatim, on every fragment, with no other producer of the value.
+    #[test]
+    fn every_fragment_carries_the_supplied_source_address() {
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        for src in ["10.0.0.1", "192.0.2.55", "127.0.0.1"] {
+            let src: Ipv4Addr = src.parse().unwrap();
+            let syn = TcpFlags { syn: true, ..TcpFlags::NONE };
+            let frags = build_tcp_fragments(src, dst, 1, 2, 3, syn, 1)
+                .unwrap()
+                .into_iter()
+                .chain(build_udp_fragments(src, dst, 1, 2, &[0u8; 16], 1).unwrap());
+            for frag in frags {
+                let (h, _) = parse_frag(&frag);
+                assert_eq!(h.source, src.octets(), "source must be carried verbatim");
+            }
+        }
+    }
+
+    /// The summary's "1 unit = N fragments" note is a constant in `mode`, and the
+    /// number of fragments is a property of the cut rule here. This is the seam
+    /// that holds the two together, across the payload sizes a run can ask for.
+    #[test]
+    fn fragment_counts_match_the_builder() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let syn = TcpFlags { syn: true, ..TcpFlags::NONE };
+        for size in [1usize, 8, 64, 1472] {
+            let payload = vec![0u8; size];
+            assert_eq!(
+                build_udp_fragments(src, dst, 1, 2, &payload, 1).unwrap().len(),
+                L4Mode::UdpFrag.packets_per_unit(),
+                "udp payload {size}"
+            );
+        }
+        assert_eq!(
+            build_tcp_fragments(src, dst, 1, 2, 3, syn, 1).unwrap().len(),
+            L4Mode::TcpFrag.packets_per_unit()
+        );
+    }
+
+    /// A GRE packet is protocol 47 carrying a version-0 header and a *real* inner
+    /// IPv4 packet — including an inner source address that is the host's own, the
+    /// one place a payload could have carried a chosen one.
+    #[test]
+    fn gre_packet_is_protocol_47_around_an_inner_packet_with_the_same_real_source() {
+        let src: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let dst: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let pkt = build_gre_packet(src, dst, 40000, 4789, &[0x5Au8; 32], 0x1111).unwrap();
+
+        let (outer, body) = parse_frag(&pkt);
+        assert_eq!(outer.protocol, etherparse::IpNumber(IPPROTO_GRE), "IP protocol 47");
+        assert_eq!(outer.source, src.octets());
+        assert_eq!(outer.destination, dst.octets());
+        assert!(!outer.more_fragments, "a GRE packet is not itself fragmented");
+
+        assert_eq!(&body[..4], &GRE_HEADER, "version-0 GRE header, EtherType IPv4");
+        let (inner, inner_body) = parse_frag(&body[4..]);
+        assert_eq!(inner.protocol, etherparse::IpNumber::UDP, "an IPv4/UDP datagram inside");
+        assert_eq!(inner.source, src.octets(), "the encapsulated source is ours too");
+        assert_eq!(inner.destination, dst.octets());
+        assert_eq!(
+            u16::from_be_bytes([inner_body[2], inner_body[3]]),
+            4789,
+            "the inner datagram addresses the run's port"
+        );
+        assert_eq!(inner_body.len(), UDP_HEADER_LEN + 32);
     }
 
     /// One's-complement sum of a whole ICMP message must be 0xFFFF for the

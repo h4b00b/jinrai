@@ -82,8 +82,9 @@ REQUIRED FOR ANY RUN THAT EMITS TRAFFIC:
 
 OPTIONS:
     --layer <l3|l4|l7>    Module to run (default: l7). l3 and l4 are the same
-                          module — the ICMP modes report as L3, the rest as L4 —
-                          so either spelling selects it.
+                          module — the ICMP, fragmentation and GRE modes report as
+                          L3 (they exercise the target's IP layer), the rest as L4
+                          — so either spelling selects it.
     --l4-mode <MODE>      L3/L4 primitive (default: udp). REPEATABLE: give it more
                           than once and the primitives run CONCURRENTLY against
                           the same targets — a multi-vector run. They share the
@@ -124,6 +125,25 @@ OPTIONS:
                                                  NOP-padded) — stresses the target's
                                                  option parser / SACK+timestamp
                                                  state (same raw-socket constraints)
+                            udp-frag | tcp-frag  L3 IP-fragmentation floods: one unit
+                                                 is one datagram cut into IPv4
+                                                 fragments, so the target must hold
+                                                 reassembly state per unit and cannot
+                                                 read the ports (udp-frag) or the SYN's
+                                                 control flags (tcp-frag) until every
+                                                 piece has arrived. 2 and 3 packets per
+                                                 unit respectively — the summary says
+                                                 so. Combine with --port-order random
+                                                 for the fragmentation+random-ports
+                                                 shape (same raw-socket constraints)
+                            gre                  L3 GRE flood (IP protocol 47) wrapping
+                                                 a real IPv4/UDP datagram — exercises a
+                                                 target's decapsulation path, which
+                                                 re-enters the IP stack once per packet.
+                                                 --port sets the encapsulated
+                                                 destination port; the inner packet
+                                                 carries the host's real source address
+                                                 too (same raw-socket constraints)
                             icmp | icmp-timestamp | icmp-address-mask
                                                  L3 ICMPv4 query floods (echo type 8,
                                                  timestamp type 13, address-mask
@@ -1596,12 +1616,15 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     "icmp" => L4Mode::Icmp,
                     "icmp-timestamp" => L4Mode::IcmpTimestamp,
                     "icmp-address-mask" => L4Mode::IcmpAddressMask,
+                    "udp-frag" => L4Mode::UdpFrag,
+                    "tcp-frag" => L4Mode::TcpFrag,
+                    "gre" => L4Mode::Gre,
                     other => {
                         return Err(format!(
                             "unknown --l4-mode: {other} \
                              (want udp|tcp|syn|ack|fin|rst|urg|cwr|ece|syn-ack|syn-fin|\
-                              syn-rst|xmas|null|data|tcp-options|icmp|icmp-timestamp|\
-                              icmp-address-mask)"
+                              syn-rst|xmas|null|data|tcp-options|udp-frag|tcp-frag|gre|\
+                              icmp|icmp-timestamp|icmp-address-mask)"
                         ))
                     }
                 };
@@ -2298,6 +2321,9 @@ mod tests {
             ("xmas", L4Mode::Xmas),
             ("null", L4Mode::Null),
             ("tcp-options", L4Mode::TcpOptions),
+            ("udp-frag", L4Mode::UdpFrag),
+            ("tcp-frag", L4Mode::TcpFrag),
+            ("gre", L4Mode::Gre),
         ] {
             let a = args_of(&["--allow", "1.2.3.4", "--l4-mode", spelling]);
             assert_eq!(a.l4_modes, vec![expected], "--l4-mode {spelling}");

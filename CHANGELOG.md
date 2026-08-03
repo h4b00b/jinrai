@@ -14,6 +14,67 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.40.0] — 2026-08-03
+
+IP fragmentation and GRE. Every primitive jinrai had so far put **one packet** on
+the wire per unit and let the target read it as-is. These three do not: two of
+them cut a datagram into pieces the target has to hold and rebuild before it can
+read anything, and one wraps a whole packet inside another. What they exercise is
+the IP layer itself — the reassembly table and the protocol demultiplexer — which
+is why they report as L3 even though the bytes inside are a UDP datagram or a SYN.
+
+### Added
+
+- **`--l4-mode udp-frag` and `--l4-mode tcp-frag`** — IPv4 fragmentation floods.
+  The cut is deliberate rather than an MTU accident: the datagram is split on
+  8-byte boundaries *inside its transport header*, so `udp-frag` puts the 8-byte
+  UDP header in fragment 0 and the payload in fragment 1 (the destination port is
+  unreadable until both land), and `tcp-frag` fragments a SYN whose 20-byte header
+  cuts into 8 + 8 + 4 — ports in fragment 0, **control flags in fragment 1**, so
+  nothing on the path can tell it is a SYN without reassembling first. Each unit
+  carries its own IP identification, so reassembly entries accumulate instead of
+  overwriting one another. Works with the existing `--port` sets, which is where
+  the fragmentation + random-ports shape comes from: add `--port-order random`.
+- **`--l4-mode gre`** — a GRE flood (IP protocol 47): an outer IPv4 header, the
+  4-byte version-0 GRE header (RFC 2784, no checksum/key/sequence), and an
+  encapsulated IPv4/UDP datagram. A target that accepts protocol 47 must
+  recognise it, strip the outer header and re-enter its IP stack with the inner
+  packet — roughly two packets' worth of processing for one packet of bandwidth.
+  `--port` sets the encapsulated destination port.
+- All three are raw-socket modes: `CAP_NET_RAW`/root, IPv4-only, real source
+  address, and covered by the existing per-vector preflight — so a missing
+  capability is refused before any traffic, including inside a multi-vector run.
+- `route_source`, `require_ipv4` and `varying_source_port` in the L3/L4 engine:
+  the three steps every packet-crafting mode already performed, now performed in
+  one place each rather than copied per sender.
+
+### Security
+
+- **The GRE builder cannot write a source address it was not given — inside the
+  encapsulation either.** A GRE payload is the one place an IP source could be
+  set where no kernel would ever validate it, which would be a spoofing path in a
+  tool whose central guarantee is that it has none. The encapsulated datagram is
+  therefore addressed from the same real source as the outer packet, and the
+  builder has no argument with which to express anything else.
+- Fragmentation changes what a packet is cut into, never who it claims to be
+  from. Every fragment carries the route-local address from `source_ipv4_for`,
+  the single producer it has always come from, and a test asserts this over the
+  whole fragment set of both modes.
+- **`--rate` counts datagrams, and the summary says what that costs.** One
+  `udp-frag` unit is 2 packets on the wire, one `tcp-frag` unit is 3. Counting
+  the datagram is the honest measure of offered load — it is the thing the target
+  reassembles — but it is 2–3× short of the packet count, so the report states
+  the multiplier rather than leaving `units_sent` to be read as packets. The
+  fragment count lives as a constant next to the mode and is held to the builder's
+  actual output by a test, across every payload size a run can ask for.
+- A `udp-frag` payload is floored at 8 bytes. Below one byte there is nothing
+  past the UDP header to cut off, so the run would emit ordinary unfragmented
+  datagrams while reporting a fragmentation flood — the hollow-run shape 0.36.0
+  spent a release removing.
+- The GRE payload is capped so the whole packet still fits the same MTU budget
+  the other modes keep to. A GRE packet the *local* kernel had to fragment on its
+  way out would be measuring our MTU, not the target's decapsulation path.
+
 ## [0.39.0] — 2026-08-03
 
 Multi-vector L3/L4 runs. The primitives were all there; what was missing was
@@ -1867,7 +1928,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.39.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/h4b00b/jinrai/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/h4b00b/jinrai/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/h4b00b/jinrai/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/h4b00b/jinrai/compare/v0.36.0...v0.37.0
