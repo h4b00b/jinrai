@@ -92,6 +92,9 @@ pub use tls_flood::TlsHandshakeEngine;
 pub mod long_lived;
 pub use long_lived::{LongLivedConfig, LongLivedEngine, LongLivedKind};
 
+pub mod tls_hello;
+pub use tls_hello::{TlsHelloEngine, TlsHelloKind};
+
 mod tls;
 
 /// Which HTTP request shape to generate. Every variant reuses the *same*
@@ -959,6 +962,9 @@ impl StressModule for L7Engine {
             mean_micros: residency.load(Ordering::Relaxed).checked_div(resolved).unwrap_or(0),
             knee,
             http_versions,
+            // The fast flood's completions all mean the same thing; the status
+            // classes above are the breakdown that matters here.
+            detail: None,
         })
     }
 }

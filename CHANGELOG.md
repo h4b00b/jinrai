@@ -14,6 +14,57 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-08-03
+
+The work a TLS server does **before** it has decided to trust you.
+
+`tls-handshake` (0.11.0) measures the crypto asymmetry: a full handshake costs
+the server a signature and costs the client almost nothing. But a handshake only
+starts after the ClientHello has been buffered, parsed, and had its cipher list
+intersected and its extensions walked — all on bytes from an unauthenticated
+peer, in code that runs before any policy the operator configured. That path had
+no coverage at all.
+
+### Added
+
+- **`--l7-method tls-big-hello`** — one well-formed ClientHello inflated to the
+  edge of the 16 KiB record limit: a 2048-entry cipher-suite list of unassigned
+  code points (the server must intersect all of them against its own and come up
+  empty) plus RFC 7685 `padding` to fill the record. Verified against OpenSSL:
+  the hello is well-formed enough that a real TLS stack parses the whole thing
+  and proceeds — which is the point. A malformed one would be rejected on the
+  record header, and the run would report a finding about jinrai.
+- **`--l7-method tls-sni-bomb`** — the same connection spent on the SNI alone: a
+  ~12 KiB `server_name` built from legal ≤63-byte DNS labels, so it survives
+  syntax validation and reaches the virtual-host lookup rather than being thrown
+  out as a malformed name. (OpenSSL refuses it in
+  `tls_parse_ctos_server_name` — the exact code path the primitive exists to
+  reach, and the healthy outcome.)
+- Both are `https`-only, rate-capped as hellos/sec and bounded by
+  `--max-connections`, and neither completes a handshake: connect, write one
+  record, read the first byte of the answer, drop.
+- **The answer split is the result, and it is now on screen.** Three outcomes
+  are counted apart because they are three verdicts on the target's parser:
+  *parsed* (the server did the work), *refused with an alert* (the parser held —
+  measure how cheaply), *silent* (usually a middlebox or a size guard in front of
+  the TLS stack). A new `of which` row in the run summary carries breakdowns like
+  this; before it, they reached the audit log and nowhere else, so an operator
+  reading the screen saw a clean run with the result of the test missing from it.
+  The same row now also reports WebSocket/SSE declines from 0.34.0.
+
+### Notes
+
+- The record is hand-rolled, std-only, as `h2_frames` is for the raw HTTP/2
+  primitives. rustls is in this tree and drives every other TLS primitive, but a
+  correct TLS library will not emit an incorrect-by-design hello — there is no
+  API for "put 12 KiB in the SNI". No new dependency.
+- **Oversized certificate chains are deliberately not covered.** The third idea
+  in this family needs a server that requests client authentication, and a full
+  handshake driven to the `Certificate` message, and a generated chain (a
+  certificate-generation dependency) — to test a configuration most targets do
+  not have. The two hello-side primitives reach the same parser without any of
+  it.
+
 ## [0.34.0] — 2026-08-03
 
 Two transports that are exhausted by using them **correctly**.
@@ -1506,6 +1557,7 @@ Phases 0–4.
   builds packets from the real source only.
 
 [Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.33.0...HEAD
+[0.35.0]: https://github.com/h4b00b/jinrai/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/h4b00b/jinrai/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/h4b00b/jinrai/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/h4b00b/jinrai/compare/v0.31.0...v0.32.0

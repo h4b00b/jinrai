@@ -27,7 +27,8 @@ use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
     H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
     H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, LongLivedConfig, LongLivedEngine,
-    LongLivedKind, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, WatchdogConfig,
+    LongLivedKind, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, TlsHelloEngine,
+    TlsHelloKind, WatchdogConfig,
 };
 use jinrai_metrics::{AuditEvent, AuditLog, RunContext};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
@@ -131,6 +132,21 @@ OPTIONS:
                             tls-handshake        TLS handshake flood (THC-SSL-DoS):
                                                  full handshake then drop, repeat;
                                                  https-only; rate cap = handshakes/sec
+                            tls-big-hello        TLS ClientHello parser stress: one
+                                                 well-formed hello inflated to the
+                                                 16 KiB record ceiling (2048-entry
+                                                 cipher list the server must
+                                                 intersect + RFC 7685 padding), no
+                                                 handshake completed
+                            tls-sni-bomb         the same, isolating the SNI: a
+                                                 12 KiB server_name of legal DNS
+                                                 labels, so it survives syntax
+                                                 checks and reaches the vhost
+                                                 lookup. Both are https-only, rate
+                                                 cap = hellos/sec, and report the
+                                                 answer split (parsed / alerted /
+                                                 silent) — an alert is the HEALTHY
+                                                 result: the parser refused
                             h2-settings          HTTP/2 SETTINGS flood
                                                  (CVE-2019-9515): empty SETTINGS
                                                  frames the server must ACK
@@ -199,7 +215,8 @@ OPTIONS:
                           the host is never altered)
     --max-connections <N> Cap concurrent in-flight requests (~concurrent keep-alive
                           connections) for the fast get/post/head flood and the
-                          tls-handshake flood (default: 1024). Pins the load to at
+                          one-connection-per-unit TLS methods (tls-handshake,
+                          tls-big-hello, tls-sni-bomb) (default: 1024). Pins the load to at
                           most N connections held busy — the controlled form of
                           keep-alive connection exhaustion (probe a server's
                           connection-slot / worker limit); --rate still caps the
@@ -329,6 +346,9 @@ enum L7Kind {
     /// Long-lived transport connection flood (WebSocket / SSE): hold sessions a
     /// protocol is *meant* to keep open, so no read timeout retires them.
     LongLived(LongLivedKind),
+    /// TLS ClientHello parser stress (oversized hello / SNI bomb): the work the
+    /// server does on bytes it has not yet decided to trust.
+    TlsHello(TlsHelloKind),
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -833,6 +853,14 @@ fn run_l7(
             let engine = LongLivedEngine::new(gate, url.clone(), cfg);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
+        L7Kind::TlsHello(kind) => {
+            // Same footprint knob as the handshake flood: one connection per
+            // hello, and a target that accepts then says nothing holds its slot
+            // for the read timeout.
+            let engine = TlsHelloEngine::new(gate, url.clone(), kind)
+                .with_max_connections(args.max_connections);
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
     };
     let (mut engine, targets) = match built {
         Ok(pair) => pair,
@@ -878,7 +906,7 @@ fn run_l7(
     let is_connection_holding =
         matches!(args.l7_kind, L7Kind::Slow(_) | L7Kind::LongLived(_));
     if !is_fast && !args.slo.is_empty() {
-        eprintln!("warning: --slo-* / --watchdog are ignored for the slow-connection / h2 / tls-handshake / websocket / sse methods (no per-request response to classify)");
+        eprintln!("warning: --slo-* / --watchdog are ignored for the slow-connection / h2 / tls-* / websocket / sse methods (no per-request response to classify)");
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
     }
@@ -1324,12 +1352,14 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     "h2-bomb" => L7Kind::H2Stream(H2StreamKind::Bomb),
                     "websocket" => L7Kind::LongLived(LongLivedKind::WebSocket),
                     "sse" => L7Kind::LongLived(LongLivedKind::Sse),
+                    "tls-big-hello" => L7Kind::TlsHello(TlsHelloKind::BigHello),
+                    "tls-sni-bomb" => L7Kind::TlsHello(TlsHelloKind::SniBomb),
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
                              slow-read|h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|\
                              h2-ping|h2-window-update|h2-priority|h2-made-you-reset|h2-empty-data|\
-                             h2-bomb|websocket|sse)"
+                             h2-bomb|websocket|sse|tls-big-hello|tls-sni-bomb)"
                         ))
                     }
                 }
@@ -1927,6 +1957,7 @@ mod tests {
             "get", "post", "head", "slowloris", "slowbody", "slow-read", "h2-rapid-reset",
             "h2-continuation", "tls-handshake", "h2-settings", "h2-ping", "h2-window-update",
             "h2-priority", "h2-made-you-reset", "h2-empty-data", "h2-bomb", "websocket", "sse",
+            "tls-big-hello", "tls-sni-bomb",
         ] {
             let argv =
                 ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--l7-method", m];

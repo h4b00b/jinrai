@@ -154,6 +154,16 @@ is all declines is pointing at the path in your URL, not at the target's capacit
 | Goal | Method |
 |---|---|
 | **THC-SSL-DoS** — complete a TLS handshake, drop it, repeat (asymmetric CPU cost) | `--l7-method tls-handshake` (https only) |
+| **Oversized ClientHello** — 16 KiB of well-formed hello, no handshake completed | `--l7-method tls-big-hello` (https only) |
+| **SNI bomb** — a 12 KiB `server_name` of legal DNS labels | `--l7-method tls-sni-bomb` (https only) |
+
+The last two measure the *other* half of TLS cost: the work a server does on
+bytes it has not yet decided to trust, before any key exchange. Read the answer
+split, not the completion count — the three outcomes mean opposite things. A
+hello the target **parsed** is work it performed for you; one it **refused with
+an alert** is the healthy result (measure how cheaply it refused); one answered
+with **silence** usually means a middlebox or a size guard sits in front of the
+TLS stack, which is worth knowing before you conclude anything about the server.
 
 ### 4. Protocol asymmetry (HTTP/2) — "one cheap frame, one expensive server reaction"
 
@@ -206,6 +216,7 @@ reinterpreted per family, and a flag belonging to another family is inert
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
 | `websocket` / `sse` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (Ping tick, `websocket` only) | same as above |
 | `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
+| `tls-big-hello` / `tls-sni-bomb` | hellos/sec | `--max-connections` (default 1024) | same as above |
 | every `h2-*` | frames/sec (cycles/sec for `h2-made-you-reset`) | *nothing* — one connection, frames paced by `--rate` | same as above |
 | l4 `tcp` | connection attempts/sec | `--concurrency` (open sockets), `--connect-timeout-ms` | `--slo-*`, `--profile` |
 | l4 `data` | writes/sec | `--concurrency`, `--payload-size` | same |
@@ -285,6 +296,13 @@ jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method websocket \
 
 # TLS handshake flood (THC-SSL-DoS): full handshake, immediate drop, repeat
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method tls-handshake \
+       --url https://api.staging.internal/ --rate 200 --duration 60
+
+# TLS ClientHello parser stress: 16 KiB of well-formed hello, no handshake.
+# Swap for tls-sni-bomb to spend the same connection on the SNI alone.
+# Read the "of which" line, not the completion count: `parsed` means the target
+# did the work, `refused with an alert` is the healthy answer.
+jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method tls-big-hello \
        --url https://api.staging.internal/ --rate 200 --duration 60
 
 # HTTP/2 rapid reset (CVE-2023-44487). Every h2-* method takes this exact shape;
@@ -565,6 +583,8 @@ counts as a unit of `--rate`, see
 | `h2-bomb` | HTTP/2 | HPACK 1-byte-reference header amplification + `INITIAL_WINDOW_SIZE=0` so the amplified memory stays pinned (CVE-2026-49975, "HTTP/2 Bomb") |
 | `websocket` | long-lived transport | complete the RFC 6455 upgrade, then hold the session open with a masked empty `Ping` every `--drip-ms`. Nothing is slow or malformed, so no header/body read timeout applies |
 | `sse` | long-lived transport | a normal `Accept: text/event-stream` GET, held open and drained — the server keeps it open by design |
+| `tls-big-hello` | TLS parser | one well-formed ClientHello inflated to the 16 KiB record ceiling: a 2048-entry cipher-suite list the server must intersect against its own, padded out with the RFC 7685 `padding` extension. No handshake is completed; https-only |
+| `tls-sni-bomb` | TLS parser | the same connection budget spent on the SNI alone: a ~12 KiB `server_name` built from legal ≤63-byte DNS labels, so it survives syntax validation and reaches the virtual-host lookup (and whatever logs the name on rejection); https-only |
 
 The slow modes and the long-lived transports support https targets (the handshake
 accepts any server certificate); `websocket` and `sse` pin ALPN to `http/1.1`, so
@@ -805,7 +825,7 @@ not an expressible program state; it fails to compile.
 - **Phase 4** — metrics, reporting, tamper-evident audit log ✅
 - **Phase 5** — response classification, SLO verdict + inline health-watchdog ✅
 - **Phase 6** — load profiles (ramp / spike / soak) + breaking-point discovery ✅
-- **Phase 7** — protocol coverage ✅: TCP-flag floods (ACK/FIN/RST, URG/CWR/ECE, SYN-ACK, SYN+FIN/SYN+RST, Xmas/NULL), TCP options bomb, TCP data/PSH-ACK flood, ICMP/L3 query floods (echo/timestamp/address-mask), the HTTP/1.1 slow family (Slowloris/RUDY/slow-read) and keep-alive exhaustion, WebSocket/SSE session exhaustion, TLS slow modes + handshake flood, and the HTTP/2 family (rapid-reset, MadeYouReset, CONTINUATION, SETTINGS/PING, WINDOW_UPDATE/PRIORITY, empty-DATA, HPACK bomb)
+- **Phase 7** — protocol coverage ✅: TCP-flag floods (ACK/FIN/RST, URG/CWR/ECE, SYN-ACK, SYN+FIN/SYN+RST, Xmas/NULL), TCP options bomb, TCP data/PSH-ACK flood, ICMP/L3 query floods (echo/timestamp/address-mask), the HTTP/1.1 slow family (Slowloris/RUDY/slow-read) and keep-alive exhaustion, WebSocket/SSE session exhaustion, TLS slow modes + handshake flood + ClientHello/SNI parser stress, and the HTTP/2 family (rapid-reset, MadeYouReset, CONTINUATION, SETTINGS/PING, WINDOW_UPDATE/PRIORITY, empty-DATA, HPACK bomb)
 - **Phase 8** *(next)* — declarative scenario files + multi-source orchestration
 
 Still open beyond Phase 8: HTTP/3 & QUIC (handshake flood, QUICLORIS — needs a

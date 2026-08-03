@@ -183,6 +183,14 @@ pub fn render_summary(
         &format!("{} {}", report.units_sent, share(report.units_sent, attempts)),
     ));
 
+    // What those completions were made of, for the primitives where "completed"
+    // covers outcomes that mean opposite things. See `RunReport::detail`: without
+    // this row the finding lives only in the audit log, and the operator reading
+    // the screen sees a clean run with no result in it.
+    if let Some(detail) = &report.detail {
+        out.push_str(&row("  of which", detail));
+    }
+
     // Response classification (fast L7 only; other layers get no response).
     let classified =
         report.status_2xx + report.status_3xx + report.status_4xx + report.status_5xx;
@@ -878,6 +886,32 @@ mod tests {
         let out = render_summary(&r, &c, None);
         assert!(out.contains("concurrency, not the target"), "{out}");
         assert!(!out.contains("the generator, not the target"), "{out}");
+    }
+
+    /// A run whose completions mean opposite things must say so on screen. A TLS
+    /// hello the target *parsed* and one it *refused with an alert* were both
+    /// delivered; reporting only "30 completed" hands the operator a clean-looking
+    /// run with the actual result of the test missing from it.
+    #[test]
+    fn the_module_breakdown_reaches_the_summary_not_just_the_audit_log() {
+        let r = RunReport {
+            layer_label: "L7 l7-tls-big-hello".into(),
+            units_sent: 30,
+            detail: Some("12 parsed by the target, 18 refused with an alert".into()),
+            ..Default::default()
+        };
+        let out = render_summary(&r, &ctx_l4(), None);
+        assert!(out.contains("of which"), "{out}");
+        assert!(out.contains("18 refused with an alert"), "{out}");
+    }
+
+    /// The layers whose units have one meaning get no row at all — an empty
+    /// breakdown printed as zeros is the noise this block exists to avoid.
+    #[test]
+    fn a_module_with_nothing_to_break_down_gets_no_row() {
+        let r = RunReport { units_sent: 30, ..Default::default() };
+        let out = render_summary(&r, &ctx_l4(), None);
+        assert!(!out.contains("of which"), "{out}");
     }
 
     /// A connection-holding run (slowloris, websocket, sse) opens up to its
