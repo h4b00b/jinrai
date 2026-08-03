@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, SignatureScheme};
+use tokio_rustls::rustls::{ClientConfig, SignatureScheme, SupportedProtocolVersion};
 
 use crate::{Datum, L7Error};
 
@@ -20,19 +20,40 @@ use crate::{Datum, L7Error};
 /// given ALPN protocols (empty for none). See the module docs for why accepting
 /// any certificate is the correct, scoped choice here.
 pub(crate) fn client_config(alpn: Vec<Vec<u8>>) -> Result<Arc<ClientConfig>, L7Error> {
+    build_config(alpn, None)
+}
+
+/// The same config restricted to **TLS 1.3 only**, for [`crate::quic`].
+///
+/// Not a hardening preference: QUIC *is* TLS 1.3 (RFC 9001), and quinn refuses a
+/// config that still offers 1.2 rather than silently negotiating something it
+/// cannot carry. Kept here so both stacks share one verifier and one provider.
+pub(crate) fn tls13_client_config(alpn: Vec<Vec<u8>>) -> Result<Arc<ClientConfig>, L7Error> {
+    build_config(alpn, Some(&[&tokio_rustls::rustls::version::TLS13]))
+}
+
+/// `versions == None` means rustls' safe defaults (1.2 + 1.3).
+fn build_config(
+    alpn: Vec<Vec<u8>>,
+    versions: Option<&[&'static SupportedProtocolVersion]>,
+) -> Result<Arc<ClientConfig>, L7Error> {
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let verifier = Arc::new(AcceptAnyServerCert::new(&provider));
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| L7Error::Client(format!("TLS config: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+    let builder = ClientConfig::builder_with_provider(provider);
+    let builder = match versions {
+        Some(v) => builder.with_protocol_versions(v),
+        None => builder.with_safe_default_protocol_versions(),
+    }
+    .map_err(|e| L7Error::Client(format!("TLS config: {e}")))?;
+    let mut config =
+        builder.dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
     config.alpn_protocols = alpn;
     // Disable client-side session resumption: every connection must complete a
     // FULL handshake. This is a no-op for the single-connection slow / rapid-reset
     // engines, but it is what makes the tls-handshake flood meaningful — a resumed
     // handshake is cheap for the server, defeating the CPU-asymmetry self-test.
+    // The same reasoning carries to QUIC, where a resumed connection can also skip
+    // a round trip entirely (0-RTT).
     config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     Ok(Arc::new(config))
 }
@@ -107,5 +128,19 @@ mod tests {
         assert!(client_config(vec![]).is_ok());
         let cfg = client_config(vec![b"h2".to_vec()]).expect("alpn config builds");
         assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    /// quinn rejects a config still offering TLS 1.2, so the QUIC variant has to
+    /// come out 1.3-only — and still carry the ALPN and the disabled resumption.
+    #[test]
+    fn tls13_config_is_single_version_and_keeps_alpn() {
+        let cfg = tls13_client_config(vec![b"h3".to_vec()]).expect("quic config builds");
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+        // The public marker for "this config can carry QUIC": rustls only exposes
+        // the QUIC bits when 1.2 is out of the picture.
+        assert!(
+            quinn::crypto::rustls::QuicClientConfig::try_from((*cfg).clone()).is_ok(),
+            "a 1.3-only accept-any config must be usable as a QUIC client config"
+        );
     }
 }

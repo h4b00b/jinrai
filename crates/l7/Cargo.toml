@@ -31,6 +31,28 @@ http = "1"
 # flush its response). Already in the workspace tree via `l34`. SockRef borrows a
 # connected tokio stream — no unsafe, no second socket.
 socket2 = "0.5"
+# QUIC / HTTP-3. The one primitive family that cannot be hand-rolled the way the
+# raw h2 and TLS-hello framing was: QUIC carries its handshake inside AEAD-
+# protected packets, so reaching the server's crypto work at all means
+# implementing header protection, packet number spaces and loss recovery first.
+#
+# The supply-chain cost is far smaller than it looks: `reqwest` already declares
+# quinn behind its (unused) `http3` feature, so these exact versions are already
+# resolved in `Cargo.lock` and reviewed as part of this tree. quinn drives the
+# same `rustls` 0.23 + `ring` provider the rest of the crate uses — no second TLS
+# stack, no second crypto backend. Default features are off so neither `log` nor
+# `platform-verifier` (a whole OS trust-store stack, useless to an engine that
+# accepts any certificate by design) comes with it.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+
+[dev-dependencies]
+# Self-signed certificate for the in-test QUIC listener. Test-only — it never
+# reaches the shipped binary. The QUIC primitives cannot be verified the way the
+# raw h2 and TLS-hello framing was (write the bytes, read them back with a
+# generic tool): nothing sees a QUIC stream without completing a handshake first,
+# so checking that jinrai's HTTP/3 bytes actually arrive means standing up a real
+# QUIC server, and that means a certificate.
+rcgen = "0.13"
 
 [lints.rust]
 unsafe_code = "forbid"

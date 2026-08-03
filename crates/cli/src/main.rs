@@ -27,8 +27,8 @@ use jinrai_l34::{L34Config, L34Engine, L4Mode, PortOrder, PortSet};
 use jinrai_l7::{
     H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
     H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, LongLivedConfig, LongLivedEngine,
-    LongLivedKind, PathMode, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, TlsHelloEngine,
-    TlsHelloKind, Variation, WatchdogConfig, parse_path_list,
+    LongLivedKind, PathMode, QuicConfig, QuicEngine, QuicKind, RequestSpec, SlowConfig, SlowMode,
+    TlsHandshakeEngine, TlsHelloEngine, TlsHelloKind, Variation, WatchdogConfig, parse_path_list,
 };
 use jinrai_metrics::{AuditEvent, AuditLog, Palette, RunContext};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
@@ -223,6 +223,28 @@ OPTIONS:
                                                  Accept: text/event-stream GET, held
                                                  open (the server keeps it open by
                                                  design) and drained
+                            quic-handshake       QUIC/HTTP-3 handshake flood: complete
+                                                 a full QUIC handshake, drop it, repeat.
+                                                 QUIC moves the crypto further forward
+                                                 than TLS-over-TCP — the server parses a
+                                                 ClientHello and signs for a client that
+                                                 has proved only that it can receive one
+                                                 round trip; rate cap = handshakes/sec,
+                                                 --max-connections caps those in flight
+                            quicloris            QUICLORIS: Slowloris carried to HTTP/3.
+                                                 Hold connections, each with one request
+                                                 stream whose HEADERS frame promises
+                                                 more than ever arrives, dribbled a byte
+                                                 per --drip-ms. A dribbling connection
+                                                 is never IDLE, so the QUIC idle timeout
+                                                 — the budget that retires an abandoned
+                                                 connection — does not fire on it;
+                                                 --slow-connections is the ceiling
+                          quic-handshake/quicloris are https-only (there is no plaintext
+                          QUIC), speak ALPN h3, and send from a real OS-assigned UDP
+                          source — no spoofing, so no reflection or amplification. Their
+                          summary separates a peer that ANSWERED and declined (usually
+                          the target offers no h3) from one that never answered at all.
                           websocket/sse take http(s) URLs, not ws(s): the handshake
                           IS an HTTP/1.1 request, so use https:// for wss. Both use
                           --slow-connections as the concurrent ceiling and --drip-ms
@@ -431,6 +453,9 @@ enum L7Kind {
     /// TLS ClientHello parser stress (oversized hello / SNI bomb): the work the
     /// server does on bytes it has not yet decided to trust.
     TlsHello(TlsHelloKind),
+    /// QUIC / HTTP-3 (handshake flood / QUICLORIS): the only transport jinrai
+    /// reaches over UDP rather than TCP.
+    Quic(QuicKind),
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -995,6 +1020,23 @@ fn run_l7(
                 .with_max_connections(args.max_connections);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
+        L7Kind::Quic(kind) => {
+            // The two QUIC primitives take their ceiling from different flags, for
+            // the same reason their TCP counterparts do: the handshake flood keeps
+            // opening connections for the whole run and needs an in-flight cap
+            // (--max-connections, as tls-handshake), while QUICLORIS opens up to a
+            // ceiling once and then holds (--slow-connections, as slowloris).
+            let cfg = QuicConfig {
+                kind,
+                max_conns: match kind {
+                    QuicKind::Handshake => args.max_connections,
+                    QuicKind::Quicloris => args.slow_connections,
+                },
+                tick: Duration::from_millis(args.drip_ms),
+            };
+            let engine = QuicEngine::new(gate, url.clone(), cfg);
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
     };
     let (mut engine, targets) = match built {
         Ok(pair) => pair,
@@ -1037,10 +1079,12 @@ fn run_l7(
     let is_fast = matches!(args.l7_kind, L7Kind::Fast(_));
     // The methods that open connections up to a ceiling and then hold them:
     // `--rate` paces the opening, `--slow-connections` is the real bound.
-    let is_connection_holding =
-        matches!(args.l7_kind, L7Kind::Slow(_) | L7Kind::LongLived(_));
+    let is_connection_holding = matches!(
+        args.l7_kind,
+        L7Kind::Slow(_) | L7Kind::LongLived(_) | L7Kind::Quic(QuicKind::Quicloris)
+    );
     if !is_fast && !args.slo.is_empty() {
-        eprintln!("warning: --slo-* / --watchdog are ignored for the slow-connection / h2 / tls-* / websocket / sse methods (no per-request response to classify)");
+        eprintln!("warning: --slo-* / --watchdog are ignored for the slow-connection / h2 / tls-* / websocket / sse / quic methods (no per-request response to classify)");
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
     }
@@ -1053,7 +1097,8 @@ fn run_l7(
     if !is_fast && args.http_version != HttpVersion::Auto {
         eprintln!(
             "warning: --http-version applies to the fast get/post/head methods only; \
-             ignored here (slow / websocket / sse are HTTP/1.1, h2-* are HTTP/2 by construction)"
+             ignored here (slow / websocket / sse are HTTP/1.1, h2-* are HTTP/2, \
+             quic-* are HTTP/3 by construction)"
         );
     }
 
@@ -1560,12 +1605,15 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     "sse" => L7Kind::LongLived(LongLivedKind::Sse),
                     "tls-big-hello" => L7Kind::TlsHello(TlsHelloKind::BigHello),
                     "tls-sni-bomb" => L7Kind::TlsHello(TlsHelloKind::SniBomb),
+                    "quic-handshake" => L7Kind::Quic(QuicKind::Handshake),
+                    "quicloris" => L7Kind::Quic(QuicKind::Quicloris),
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
                              slow-read|h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|\
                              h2-ping|h2-window-update|h2-priority|h2-made-you-reset|h2-empty-data|\
-                             h2-bomb|websocket|sse|tls-big-hello|tls-sni-bomb)"
+                             h2-bomb|websocket|sse|tls-big-hello|tls-sni-bomb|quic-handshake|\
+                             quicloris)"
                         ))
                     }
                 }
@@ -2318,7 +2366,7 @@ mod tests {
             "get", "post", "head", "slowloris", "slowbody", "slow-read", "h2-rapid-reset",
             "h2-continuation", "tls-handshake", "h2-settings", "h2-ping", "h2-window-update",
             "h2-priority", "h2-made-you-reset", "h2-empty-data", "h2-bomb", "websocket", "sse",
-            "tls-big-hello", "tls-sni-bomb",
+            "tls-big-hello", "tls-sni-bomb", "quic-handshake", "quicloris",
         ] {
             let argv =
                 ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--l7-method", m];
@@ -2342,6 +2390,34 @@ mod tests {
                 other => panic!("{method} selected {other:?}"),
             }
         }
+    }
+
+    /// The two QUIC methods select the right primitive, and QUICLORIS is treated
+    /// as connection-holding — the flag that decides whether the summary reads a
+    /// connection ceiling as "the generator was the limit" or as the measurement.
+    #[test]
+    fn quic_methods_select_their_primitive() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "https://10.1.2.3/", "--l7-method"];
+        for (method, want) in
+            [("quic-handshake", QuicKind::Handshake), ("quicloris", QuicKind::Quicloris)]
+        {
+            let mut argv = base.to_vec();
+            argv.push(method);
+            match args_of(&argv).l7_kind {
+                L7Kind::Quic(got) => assert_eq!(got, want, "{method}"),
+                other => panic!("{method} selected {other:?}"),
+            }
+        }
+        let holding = |m: &str| {
+            let mut argv = base.to_vec();
+            argv.push(m);
+            matches!(
+                args_of(&argv).l7_kind,
+                L7Kind::Slow(_) | L7Kind::LongLived(_) | L7Kind::Quic(QuicKind::Quicloris)
+            )
+        };
+        assert!(holding("quicloris"), "QUICLORIS holds connections");
+        assert!(!holding("quic-handshake"), "the handshake flood does not hold them");
     }
 
     /// `--layer` accepts the spellings the README and the help text use.

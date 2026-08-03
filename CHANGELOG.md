@@ -26,6 +26,97 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.42.0] — 2026-08-03
+
+HTTP/3 and QUIC. Every technique jinrai had reached the target's TCP front door;
+the UDP one had coverage of exactly zero. That gap is worth more than its size
+suggests, because an HTTP/3 endpoint is usually a *different* code path behind a
+*different* protocol, and the rate limits, connection caps and idle reapers that
+protect port 443/TCP are frequently absent from port 443/UDP — a target can pass
+every existing run and still have an unguarded front door.
+
+### Added
+
+- **`--l7-method quic-handshake`** — QUIC handshake flood. Complete a full
+  handshake, drop it, repeat concurrently. The same CPU asymmetry
+  `tls-handshake` measures, except QUIC moves the work *further forward*: the
+  server decrypts an Initial, parses a ClientHello and signs with its private key
+  for a client that has proved nothing beyond being able to receive one round
+  trip. `--rate` counts handshakes/sec, `--max-connections` caps those in flight.
+- **`--l7-method quicloris`** — QUICLORIS. Hold connections open, each carrying a
+  proper HTTP/3 control stream with `SETTINGS` and one request stream whose
+  `HEADERS` frame promises 4 KiB and delivers a byte per `--drip-ms`. Not just
+  Slowloris again: an HTTP/1.1 Slowloris is retired by a request-header read
+  timeout, and QUIC's equivalent budget is the **idle timeout** — which a
+  dribbling connection never reaches. `--slow-connections` is the ceiling.
+- Both are `https`-only (there is no plaintext QUIC), speak ALPN `h3`, and share
+  the datum-authorization + resolve-once-and-pin boundary of every other L7
+  engine.
+- A third outcome in the summary, on the pattern the TLS-hello and WebSocket
+  engines set: **refused** (the peer answered in QUIC and declined — almost
+  always no `h3` ALPN, a finding about the endpoint rather than its capacity) is
+  reported apart from **errors** (nothing came back at all). QUIC makes the
+  distinction matter more than TCP does, because a dropped Initial produces no
+  `ECONNREFUSED` and no `RST` — just silence.
+
+### Security
+
+- **No spoofing in the QUIC path either, and it is load-bearing.** QUIC is the
+  protocol most easily turned into a reflector, and every amplification variant
+  needs a forged Initial. jinrai binds an ordinary client UDP socket on `:0` and
+  lets the OS assign the source; there is no source-address option anywhere in
+  the module, which is enforced by a test asserting the bind address is
+  unspecified with port 0. Because the source is real, RFC 9000's
+  anti-amplification limit is satisfied rather than evaded — the server answers
+  us. QUIC Retry / token-replay amplification and reflection via the certificate
+  exchange stay out of scope by design.
+- **A run that reaches nothing no longer reads as a clean sweep.** QUIC gives a
+  silent target no way to fail fast, so every attempt against a filtered or dead
+  UDP port is still handshaking when the window closes. Counting only *resolved*
+  attempts reported such a run as `0 attempts, 0 failed, ran to completion` — the
+  hollow success this project has fixed once before, in `l34`. Attempts are now
+  counted at spawn and anything unresolved at the deadline is an error, so the
+  run exits non-zero and says so.
+
+### Fixed
+
+- **A QUIC run no longer outlives its `--duration`.** Closing the endpoint waits
+  out the draining period (three PTOs) per connection, which against a target
+  that never answered added seconds to a two-second run — and an elapsed time
+  that disagrees with the planned one makes every rate in the report a different
+  number than it claims. The close is now bounded by a 500 ms grace.
+
+### Dependencies
+
+- **`quinn` 0.11** (`default-features = false`, `runtime-tokio` + `rustls-ring`)
+  — the first primitive family that could not be hand-rolled the way the raw
+  HTTP/2 framing and the TLS ClientHello bytes were. QUIC carries its handshake
+  *inside* AEAD-protected packets, so reaching the server's crypto work at all
+  means implementing header protection, packet-number spaces and loss recovery
+  first. The supply-chain cost is smaller than the policy suggests: `reqwest`
+  already declares these exact versions behind its unused `http3` feature, so
+  they were resolved and reviewed in `Cargo.lock` before this release; quinn
+  drives the same `rustls` 0.23 and `ring` provider the crate already uses, so
+  no second TLS stack and no second crypto backend enter the tree. Default
+  features are off, which keeps out `platform-verifier` — an entire OS
+  trust-store stack, useless to an engine that accepts any certificate by design.
+  Net effect on the build graph: 13 crates, 127 → 140.
+- **`rcgen` 0.13, dev-only.** Nothing observes a QUIC stream without completing a
+  handshake first, so verifying that jinrai's HTTP/3 bytes actually arrive means
+  standing up a real QUIC listener in the tests, and that means a certificate. It
+  never reaches the shipped binary.
+
+### Verified
+
+- Against a real QUIC listener, in-test: handshakes complete and report zero
+  errors; an `h3`-less listener lands in **refused** rather than errors; and a
+  QUICLORIS run delivers a byte-exact HTTP/3 control stream and a `HEADERS` frame
+  that is still unfinished when the run ends, with the request stream never
+  finished. Plus RFC 9000 varint encoding at all three form boundaries.
+- End to end through the CLI: both methods run, the scheme and gate refusals exit
+  non-zero, and a run against a dead UDP port reports `40 attempts, 40 failed`
+  and exits 1.
+
 ## [0.41.0] — 2026-08-03
 
 Colour in the run summary. The block already said everything an operator needs;
@@ -1985,6 +2076,7 @@ Phases 0–4.
   builds packets from the real source only.
 
 [Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.41.0...HEAD
+[0.42.0]: https://github.com/h4b00b/jinrai/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/h4b00b/jinrai/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/h4b00b/jinrai/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/h4b00b/jinrai/compare/v0.38.0...v0.39.0

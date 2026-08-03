@@ -98,6 +98,9 @@ pub use tls_hello::{TlsHelloEngine, TlsHelloKind};
 pub mod vary;
 pub use vary::{parse_path_list, PathMode, Variation};
 
+pub mod quic;
+pub use quic::{QuicConfig, QuicEngine, QuicKind};
+
 mod tls;
 
 /// Which HTTP request shape to generate. Every variant reuses the *same*
