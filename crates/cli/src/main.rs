@@ -26,8 +26,8 @@ use jinrai_core::{
 use jinrai_l34::{L34Config, L34Engine, L4Mode};
 use jinrai_l7::{
     H2ContinuationEngine, H2FrameFloodEngine, H2FrameKind, H2RapidResetEngine, H2StreamFloodEngine,
-    H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, RequestSpec, SlowConfig, SlowMode,
-    TlsHandshakeEngine, WatchdogConfig,
+    H2StreamKind, HttpVersion, L7Engine, L7Method, L7SlowEngine, LongLivedConfig, LongLivedEngine,
+    LongLivedKind, RequestSpec, SlowConfig, SlowMode, TlsHandshakeEngine, WatchdogConfig,
 };
 use jinrai_metrics::{AuditEvent, AuditLog, RunContext};
 use jinrai_safety::{Allowlist, AuthorizedTarget, Authorization, KillSwitch};
@@ -157,6 +157,24 @@ OPTIONS:
                                                  + zero initial window so the
                                                  amplified memory stays pinned; rate
                                                  cap = bomb frames/sec
+                            websocket            WebSocket connection exhaustion: do
+                                                 the RFC 6455 upgrade properly, then
+                                                 hold the session with an empty Ping
+                                                 every --drip-ms. Nothing is slow or
+                                                 malformed, so no header/body read
+                                                 timeout retires it — this measures
+                                                 the concurrent-session ceiling
+                            sse                  Server-Sent-Events connection
+                                                 exhaustion: a normal
+                                                 Accept: text/event-stream GET, held
+                                                 open (the server keeps it open by
+                                                 design) and drained
+                          websocket/sse take http(s) URLs, not ws(s): the handshake
+                          IS an HTTP/1.1 request, so use https:// for wss. Both use
+                          --slow-connections as the concurrent ceiling and --drip-ms
+                          as the keep-alive tick, and the run summary separates a
+                          server DECLINING the transport (wrong path / not supported)
+                          from a connection that never got an answer.
                           For slow modes the rate cap is connections-opened/sec,
                           and https targets are supported (slow-TLS; the handshake
                           accepts any server certificate — see README). h2-rapid-reset
@@ -202,10 +220,12 @@ OPTIONS:
                           Requests cancelled here are counted in the `abandoned`
                           errno bucket, never silently dropped. 0 = cancel at the
                           deadline itself.
-    --slow-connections <N>  Concurrent connection ceiling for slow modes (default: 100)
-    --drip-ms <MS>        Per-tick interval for slow modes (default: 10000): the
-                          keep-alive write interval for slowloris/slowbody, or the
-                          read interval draining one chunk for slow-read
+    --slow-connections <N>  Concurrent connection ceiling for the slow modes and
+                          for websocket/sse (default: 100)
+    --drip-ms <MS>        Per-tick interval for the connection-holding l7 methods
+                          (default: 10000): the keep-alive write interval for
+                          slowloris/slowbody, the read interval draining one chunk
+                          for slow-read, or the Ping interval for websocket
     --concurrency <N>     Max SIMULTANEOUSLY OPEN sockets for the connection-
                           holding l4 modes (tcp, data) (default: 256). This is the
                           run's local footprint, and it is independent of
@@ -306,6 +326,9 @@ enum L7Kind {
     H2Frame(H2FrameKind),
     /// HTTP/2 stream-based flood (MadeYouReset / empty-DATA / HTTP/2 Bomb).
     H2Stream(H2StreamKind),
+    /// Long-lived transport connection flood (WebSocket / SSE): hold sessions a
+    /// protocol is *meant* to keep open, so no read timeout retires them.
+    LongLived(LongLivedKind),
 }
 
 /// The load shape over time (fast L7 methods only). `--rate` is the peak/ceiling
@@ -798,6 +821,18 @@ fn run_l7(
             let engine = H2StreamFloodEngine::new(gate, url.clone(), kind);
             engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
         }
+        L7Kind::LongLived(kind) => {
+            // Shares the slow modes' two knobs: both primitives open connections
+            // up to a ceiling and then hold them, so a second pair of flags for
+            // the same two numbers would only be a way to get them wrong.
+            let cfg = LongLivedConfig {
+                kind,
+                max_conns: args.slow_connections,
+                tick: Duration::from_millis(args.drip_ms),
+            };
+            let engine = LongLivedEngine::new(gate, url.clone(), cfg);
+            engine.authorize_target().map(|t| (Box::new(engine) as Box<dyn StressModule>, t))
+        }
     };
     let (mut engine, targets) = match built {
         Ok(pair) => pair,
@@ -838,8 +873,12 @@ fn run_l7(
     // SLO/watchdog apply to the fast request-flood methods only: the slow modes
     // and rapid-reset never receive a response to classify. Warn, don't ignore.
     let is_fast = matches!(args.l7_kind, L7Kind::Fast(_));
+    // The methods that open connections up to a ceiling and then hold them:
+    // `--rate` paces the opening, `--slow-connections` is the real bound.
+    let is_connection_holding =
+        matches!(args.l7_kind, L7Kind::Slow(_) | L7Kind::LongLived(_));
     if !is_fast && !args.slo.is_empty() {
-        eprintln!("warning: --slo-* / --watchdog are ignored for slow-connection / h2 / tls-handshake methods (no response to classify)");
+        eprintln!("warning: --slo-* / --watchdog are ignored for the slow-connection / h2 / tls-handshake / websocket / sse methods (no per-request response to classify)");
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
     }
@@ -852,7 +891,7 @@ fn run_l7(
     if !is_fast && args.http_version != HttpVersion::Auto {
         eprintln!(
             "warning: --http-version applies to the fast get/post/head methods only; \
-             ignored here (slow modes are HTTP/1.1, h2-* methods are HTTP/2 by construction)"
+             ignored here (slow / websocket / sse are HTTP/1.1, h2-* are HTTP/2 by construction)"
         );
     }
 
@@ -890,6 +929,13 @@ fn run_l7(
             notes.push(format!("max {} concurrent connections", args.max_connections));
         }
     }
+    // The connection-holding methods open --slow-connections connections and then
+    // stop opening. Naming that ceiling is what keeps `25 attempts, 10% of the
+    // 50/s cap` from reading as a target that absorbed the other 90%: nothing was
+    // withheld, the run simply reached the ceiling the operator set.
+    if is_connection_holding {
+        notes.push(format!("{} connection ceiling", args.slow_connections));
+    }
     report_run(
         args,
         &report,
@@ -903,12 +949,19 @@ fn run_l7(
             elapsed,
             started_unix,
             notes,
-            // Only the bounded fast flood has an in-flight ceiling; 0 means
-            // unbounded, which cannot be the binding constraint.
-            concurrency: if is_fast && args.max_connections > 0 {
-                Some(args.max_connections)
-            } else {
-                None
+            // The in-flight ceiling that actually applied, so the shortfall note
+            // can attribute a run that fell short of its cap. For the fast flood
+            // that is --max-connections (0 means unbounded, which cannot be the
+            // binding constraint); for the connection-holding methods it is
+            // --slow-connections, and naming it suppresses the "the generator,
+            // not the target" inference — which was false here: the run stopped
+            // opening because it hit the ceiling, not because this host could
+            // not go faster. The h2-* methods use a single connection and are
+            // genuinely paced by --rate alone.
+            concurrency: match () {
+                _ if is_fast => (args.max_connections > 0).then_some(args.max_connections),
+                _ if is_connection_holding => Some(args.slow_connections),
+                _ => None,
             },
         },
     );
@@ -1269,12 +1322,14 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                     "h2-made-you-reset" => L7Kind::H2Stream(H2StreamKind::MadeYouReset),
                     "h2-empty-data" => L7Kind::H2Stream(H2StreamKind::EmptyData),
                     "h2-bomb" => L7Kind::H2Stream(H2StreamKind::Bomb),
+                    "websocket" => L7Kind::LongLived(LongLivedKind::WebSocket),
+                    "sse" => L7Kind::LongLived(LongLivedKind::Sse),
                     other => {
                         return Err(format!(
                             "unknown --l7-method: {other} (want get|post|head|slowloris|slowbody|\
                              slow-read|h2-rapid-reset|h2-continuation|tls-handshake|h2-settings|\
                              h2-ping|h2-window-update|h2-priority|h2-made-you-reset|h2-empty-data|\
-                             h2-bomb)"
+                             h2-bomb|websocket|sse)"
                         ))
                     }
                 }
@@ -1859,6 +1914,41 @@ mod tests {
             let err = parse(&["--allow", "10.0.0.0/8", flag, bad]).unwrap_err();
             assert!(err.contains(flag), "{flag} {bad}: {err}");
             assert!(err.contains(bad), "the error should quote the bad value: {err}");
+        }
+    }
+
+    /// Every `--l7-method` the parser accepts must also be documented, and vice
+    /// versa. The two lists drift silently: a method in the parser but not the
+    /// help is unreachable in practice, one in the help but not the parser is a
+    /// documented flag that errors out.
+    #[test]
+    fn every_l7_method_parses_and_is_documented() {
+        for m in [
+            "get", "post", "head", "slowloris", "slowbody", "slow-read", "h2-rapid-reset",
+            "h2-continuation", "tls-handshake", "h2-settings", "h2-ping", "h2-window-update",
+            "h2-priority", "h2-made-you-reset", "h2-empty-data", "h2-bomb", "websocket", "sse",
+        ] {
+            let argv =
+                ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--l7-method", m];
+            assert!(parse(&argv).is_ok(), "--l7-method {m} should parse");
+            assert!(USAGE.contains(m), "help must document --l7-method {m}");
+        }
+    }
+
+    /// The long-lived transports route to their own engine rather than being
+    /// quietly served by the fast request flood.
+    #[test]
+    fn websocket_and_sse_select_the_long_lived_engine() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--l7-method"];
+        for (method, want) in
+            [("websocket", LongLivedKind::WebSocket), ("sse", LongLivedKind::Sse)]
+        {
+            let mut argv = base.to_vec();
+            argv.push(method);
+            match args_of(&argv).l7_kind {
+                L7Kind::LongLived(got) => assert_eq!(got, want, "{method}"),
+                other => panic!("{method} selected {other:?}"),
+            }
         }
     }
 

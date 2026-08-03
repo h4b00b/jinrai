@@ -14,6 +14,72 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-08-03
+
+Two transports that are exhausted by using them **correctly**.
+
+Every connection-holding primitive jinrai had until now works by being wrong on
+purpose: Slowloris never terminates its headers, RUDY never delivers the body it
+declared, slow-read refuses to drain the response. All three are defeated by the
+same class of control — a header read timeout, a body read timeout, a minimum
+data rate — and a target that passes them tells you only that those timeouts are
+configured.
+
+WebSocket and SSE are not defeated by any of them, because there is nothing to
+time out. A WebSocket session that sits idle for an hour is a WebSocket session
+working as designed, and an event stream that sends one comment every 30 seconds
+is a healthy event stream. The connection-slot, worker and descriptor budget is
+consumed exactly the same way. What jinrai now measures is whether anything
+*else* stops it: a concurrent-session cap, a per-IP limit, an idle-session
+reaper. If a run holds `--slow-connections` sessions for the whole `--duration`
+with no errors, nothing does.
+
+### Added
+
+- **`--l7-method websocket`** — completes the RFC 6455 HTTP/1.1 upgrade (fresh
+  16-byte `Sec-WebSocket-Key` per connection, as the RFC requires — a reused or
+  malformed one is grounds for a server to reject the upgrade and would make the
+  whole run look like a decline), then holds the session with a masked,
+  zero-length `Ping` control frame every `--drip-ms`.
+- **`--l7-method sse`** — an ordinary `Accept: text/event-stream` GET, held open
+  and drained. No keep-alive traffic is needed at all: the server is the one
+  obliged to keep the connection.
+- Both reuse the slow modes' two knobs — `--slow-connections` as the concurrent
+  ceiling, `--drip-ms` as the tick — rather than adding a second pair of flags
+  for the same two numbers. `--rate` is connections opened per second, as it is
+  for every other connection-holding primitive.
+- **A declined transport is reported as a decline, not a failure.** A server that
+  answers the upgrade with `404` and one that never answers at all are different
+  findings: the first says the path in your URL is wrong, the second says the
+  target is out of capacity or unreachable. The run summary names the count of
+  each; a run that is all declines is not a capacity result.
+
+### Fixed
+
+- **A connection-holding run no longer blames the generator for its own
+  ceiling.** `--slow-connections 25 --rate 50` opens 25 connections and then
+  stops opening, so the summary reads `25 attempts, 10% of the 50/s cap` with
+  zero failures — the precise shape the shortfall note fires on, and the one
+  case where its conclusion was wrong: it told the operator that *this host*
+  could not emit faster, when the host was doing exactly what it was asked. The
+  ceiling is now declared for the slow modes and the two new ones, which both
+  silences the false attribution and prints the bound next to the module name.
+  This affects `slowloris` / `slowbody` / `slow-read` too, which had the same
+  misreading since the note was introduced in 0.25.0.
+
+### Notes
+
+- `http(s)` URLs, not `ws(s)`: the upgrade *is* an HTTP/1.1 request, and the
+  datum gate authorizes http(s) — so `https://` is how you say `wss://`. The
+  safety boundary is unchanged: datum authorization, resolve-once, pinned connect
+  address, kill switch, `--duration`.
+- TLS for these two pins ALPN to `http/1.1`. Without it, a target offering h2
+  could negotiate a protocol the upgrade cannot run over, and every connection
+  would be counted as declined for a reason that was ours.
+- The README roadmap's Phase 7 line had drifted — it still listed the protocol
+  coverage as of 0.12.0. It now reflects what is actually implemented, and names
+  what is left after Phase 8 (HTTP/3 & QUIC, IPv6 for the raw L3/L4 modes).
+
 ## [0.33.0] — 2026-07-31
 
 The tail of the same external review. 0.32.0 took the allowlist bypass and the
@@ -1440,6 +1506,7 @@ Phases 0–4.
   builds packets from the real source only.
 
 [Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.33.0...HEAD
+[0.34.0]: https://github.com/h4b00b/jinrai/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/h4b00b/jinrai/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/h4b00b/jinrai/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/h4b00b/jinrai/compare/v0.30.0...v0.31.0
