@@ -290,6 +290,22 @@ a 10.0s attempt timeout carry 102/s once attempts run to timeout, ...
 sending anything. `--allow-underpowered` proceeds anyway, for a run where
 holding a fixed slot budget against the target *is* the test.
 
+**`--l4-mode tcp` is the same failure and gets the same refusal**, in its own
+flags: a connect worker is held for a whole handshake, so `--concurrency` over
+`--connect-timeout-ms` is what the flood can offer once the target stops
+answering — the stock 256 over 500 ms carry **512/s**. The refusal names
+`--concurrency` and `--connect-timeout-ms`, never L7's flags, because advice that
+does not parse is worse than none. In a multi-vector run `--rate` is one ceiling
+split between the vectors, so the check runs against the connect vector's
+*share*, says where that smaller number came from, and scales its `--rate`
+suggestion back up to a total that works when pasted.
+
+The other L3/L4 modes are not checked and cannot be: a packet flood holds no slot
+at all — `sendto` returns and the unit is gone — and `--l4-mode data` opens its
+pool once and then writes into it, so the connect cost bounds its first second
+rather than its steady state. Refusing on a figure that describes neither would be
+a refusal an operator is right to ignore.
+
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
 | `websocket` / `sse` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (Ping tick, `websocket` only) | same as above |
 | `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
@@ -448,7 +464,7 @@ jinrai $REQ --layer l4 --l4-mode udp --allow 10.0.0.0/8 --target 10.1.2.3 --port
 # --concurrency is both the local footprint AND the parallelism; no privilege needed
 jinrai $REQ --layer l4 --l4-mode tcp --allow 10.0.0.0/8 --target 10.1.2.3 --port 443 \
        --rate 5000 --duration 60 \
-       --concurrency 512 --connect-timeout-ms 500
+       --concurrency 512 --connect-timeout-ms 100
 
 # PSH-ACK data flood: real connections filled with application data
 jinrai $REQ --layer l4 --l4-mode data --allow 10.0.0.0/8 --target 10.1.2.3 --port 80 \

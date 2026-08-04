@@ -580,6 +580,40 @@ impl RunReport {
     }
 }
 
+/// The most a run can offer per second once every attempt runs to its timeout.
+///
+/// A slot carries one attempt at a time and is held for that attempt's whole
+/// life, so the dispatcher can only start a new one as fast as slots come back.
+/// The longest an attempt can hold a slot is the attempt timeout — past that the
+/// generator abandons it — which makes `slots / timeout` the floor on offered
+/// rate: the rate still reachable when the target has stopped answering
+/// entirely.
+///
+/// This is the number that decides whether `--rate` is a load the target will
+/// ever see. Above it, the surplus is never offered, and the run measures this
+/// generator's budget while reporting it as the target's behaviour. See
+/// [`RunReport::not_offered`], which is where that shortfall surfaces once the
+/// window has closed.
+///
+/// `None` when there is no ceiling to state: an unbounded budget or a zero
+/// timeout.
+///
+/// Note this is the *worst* case, not a prediction. A target answering in 13ms
+/// recycles a slot 700x faster than a 10s timeout does, so a healthy run never
+/// approaches it — which is exactly why the shortfall shows up only once the
+/// target starts to struggle.
+///
+/// Lives here rather than in a traffic crate because it is not one layer's
+/// arithmetic. It is the same slot ledger wherever a run holds a bounded pool
+/// for the life of an attempt: `--max-connections` over `--request-timeout-ms`
+/// at L7, `--concurrency` over `--connect-timeout-ms` for the L4 connect flood.
+/// Two copies would be two chances for the refusal and the diagnostic to quote
+/// different ceilings for the same run.
+pub fn worst_case_offered_rate(slots: usize, attempt_timeout: Duration) -> Option<f64> {
+    let secs = attempt_timeout.as_secs_f64();
+    (slots > 0 && secs > 0.0).then(|| slots as f64 / secs)
+}
+
 /// How many distinct failure messages a `--debug` run keeps.
 ///
 /// The text comes from the peer's behaviour, so it is not ours to trust with an
@@ -900,6 +934,48 @@ mod tests {
     fn rate_cap_interval() {
         assert_eq!(RateCap::new(0).min_interval(), None);
         assert_eq!(RateCap::new(1000).min_interval(), Some(Duration::from_millis(1)));
+    }
+
+    /// The slot ledger both layers refuse on: a slot is held for a whole attempt,
+    /// so `slots / timeout` is the rate still reachable when nothing completes.
+    #[test]
+    fn worst_case_offered_rate_is_slots_over_timeout() {
+        // Halving the timeout doubles the reachable rate — the cheaper of the two
+        // levers, since the other one costs a descriptor per slot.
+        assert_eq!(worst_case_offered_rate(1024, Duration::from_secs(10)), Some(102.4));
+        assert_eq!(worst_case_offered_rate(1024, Duration::from_secs(5)), Some(204.8));
+        assert_eq!(worst_case_offered_rate(4096, Duration::from_secs(1)), Some(4096.0));
+        // The L4 connect flood's stock budget, on the same arithmetic: 256 slots
+        // over a 500ms connect timeout.
+        assert_eq!(worst_case_offered_rate(256, Duration::from_millis(500)), Some(512.0));
+    }
+
+    /// No ceiling to state is not a ceiling of zero: an unbounded budget must pass
+    /// the check rather than refuse every rate above nothing.
+    #[test]
+    fn worst_case_offered_rate_is_none_when_unbounded() {
+        assert_eq!(worst_case_offered_rate(0, Duration::from_secs(10)), None);
+        assert_eq!(worst_case_offered_rate(1024, Duration::ZERO), None);
+    }
+
+    /// The failure sample is bounded, and a truncated one says so rather than
+    /// silently dropping what it could not hold.
+    #[test]
+    fn failure_samples_are_capped_and_the_overflow_is_counted() {
+        let mut seen = BTreeMap::new();
+        for i in 0..MAX_FAILURE_SAMPLES {
+            record_failure_sample(&mut seen, format!("failure {i}"), 1);
+        }
+        assert_eq!(seen.len(), MAX_FAILURE_SAMPLES);
+        assert!(!seen.contains_key(FAILURE_OVERFLOW_KEY), "nothing has overflowed yet");
+
+        record_failure_sample(&mut seen, "one message too many".into(), 7);
+        assert_eq!(seen.len(), MAX_FAILURE_SAMPLES + 1, "only the overflow key is added");
+        assert_eq!(seen.get(FAILURE_OVERFLOW_KEY), Some(&7), "counted, not dropped");
+        // A message already in the map still counts, full or not — truncation must
+        // not start losing occurrences of what it did keep.
+        record_failure_sample(&mut seen, "failure 0".into(), 3);
+        assert_eq!(seen.get("failure 0"), Some(&4));
     }
 
     /// The safety property of a multi-vector run: however the cap is split, the

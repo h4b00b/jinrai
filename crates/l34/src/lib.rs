@@ -81,8 +81,8 @@ use hdrhistogram::Histogram;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use jinrai_core::{
-    record_failure_sample, ErrnoBucket, ErrnoTally, Layer, ModuleError, RateCap, RunPlan,
-    RunReport, StressModule,
+    record_failure_sample, worst_case_offered_rate, ErrnoBucket, ErrnoTally, Layer, ModuleError,
+    RateCap, RunPlan, RunReport, StressModule,
 };
 
 use crate::mode::{IcmpQuery, TcpFlags};
@@ -484,12 +484,17 @@ impl L34Engine {
             let line = match mode {
                 L4Mode::TcpConnect => {
                     let slots = effective_parallelism(cap);
+                    // The same ledger the CLI refuses an underpowered run on, so
+                    // the diagnostic and the refusal can never quote different
+                    // ceilings for one command line.
+                    let offerable = worst_case_offered_rate(slots, cfg.connect_timeout)
+                        .map(|r| format!("{r:.0}/s"))
+                        .unwrap_or_else(|| "an unbounded rate".to_string());
                     format!(
-                        "{}: {slots} sockets, connect timeout {:?} — at most {}/s can be \
+                        "{}: {slots} sockets, connect timeout {:?} — at most {offerable} can be \
                          offered if nothing completes",
                         mode.label(),
                         cfg.connect_timeout,
-                        offerable_per_second(slots, cfg.connect_timeout),
                     )
                 }
                 L4Mode::Data => format!(
@@ -979,7 +984,12 @@ const MAX_DATA_PAYLOAD: usize = 65_536;
 /// with a resident cost of a few MiB. Beyond this, more threads is the wrong
 /// instrument — lower `--connect-timeout-ms` (which cuts residency directly) or
 /// move the pool to non-blocking connects.
-const MAX_CONNECT_WORKERS: usize = 4096;
+///
+/// Public because the CLI's underpowered-run refusal suggests raising
+/// `--concurrency`, and a suggestion past this ceiling is a flag the parser would
+/// accept and the pool would then clamp away — advice the tool itself would not
+/// take.
+pub const MAX_CONNECT_WORKERS: usize = 4096;
 
 /// The most simultaneous handshakes a connect flood can have in flight, given a
 /// `--concurrency` budget.
@@ -1038,24 +1048,6 @@ fn effective_payload(mode: L4Mode, requested: usize) -> Option<usize> {
         // the protocol, not by `--payload-size`.
         _ => None,
     }
-}
-
-/// The most attempts a slot-bound flood can *start* per second, given its socket
-/// budget and its per-attempt timeout.
-///
-/// A slot is held for an attempt's whole life, so when attempts run to the
-/// timeout — which is exactly the case a saturating target produces — the
-/// dispatcher can begin only `slots / timeout` of them per second, whatever
-/// `--rate` says. Reported rather than assumed: a run that cannot offer the rate
-/// it was given reports our ceiling as the target's capacity.
-fn offerable_per_second(slots: usize, timeout: Duration) -> u64 {
-    let secs = timeout.as_secs_f64();
-    // A zero timeout is not reachable through the CLI, and treating it as an
-    // infinite ceiling beats dividing by zero in a diagnostic line.
-    if secs <= 0.0 {
-        return u64::MAX;
-    }
-    (slots as f64 / secs) as u64
 }
 
 /// The `--debug` progress line for one vector: what it has done so far, once a

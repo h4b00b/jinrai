@@ -453,32 +453,6 @@ pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// to match.
 pub const DEFAULT_MAX_CONNS: usize = 1024;
 
-/// The most a run can offer per second once every attempt runs to its timeout.
-///
-/// A slot carries one attempt at a time and is held for that attempt's whole
-/// life, so the dispatcher can only start a new one as fast as slots come back.
-/// The longest an attempt can hold a slot is the request timeout — past that the
-/// client abandons it — which makes `slots / timeout` the floor on offered rate:
-/// the rate still reachable when the target has stopped answering entirely.
-///
-/// This is the number that decides whether `--rate` is a load the target will
-/// ever see. Above it, the surplus is never offered, and the run measures this
-/// generator's budget while reporting it as the target's behaviour. See
-/// [`RunReport::not_offered`], which is where that shortfall surfaces today —
-/// after the window has closed.
-///
-/// `None` when there is no ceiling to state: an unbounded budget
-/// (`--max-connections 0`) or a zero timeout.
-///
-/// Note this is the *worst* case, not a prediction. A target answering in 13ms
-/// recycles a slot 700x faster than a 10s timeout does, so a healthy run never
-/// approaches it — which is exactly why the shortfall shows up only once the
-/// target starts to struggle.
-pub fn worst_case_offered_rate(max_connections: usize, request_timeout: Duration) -> Option<f64> {
-    let secs = request_timeout.as_secs_f64();
-    (max_connections > 0 && secs > 0.0).then(|| max_connections as f64 / secs)
-}
-
 impl L7Engine {
     pub fn new(gate: Authorization, spec: RequestSpec) -> Self {
         Self {
@@ -1628,6 +1602,7 @@ pub(crate) async fn wait_for_kill(kill: jinrai_safety::KillSwitch) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jinrai_core::worst_case_offered_rate;
     use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
@@ -2217,30 +2192,19 @@ mod tests {
         ));
     }
 
-    /// The arithmetic the CLI refuses an underpowered run on. The stock defaults
-    /// are pinned deliberately: 1024 slots at a 10s timeout carry 102/s, just
-    /// over the default `--rate 100`, so a run that touches none of the three
-    /// knobs must never trip the check. Move any default and this test says so
-    /// before an operator discovers it as a refusal on a command that used to run.
+    /// The arithmetic the CLI refuses an underpowered run on, at L7's own
+    /// defaults. The numbers are pinned deliberately: 1024 slots at a 10s timeout
+    /// carry 102/s, just over the default `--rate 100`, so a run that touches none
+    /// of the three knobs must never trip the check. Move any default and this
+    /// test says so before an operator discovers it as a refusal on a command that
+    /// used to run. (The function itself lives in `core` and is tested there; this
+    /// is about these defaults staying compatible with it.)
     #[test]
-    fn worst_case_offered_rate_is_slots_over_timeout() {
+    fn the_stock_l7_budget_carries_the_stock_l7_rate() {
         let ceiling = worst_case_offered_rate(DEFAULT_MAX_CONNS, DEFAULT_REQUEST_TIMEOUT)
             .expect("a bounded budget has a ceiling");
         assert!((ceiling - 102.4).abs() < 0.001, "{ceiling}");
         assert!(ceiling >= 100.0, "the stock defaults must not refuse themselves: {ceiling}");
-
-        // Halving the timeout doubles the reachable rate — the cheaper of the two
-        // levers, since the other one costs a descriptor per slot.
-        assert_eq!(worst_case_offered_rate(1024, Duration::from_secs(5)), Some(204.8));
-        assert_eq!(worst_case_offered_rate(4096, Duration::from_secs(1)), Some(4096.0));
-    }
-
-    /// No ceiling to state is not a ceiling of zero: an unbounded budget must
-    /// pass the check rather than refuse every rate above nothing.
-    #[test]
-    fn worst_case_offered_rate_is_none_when_unbounded() {
-        assert_eq!(worst_case_offered_rate(0, DEFAULT_REQUEST_TIMEOUT), None);
-        assert_eq!(worst_case_offered_rate(1024, Duration::ZERO), None);
     }
 
     #[test]

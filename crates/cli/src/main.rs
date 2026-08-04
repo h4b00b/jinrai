@@ -313,18 +313,22 @@ OPTIONS:
                           latency is the socket count, so this is what keeps a run
                           from becoming a descriptor self-test on YOUR box. 0
                           means unbounded — an explicit choice, never the default
-    --allow-underpowered  Run the fast get/post/head flood even when the slot
-                          budget cannot carry --rate. A slot is held for a whole
-                          attempt, so once attempts run to the request timeout
-                          only --max-connections / --request-timeout-ms of them
-                          can start each second (the stock 1024 over 10s = 102/s);
-                          asking for more offers load the target never sees.
+    --allow-underpowered  Run even when the slot budget cannot carry --rate. A
+                          slot is held for a whole attempt, so once attempts run
+                          to the timeout only slots / timeout of them can start
+                          each second: --max-connections / --request-timeout-ms
+                          for the fast get/post/head flood (the stock 1024 over
+                          10s = 102/s), --concurrency / --connect-timeout-ms for
+                          --l4-mode tcp (the stock 256 over 500ms = 512/s).
+                          Asking for more offers load the target never sees.
                           jinrai refuses that up front, because the shortfall
                           appears only once the target starts to struggle — the
                           moment the run is finally measuring something — and the
                           summary would then be reporting OUR ceiling as the
-                          target's capacity. The refusal prints the two knobs that
-                          fix it. Use this flag when the shortfall is the point
+                          target's capacity. The refusal prints the two knobs of
+                          the layer that is running, as pasteable fragments. Use
+                          this flag when the shortfall is the point. The packet
+                          floods hold no slot and are never checked
     --debug               Narrate the run on stderr: what will go on the wire as
                           composed, a progress line each second while it runs,
                           and the DISTINCT FAILURE MESSAGES behind the errno
@@ -964,15 +968,58 @@ fn l7_profile(args: &Args, rate_cap: RateCap, duration: Duration) -> Option<Load
     }
 }
 
-/// Refuse a fast-L7 run whose in-flight budget cannot carry the rate it asks
-/// for, naming the knob to turn. `None` when the budget can deliver the cap.
+/// Which layer's knobs an underpowered-run refusal is talking about.
 ///
-/// `--rate`, `--max-connections` and `--request-timeout-ms` are not three
-/// independent knobs, and nothing said so. A slot is held for an attempt's whole
-/// life, so once attempts run to the timeout the dispatcher can start only
-/// `slots / timeout` of them per second — see
-/// [`jinrai_l7::worst_case_offered_rate`]. Everything above that is load the
-/// target never sees.
+/// The arithmetic is one ledger ([`jinrai_core::worst_case_offered_rate`]) and
+/// the failure is one failure, but the flags that fix it are not the same words:
+/// telling an `--layer l4` operator to raise `--max-connections` names a flag
+/// that layer does not have, and a refusal whose advice does not parse is worse
+/// than none.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SlotBudget {
+    /// The flag that sets how many attempts may be in flight at once.
+    slots_flag: &'static str,
+    /// The flag that bounds how long one attempt may hold its slot.
+    timeout_flag: &'static str,
+    /// The largest value `slots_flag` can be raised to and still take effect.
+    /// Suggesting past it would name a value the parser accepts and the engine
+    /// then clamps away — advice the tool itself would not take.
+    max_slots: usize,
+    /// What the run is called in the refusal's first line.
+    what: &'static str,
+}
+
+/// L7's fast `get`/`post`/`head` flood: a semaphore of keep-alive requests,
+/// bounded by `--max-connections`, each held for at most `--request-timeout-ms`.
+const L7_BUDGET: SlotBudget = SlotBudget {
+    slots_flag: "--max-connections",
+    timeout_flag: "--request-timeout-ms",
+    max_slots: MAX_CONNECTIONS,
+    what: "request",
+};
+
+/// The L4 connect flood: a pool of blocking workers bounded by `--concurrency`,
+/// each holding one handshake for at most `--connect-timeout-ms`.
+///
+/// `max_slots` is the pool's own worker ceiling rather than the parser's, because
+/// past it `--concurrency` buys nothing: the pool clamps, and the run would come
+/// back with the identical shortfall and the identical refusal.
+const L4_CONNECT_BUDGET: SlotBudget = SlotBudget {
+    slots_flag: "--concurrency",
+    timeout_flag: "--connect-timeout-ms",
+    max_slots: jinrai_l34::MAX_CONNECT_WORKERS,
+    what: "handshake",
+};
+
+/// Refuse a run whose in-flight budget cannot carry the rate it asks for, naming
+/// the knobs of the layer that is running. `None` when the budget can deliver the
+/// cap.
+///
+/// `--rate`, the slot flag and the timeout flag are not three independent knobs,
+/// and nothing said so. A slot is held for an attempt's whole life, so once
+/// attempts run to the timeout the dispatcher can start only `slots / timeout` of
+/// them per second — see [`jinrai_core::worst_case_offered_rate`]. Everything
+/// above that is load the target never sees.
 ///
 /// This refuses rather than warns because the shortfall arrives exactly when the
 /// measurement matters. A healthy target answers in milliseconds and never comes
@@ -982,21 +1029,40 @@ fn l7_profile(args: &Args, rate_cap: RateCap, duration: Duration) -> Option<Load
 /// quietly. The summary does say so afterwards (`not sent` / `bound by`), but
 /// afterwards costs a whole window, and the operator has to know to read for it.
 ///
-/// The stock defaults pass by construction (1024 slots at 10s carry 102/s,
-/// against `--rate 100`), so this only fires on a rate someone raised without
-/// the budget to match. `--allow-underpowered` is how an operator says the
-/// shortfall is understood and wanted — holding a fixed slot budget against a
-/// target on purpose, say.
+/// Both layers' stock defaults pass by construction — 1024 slots at 10s carry
+/// 102/s against `--rate 100` at L7, 256 slots at 500ms carry 512/s at L4 — so
+/// this only fires on a rate someone raised without the budget to match.
+/// `--allow-underpowered` is how an operator says the shortfall is understood and
+/// wanted — holding a fixed slot budget against a target on purpose, say.
+/// `rate` is the load **this budget** must carry, which for a multi-vector L4 run
+/// is the vector's share rather than the flag. `shared_cap` carries the total the
+/// operator typed and how many vectors split it, so the refusal can say where the
+/// smaller number came from and scale the `--rate` suggestion back up to a value
+/// that works when pasted. `None` for a run whose cap is not split.
 fn underpowered_refusal(
-    max_connections: usize,
-    request_timeout: Duration,
+    budget: SlotBudget,
+    slots: usize,
+    attempt_timeout: Duration,
     rate: u64,
+    shared_cap: Option<(u64, usize)>,
 ) -> Option<String> {
-    let ceiling = jinrai_l7::worst_case_offered_rate(max_connections, request_timeout)?;
+    let SlotBudget { slots_flag, timeout_flag, max_slots, what } = budget;
+    let max_connections = slots;
+    let ceiling = jinrai_core::worst_case_offered_rate(slots, attempt_timeout)?;
     if rate == 0 || ceiling >= rate as f64 {
         return None;
     }
-    let timeout_secs = request_timeout.as_secs_f64();
+    let timeout_secs = attempt_timeout.as_secs_f64();
+    // Where the number in the headline came from, when it is not the number that
+    // was typed. Without this the refusal quotes a `--rate` the operator will go
+    // looking for in their own command line and not find.
+    let shared_note = match shared_cap {
+        Some((total, vectors)) if vectors > 1 => format!(
+            "note: --rate {total} is one ceiling shared between {vectors} vectors, so this \
+             one is allocated {rate}/s.\n"
+        ),
+        _ => String::new(),
+    };
 
     // Both levers, then the option of asking for less. Each is a command-line
     // fragment the operator can paste, because a refusal that only diagnoses is
@@ -1008,16 +1074,16 @@ fn underpowered_refusal(
     let timeout_fix_ms = (max_connections as f64 * 1000.0 / rate as f64).floor();
     if timeout_fix_ms >= 1.0 {
         fixes.push((
-            format!("--request-timeout-ms {timeout_fix_ms:.0}"),
+            format!("{timeout_flag} {timeout_fix_ms:.0}"),
             format!("{max_connections} slots turning over that fast carry {rate}/s"),
         ));
     }
     // More slots is the other lever, and it costs a descriptor each — worth
     // saying, because a fix that quietly needs an fd ceiling raise is not a fix.
     let conns_fix = (rate as f64 * timeout_secs).ceil();
-    if conns_fix <= MAX_CONNECTIONS as f64 {
+    if conns_fix <= max_slots as f64 {
         fixes.push((
-            format!("--max-connections {conns_fix:.0}"),
+            format!("{slots_flag} {conns_fix:.0}"),
             format!("{rate}/s at the current {timeout_secs:.1}s timeout, one descriptor each"),
         ));
     }
@@ -1025,25 +1091,37 @@ fn underpowered_refusal(
     // `--rate 0` means "send nothing" here, so a budget whose ceiling rounds
     // below 1/s must not be handed its own floor back as a suggestion.
     if ceiling >= 1.0 {
-        fixes
-            .push((format!("--rate {:.0}", ceiling.floor()), "what this budget already delivers".into()));
+        // Scaled back up to the flag's own scale when the cap is split, because
+        // this fragment is meant to be pasted: `--rate 512` on a two-vector run
+        // hands this vector 256 and earns the identical refusal.
+        let vectors = shared_cap.map(|(_, n)| n.max(1)).unwrap_or(1) as f64;
+        let suggestion = ceiling.floor() * vectors;
+        fixes.push((
+            format!("--rate {suggestion:.0}"),
+            if vectors > 1.0 {
+                format!("what this budget delivers, times the {vectors:.0} vectors sharing it")
+            } else {
+                "what this budget already delivers".into()
+            },
+        ));
     }
 
     let w = fixes.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
     let advice = if fixes.is_empty() {
         // Every lever is off the end of its own scale — the three numbers are not
         // reconcilable and there is nothing honest to suggest.
-        "\n  no combination of --request-timeout-ms, --max-connections and --rate within \
-         their limits reaches this; the run as described cannot be generated."
-            .to_string()
+        format!(
+            "\n  no combination of {timeout_flag}, {slots_flag} and --rate within \
+             their limits reaches this; the run as described cannot be generated."
+        )
     } else {
         let lines: Vec<String> =
             fixes.iter().map(|(f, why)| format!("    {f:<w$}   {why}")).collect();
         format!("\n  raise the ceiling past {rate}/s:\n{}", lines.join("\n"))
     };
     Some(format!(
-        "--rate {rate} cannot be offered with this in-flight budget: {max_connections} slots \
-         over a {timeout_secs:.1}s attempt timeout carry {ceiling:.0}/s once attempts run to \
+        "{shared_note}--rate {rate} cannot be offered with this in-flight budget: {max_connections} slots \
+         over a {timeout_secs:.1}s {what} timeout carry {ceiling:.0}/s once attempts run to \
          timeout, and a target that stops answering is what a stress run is looking for. The \
          shortfall would land exactly when the target starts to struggle, and the summary would \
          report OUR ceiling as its capacity.{advice}\n  --allow-underpowered runs it as asked."
@@ -1085,9 +1163,13 @@ fn run_l7(
     // point is to fail on the command line, not after the window has closed.
     if matches!(args.l7_kind, L7Kind::Fast(_)) && !args.allow_underpowered {
         if let Some(msg) = underpowered_refusal(
+            L7_BUDGET,
             args.max_connections,
             Duration::from_millis(args.request_timeout_ms),
             args.rate,
+            // L7 runs one workload, so the cap is not split and `--rate` means
+            // what it says.
+            None,
         ) {
             return Err(audit_refusal(&mut audit, "arguments", &msg)?);
         }
@@ -1497,6 +1579,41 @@ fn run_l4(
             "--layer l3/l4 requires at least one --target <IP>",
         )?);
     }
+    // The connect flood holds a worker for a whole handshake, so its in-flight
+    // budget must be able to carry the rate the vector was given — the same
+    // arithmetic, and the same refusal, as the fast L7 flood. Checked here with
+    // the other pre-traffic refusals so `--dry-run` reaches it: the point is to
+    // fail on the command line, not after the window has closed.
+    //
+    // Only `tcp`. The packet floods (udp, the raw flag/fragment/GRE/ICMP modes)
+    // hold no slot at all — a `sendto` returns and the unit is gone — so there is
+    // no ceiling to breach. `data` holds connections too, but opens its pool once
+    // and then writes into it: the connect cost bounds its first second, not its
+    // steady state, and refusing on a figure that describes neither would be a
+    // refusal the operator is right to ignore.
+    if !args.allow_underpowered && args.l4_modes.contains(&L4Mode::TcpConnect) {
+        // The share this vector actually gets, not the flag: `--rate` is one
+        // ceiling split between the vectors of a multi-vector run, so checking the
+        // whole cap would refuse a two-vector run whose connect half is fine.
+        let share = rate_cap
+            .split_across(args.l4_modes.len())
+            .get(args.l4_modes.iter().position(|m| *m == L4Mode::TcpConnect).unwrap_or(0))
+            .map(|c| c.per_second)
+            .unwrap_or(rate_cap.per_second);
+        if let Some(msg) = underpowered_refusal(
+            L4_CONNECT_BUDGET,
+            // The ceiling the pool will actually enforce. Quoting a `--concurrency`
+            // it then clamps away would make the refusal advise a knob that does
+            // nothing.
+            jinrai_l34::effective_parallelism(args.concurrency.max(1)),
+            Duration::from_millis(args.connect_timeout_ms),
+            share,
+            Some((rate_cap.per_second, args.l4_modes.len())),
+        ) {
+            return Err(audit_refusal(&mut audit, "arguments", &msg)?);
+        }
+    }
+
     // ICMP is portless; every other mode targets a port (or a set of them).
     // A run is portless only if every vector is: one non-ICMP vector in the list
     // means the run addresses a port.
@@ -2098,7 +2215,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         ),
         Layer::L3 | Layer::L4 => {
             ("--target", &["--url", "--header", "--l7-method", "--max-connections",
-                "--allow-underpowered", "--follow-redirects"][..])
+                "--follow-redirects"][..])
         }
     };
     // Reported through the same warning as the rest when the run is not l7 at all.
@@ -2494,7 +2611,7 @@ mod tests {
     /// cap, and reported that as the target's behaviour.
     #[test]
     fn a_rate_the_slot_budget_cannot_carry_is_refused() {
-        let msg = underpowered_refusal(1024, Duration::from_secs(10), 2000)
+        let msg = underpowered_refusal(L7_BUDGET, 1024, Duration::from_secs(10), 2000, None)
             .expect("1024 slots over 10s cannot offer 2000/s");
         assert!(msg.contains("102/s"), "the reachable ceiling must be stated: {msg}");
         // Both levers, as pasteable fragments: 1024 slots clear 2000/s at 512ms,
@@ -2513,9 +2630,11 @@ mod tests {
         let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]);
         assert_eq!(
             underpowered_refusal(
+                L7_BUDGET,
                 a.max_connections,
                 Duration::from_millis(a.request_timeout_ms),
-                a.rate
+                a.rate,
+                None,
             ),
             None
         );
@@ -2525,10 +2644,10 @@ mod tests {
     /// budget that clears the cap both run untouched.
     #[test]
     fn a_budget_that_carries_the_rate_is_not_refused() {
-        assert_eq!(underpowered_refusal(0, Duration::from_secs(10), 2_000_000), None);
-        assert_eq!(underpowered_refusal(4096, Duration::from_secs(1), 2000), None);
+        assert_eq!(underpowered_refusal(L7_BUDGET, 0, Duration::from_secs(10), 2_000_000, None), None);
+        assert_eq!(underpowered_refusal(L7_BUDGET, 4096, Duration::from_secs(1), 2000, None), None);
         // Exactly at the ceiling is enough; the check is a shortfall, not headroom.
-        assert_eq!(underpowered_refusal(2000, Duration::from_secs(1), 2000), None);
+        assert_eq!(underpowered_refusal(L7_BUDGET, 2000, Duration::from_secs(1), 2000, None), None);
     }
 
     /// A lever that cannot reach must not be printed as if it could. Below a
@@ -2539,19 +2658,109 @@ mod tests {
     fn only_the_levers_that_can_actually_reach_are_offered() {
         // 100 slots asked for 200000/s: no timeout above a millisecond turns them
         // over fast enough, but 200000 slots at the 1s timeout is buyable.
-        let msg = underpowered_refusal(100, Duration::from_secs(1), 200_000).unwrap();
+        let msg = underpowered_refusal(L7_BUDGET, 100, Duration::from_secs(1), 200_000, None).unwrap();
         assert!(!msg.contains("--request-timeout-ms"), "sub-millisecond lever offered: {msg}");
         assert!(msg.contains("--max-connections 200000"), "{msg}");
 
         // The mirror image: 1000/s over an hour-long timeout needs 3.6M slots,
         // past the ceiling --max-connections itself enforces, so only the timeout
         // is left. Suggesting a value the parser would reject is not advice.
-        let msg = underpowered_refusal(1024, Duration::from_secs(3600), 1000).unwrap();
+        let msg = underpowered_refusal(L7_BUDGET, 1024, Duration::from_secs(3600), 1000, None).unwrap();
         assert!(!msg.contains("--max-connections"), "unbuyable slot count offered: {msg}");
         assert!(msg.contains("--request-timeout-ms 1024"), "{msg}");
         // 1024 slots over an hour carry 0.28/s, and `--rate 0` sends nothing —
         // the one suggestion that would leave the operator with no run at all.
         assert!(!msg.contains("--rate 0"), "a do-nothing rate was suggested: {msg}");
+    }
+
+    /// The same failure at L4, and the reason the check is layer-aware: the
+    /// arithmetic is identical, but a refusal telling an `--layer l4` operator to
+    /// raise `--max-connections` names a flag that layer does not have.
+    #[test]
+    fn an_l4_connect_flood_is_refused_in_its_own_flags() {
+        // 16 workers over a 500ms connect timeout carry 32/s; 2000 was asked for.
+        let msg = underpowered_refusal(L4_CONNECT_BUDGET, 16, Duration::from_millis(500), 2000, None)
+            .expect("16 slots over 500ms cannot offer 2000/s");
+        assert!(msg.contains("32/s"), "the reachable ceiling must be stated: {msg}");
+        assert!(msg.contains("--concurrency 1000"), "{msg}");
+        assert!(msg.contains("--connect-timeout-ms 8"), "{msg}");
+        assert!(msg.contains("handshake timeout"), "the L4 attempt is a handshake: {msg}");
+        // The L7 flags must not appear: they are the ones this layer cannot take.
+        assert!(!msg.contains("--max-connections"), "L7's flag was offered to l4: {msg}");
+        assert!(!msg.contains("--request-timeout-ms"), "L7's flag was offered to l4: {msg}");
+    }
+
+    /// The same regression guard the L7 defaults have: 256 workers over the stock
+    /// 500ms connect timeout carry 512/s, comfortably over the default `--rate
+    /// 100`, so a connect flood that touches none of the knobs must run. Move
+    /// either default and this says so before an operator meets it as a refusal on
+    /// a command that used to work.
+    #[test]
+    fn the_stock_l4_connect_budget_does_not_refuse_itself() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--target", "10.1.2.3", "--layer", "l4",
+            "--l4-mode", "tcp", "--port", "443",
+        ]);
+        assert_eq!(
+            underpowered_refusal(
+                L4_CONNECT_BUDGET,
+                jinrai_l34::effective_parallelism(a.concurrency),
+                Duration::from_millis(a.connect_timeout_ms),
+                a.rate,
+                None,
+            ),
+            None
+        );
+    }
+
+    /// The slot suggestion must be one the pool will honour. `--concurrency`
+    /// parses up to a million, but the connect pool clamps its workers, so a
+    /// suggestion past that ceiling would be advice the tool itself would not
+    /// take: the operator pastes it and gets the identical refusal back.
+    #[test]
+    fn the_l4_slot_suggestion_stops_at_the_ceiling_the_pool_enforces() {
+        assert_eq!(L4_CONNECT_BUDGET.max_slots, jinrai_l34::MAX_CONNECT_WORKERS);
+        // 100000/s over a 1s timeout needs 100000 workers, far past the pool's
+        // ceiling — so only the timeout lever, and asking for less, are offered.
+        let msg =
+            underpowered_refusal(L4_CONNECT_BUDGET, 512, Duration::from_secs(1), 100_000, None).unwrap();
+        assert!(!msg.contains("--concurrency"), "an unbuyable worker count was offered: {msg}");
+        assert!(msg.contains("--rate 512"), "{msg}");
+    }
+
+    /// A multi-vector run's `--rate` is one ceiling split between its vectors, so
+    /// the number the check refuses on is not the number the operator typed. Both
+    /// have to appear, and the `--rate` suggestion has to be on the flag's scale —
+    /// pasting back a per-vector figure earns the identical refusal.
+    #[test]
+    fn a_split_rate_cap_says_so_and_suggests_a_pasteable_total() {
+        // Two vectors sharing --rate 2000; the connect half is allocated 1000/s,
+        // and 256 workers over 500ms carry 512/s.
+        let msg = underpowered_refusal(
+            L4_CONNECT_BUDGET,
+            256,
+            Duration::from_millis(500),
+            1000,
+            Some((2000, 2)),
+        )
+        .expect("1000/s is past what 256 slots over 500ms can offer");
+        assert!(msg.contains("--rate 2000 is one ceiling shared between 2 vectors"), "{msg}");
+        assert!(msg.contains("allocated 1000/s"), "{msg}");
+        // 512/s per vector, so 1024 across the two — not 512, which would split
+        // back down to 256 each and refuse again.
+        assert!(msg.contains("--rate 1024"), "the suggestion must be pasteable: {msg}");
+        assert!(!msg.contains("--rate 512 "), "a per-vector figure was suggested: {msg}");
+    }
+
+    /// `--allow-underpowered` is the way out at every layer, so it must stop being
+    /// reported as a flag of the wrong one.
+    #[test]
+    fn allow_underpowered_is_an_l4_flag_too() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--target", "10.1.2.3", "--layer", "l4",
+            "--l4-mode", "tcp", "--port", "443", "--allow-underpowered",
+        ]);
+        assert!(a.allow_underpowered);
     }
 
     #[test]
