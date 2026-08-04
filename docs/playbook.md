@@ -4,7 +4,7 @@ One section per row of a test plan, with the ready-to-paste command and an
 explanation of **every switch in it**, so whoever runs the test knows exactly
 what lands on the wire and how to read the result.
 
-Reference version: **0.44.0**.
+Reference version: **0.45.0**.
 
 ---
 
@@ -18,6 +18,7 @@ Reference version: **0.44.0**.
 - [Out of scope, and why](#out-of-scope-and-why)
 - [Reading the run summary](#reading-the-run-summary)
 - [Verifying the audit log](#verifying-the-audit-log)
+- [Seeing a run while it happens](#seeing-a-run-while-it-happens---debug)
 - [When a run reaches nothing](#when-a-run-reaches-nothing)
 
 ---
@@ -980,6 +981,33 @@ processes**, which is what makes a deleted middle run detectable.
 Honest about the limit: this is **tamper-evidence, not non-repudiation**. Anyone
 who rewrites the whole file can recompute a clean chain; closing that needs an
 HMAC or an external anchor, and it is out of scope.
+
+---
+
+## Seeing a run while it happens (`--debug`)
+
+For the fast `get`/`post`/`head` flood, `--debug` narrates on **stderr** — stdout
+stays exactly as scriptable as before. Use it when the summary left a question it
+could not answer, which is normally one of these three:
+
+| Question | What `--debug` shows |
+|---|---|
+| *What am I actually sending?* | The composed request before the first byte: URL after variation, **every header including the ones jinrai adds**, the body and its declared type, the single pinned resolution, and the policies in force. A `body … type: NONE — the target cannot tell what this is` is the whole diagnosis of a POST flood that reported `4xx` and tested nothing. |
+| *Is it doing anything? When did it start failing?* | One line a second: attempts, the rate **over the last second** (not the average — that hides mid-run degradation), completions by class, failures. |
+| *What does `4 x internal` actually mean?* | The distinct failure messages behind the errno buckets, with counts — `error sending request …: tcp connect error: Connection refused (os error 111)`. The bucket is the category; this is the cause. |
+
+```sh
+jinrai $A --url $URL --l7-method post --body '{"q":"load"}' \
+  --header 'Content-Type: application/json' --debug \
+  --rate 100 --duration 30 $REQ
+```
+
+It is **not** per-request logging, and deliberately so: at these rates a line per
+request is a second workload competing with the one under test, which would
+change the measurement it exists to explain. Everything is once, once a second,
+or aggregated. The failure sample is capped at 16 distinct messages and never
+enters the audit log — that text is chosen by the target, and the log is a
+bounded, hash-chained record.
 
 ---
 

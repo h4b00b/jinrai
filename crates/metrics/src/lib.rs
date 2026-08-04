@@ -343,6 +343,19 @@ pub fn render_summary(
                 &if is_local_ceiling(bucket) { p.warn(&line) } else { p.bad(&line) },
             ));
         }
+        // Under `--debug`, the sentence behind the bucket. The bucket says which
+        // KIND of failure; this says which failure — and it is the difference
+        // between "4 x internal" and "connection closed before message
+        // completed", which is the whole reason the flag exists.
+        if !report.failure_samples.is_empty() {
+            let mut ranked: Vec<(&String, u64)> =
+                report.failure_samples.iter().map(|(m, n)| (m, *n)).collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            out.push_str(&row(p, "  debug", "distinct failure messages, most frequent first:"));
+            for (msg, n) in ranked {
+                out.push_str(&row(p, "", &p.warn(&format!("{n} x  {msg}"))));
+            }
+        }
     } else {
         out.push_str(&row(p, "failed", &p.good("0")));
     }
