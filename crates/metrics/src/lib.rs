@@ -293,12 +293,46 @@ pub fn render_summary(
     // mean opposite things — so they are the pair that must not arrive in the
     // same colour. A completion count of zero is not good news, whatever the row
     // is called.
-    let completed = format!("{} {}", report.units_sent, share(report.units_sent, attempts));
+    //
+    // For a packet flood the row is not called `completed` at all. `sendto()`
+    // returning Ok means the local kernel queued the bytes; nothing observed them
+    // after that, and there is no acknowledgement in a UDP or SYN flood to wait
+    // for. A measured 500000/s loopback flood emitted every datagram it claimed
+    // and the receiving application read 11% of them — under a green
+    // `2497693 completed (100.0%)`. The load was real; the completion was not
+    // ours to claim. See `RunReport::unobserved_units`.
+    let all_unobserved = report.unobserved_units >= report.units_sent && report.units_sent > 0;
+    let counted = format!("{} {}", report.units_sent, share(report.units_sent, attempts));
     out.push_str(&row(
         p,
-        "completed",
-        &if report.units_sent > 0 { p.good(&completed) } else { p.bad(&completed) },
+        if all_unobserved { "emitted" } else { "completed" },
+        &match (report.units_sent > 0, all_unobserved) {
+            // Green is reserved for "the run did its job", and handing bytes to
+            // the local stack is not yet that — it is the premise of the test,
+            // not its result.
+            (true, true) => counted.clone(),
+            (true, false) => p.good(&counted),
+            _ => p.bad(&counted),
+        },
     ));
+    if report.units_sent > 0 && report.unobserved_units > 0 {
+        // Where the operator has to look, because it is not here. The receiving
+        // stack counts what it dropped, and on a flood that number is the result.
+        let value = if all_unobserved {
+            "handed to the local stack and not observed again — a datagram/raw \
+             flood has no acknowledgement, so this is offered load, not delivery. \
+             Confirm at the TARGET (`nstat -az '*RcvbufErrors*'`, `netstat -su`)"
+                .to_string()
+        } else {
+            format!(
+                "{} of these were datagram/raw units, which are counted as offered \
+                 rather than delivered — only the connection-oriented vectors here \
+                 observed the target",
+                report.unobserved_units,
+            )
+        };
+        out.push_str(&row(p, "  unacked", &p.warn(&value)));
+    }
 
     // What those completions were made of, for the primitives where "completed"
     // covers outcomes that mean opposite things. See `RunReport::detail`: without
@@ -382,7 +416,13 @@ pub fn render_summary(
         out.push_str(&row(p, "failed", &p.good("0")));
     }
 
-    if report.units_sent > 0 {
+    // `max_micros` is the tell that anything was timed at all: a packet flood has
+    // no completion to measure, so its histogram stays empty and every percentile
+    // is a literal 0 that the row then presents as a measurement. `p50 0us p90
+    // 0us p99 0us max 0us` under a UDP flood is not a fast target, it is four
+    // numbers nobody took — and beside a rate this run really did achieve, it
+    // reads like the former.
+    if report.units_sent > 0 && report.max_micros > 0 {
         let mut latency = format!(
             "p50 {}   p90 {}   p99 {}   max {}",
             fmt_micros(report.p50_micros),
@@ -1109,6 +1149,71 @@ mod tests {
             render_summary(&limited, &ctx(), None, &Palette::PLAIN).contains("429 x1000"),
             "a single rate-limit code is the finding, not noise"
         );
+    }
+
+    /// A packet flood's units are offered load, not delivered load, and the
+    /// summary may not call them completions.
+    ///
+    /// Measured, which is why the row exists: a 500000/s loopback UDP flood
+    /// emitted every datagram it claimed — the kernel's own `OutDatagrams` agreed
+    /// exactly, `SndbufErrors` was 0 — and the receiving application read 11% of
+    /// them, the rest counted by the peer's `RcvbufErrors`. The summary said
+    /// `2497693 completed (100.0%), failed 0, ran to completion`.
+    #[test]
+    fn a_packet_flood_reports_emitted_not_completed() {
+        let r = RunReport {
+            layer_label: "L4 udp-flood".into(),
+            units_sent: 2_497_693,
+            unobserved_units: 2_497_693,
+            ..Default::default()
+        };
+        let out = render_summary(&r, &ctx_l4(), None, &Palette::PLAIN);
+        assert!(out.contains("emitted"), "a datagram was not completed by anyone: {out}");
+        assert!(!out.contains("completed  2497693"), "{out}");
+        // And the row says where the answer actually is, because it is not here.
+        assert!(out.contains("unacked"), "{out}");
+        assert!(out.contains("RcvbufErrors"), "the operator must be pointed at the target: {out}");
+
+        // The colour rule: green means "the run did its job". Handing bytes to
+        // the local stack is the premise of the test, not its result.
+        let painted = render_summary(&r, &ctx_l4(), None, &Palette::ANSI);
+        let emitted_line = painted
+            .lines()
+            .find(|l| l.contains("emitted"))
+            .expect("the emitted row must render");
+        assert!(!emitted_line.contains(GREEN), "offered load must not be painted as success");
+    }
+
+    /// A connection-oriented run is unchanged: a completed handshake or an HTTP
+    /// response really is an observation of the target, and renaming that row
+    /// would have been a second wrong answer.
+    #[test]
+    fn an_observed_run_still_reports_completions() {
+        let r = RunReport {
+            layer_label: "L4 tcp-connect-flood".into(),
+            units_sent: 25_000,
+            ..Default::default()
+        };
+        let out = render_summary(&r, &ctx_l4(), None, &Palette::PLAIN);
+        assert!(out.contains("completed"), "{out}");
+        assert!(!out.contains("emitted"), "{out}");
+        assert!(!out.contains("unacked"), "{out}");
+    }
+
+    /// A multi-vector run mixes the two, which is why the field is a count and
+    /// not a flag: the row stays `completed` because some vector did observe the
+    /// target, and the caveat names how much of the total did not.
+    #[test]
+    fn a_mixed_run_keeps_completions_and_names_the_unacked_share() {
+        let r = RunReport {
+            layer_label: "L4 multi-vector [udp-flood + tcp-connect-flood]".into(),
+            units_sent: 5_000,
+            unobserved_units: 2_500,
+            ..Default::default()
+        };
+        let out = render_summary(&r, &ctx_l4(), None, &Palette::PLAIN);
+        assert!(out.contains("completed"), "{out}");
+        assert!(out.contains("2500 of these were datagram/raw units"), "{out}");
     }
 
     /// REGRESSION: the `internal` bucket printed the packet-layer meaning on an

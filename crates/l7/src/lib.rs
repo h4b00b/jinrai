@@ -1300,6 +1300,10 @@ impl StressModule for L7Engine {
             // classes above are the breakdown that matters here.
             detail: None,
             not_offered: skipped,
+            // Every unit here is an HTTP response that arrived. The target did
+            // something and we saw it, which is the whole difference from a
+            // packet flood — see `RunReport::unobserved_units`.
+            unobserved_units: 0,
         })
     }
 }

@@ -229,6 +229,24 @@ impl L4Mode {
         self.icmp_query().is_some()
     }
 
+    /// Whether a unit of this mode is **counted without anything observing it**.
+    ///
+    /// True for every datagram and raw-socket primitive: `sendto()` returning
+    /// `Ok` says the kernel queued the bytes, and nothing after that is visible
+    /// to the generator — there is no acknowledgement in a UDP or SYN flood to
+    /// wait for. False for the two connection-oriented modes, where the unit is a
+    /// completed handshake (`tcp`) or a write onto an established connection
+    /// (`data`) and TCP itself is the observation.
+    ///
+    /// The distinction is not `latency.is_some()`, which is what it looks like
+    /// from inside the send loop: the data flood's steady-state writes report no
+    /// latency either, and they are delivered — a measured run wrote 6.4 GB and
+    /// the peer read all of it. What separates the two is the socket, not the
+    /// timing. See [`RunReport::unobserved_units`].
+    pub fn is_fire_and_forget(self) -> bool {
+        !matches!(self, L4Mode::TcpConnect | L4Mode::Data)
+    }
+
     /// The TCP flags for a raw-TCP flood mode, or `None` for every other mode
     /// (UDP / TCP-connect need no raw socket; ICMP and GRE are not TCP).
     ///

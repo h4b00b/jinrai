@@ -73,6 +73,12 @@ pub enum AuditEvent {
         /// Completions plus failures — the denominator every rate is read against.
         attempts: u64,
         units_sent: u64,
+        /// How many of `units_sent` nothing observed past the local stack
+        /// accepting them — see [`RunReport::unobserved_units`]. Recorded because
+        /// the distinction survives worse than the count does: months later,
+        /// "2497693 completed" reads as a delivered flood, and for a datagram
+        /// primitive nobody ever established that.
+        unobserved_units: u64,
         errors: u64,
         aborted_early: bool,
         aborted_by_watchdog: bool,
@@ -117,6 +123,7 @@ impl AuditEvent {
             layer_label: report.layer_label.clone(),
             attempts: report.attempts(),
             units_sent: report.units_sent,
+            unobserved_units: report.unobserved_units,
             errors: report.errors,
             errno: report.errno.iter().map(|(b, n)| (b.to_string(), n)).collect(),
             http_versions: report
@@ -181,12 +188,23 @@ impl AuditEvent {
                 errno,
                 http_versions,
                 status_codes,
+                unobserved_units,
                 p99_micros,
                 slo,
                 ..
             } => {
+                // A datagram or raw unit was never observed past the local stack
+                // taking it, so the record must not say it completed. The trail
+                // outlives everyone's memory of which primitive this was, and
+                // "2497693 completed" is exactly the sentence a reader would take
+                // at face value years later.
+                let verb = if *unobserved_units >= *units_sent && *units_sent > 0 {
+                    "emitted (unacknowledged: no completion is observable at this layer)"
+                } else {
+                    "completed"
+                };
                 let mut s = format!(
-                    "COMPLETED {layer_label} — {attempts} attempts: {units_sent} completed, \
+                    "COMPLETED {layer_label} — {attempts} attempts: {units_sent} {verb}, \
                      {errors} failed"
                 );
                 if *timeouts > 0 {
@@ -214,7 +232,11 @@ impl AuditEvent {
                     let v: Vec<String> = errno.iter().map(|(k, n)| format!("{k}={n}")).collect();
                     s.push_str(&format!("; errno {}", v.join(" ")));
                 }
-                if *units_sent > 0 {
+                // Only when something was actually timed. A packet flood has no
+                // completion to measure, so `p99 0us` in a permanent record is a
+                // measurement nobody took — and the reader years later has no way
+                // left to tell it from a very fast one.
+                if *units_sent > 0 && *p99_micros > 0 {
                     s.push_str(&format!("; p99 {}us", p99_micros));
                 }
                 if *aborted_by_watchdog {
@@ -256,6 +278,7 @@ impl AuditEvent {
                 layer_label,
                 attempts,
                 units_sent,
+                unobserved_units,
                 errors,
                 aborted_early,
                 aborted_by_watchdog,
@@ -274,7 +297,7 @@ impl AuditEvent {
                 slo,
             } => format!(
                 "\"event\":\"run_completed\",\"layer\":\"{}\",\"attempts\":{},\
-                 \"units_sent\":{},\"errors\":{},\
+                 \"units_sent\":{},\"unobserved_units\":{},\"errors\":{},\
                  \"aborted_early\":{},\"aborted_by_watchdog\":{},\
                  \"status\":{{\"c2xx\":{},\"c3xx\":{},\"c4xx\":{},\"c5xx\":{},\"timeout\":{}}},\
                  \"errno\":{},\"http_versions\":{},\"status_codes\":{},\
@@ -282,6 +305,7 @@ impl AuditEvent {
                 json_escape(layer_label),
                 attempts,
                 units_sent,
+                unobserved_units,
                 errors,
                 aborted_early,
                 aborted_by_watchdog,
