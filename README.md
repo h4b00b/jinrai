@@ -855,6 +855,73 @@ line — because `attempts` otherwise quietly stops meaning "requests the target
 saw". Keep `N` at the length of the chain you actually expect (usually `1`), and
 prefer pointing `--url` at the final URL when you know it.
 
+### When the summary raises a question it cannot answer (`--debug`)
+
+The end-of-run block is the report, and it is deliberately a report: aggregated,
+bounded, the same shape every time. `--debug` is what you turn on when it left
+you with a question — narration on **stderr**, so `--output line` on stdout stays
+exactly as scriptable as it was.
+
+Three things, in the three places a question actually gets asked.
+
+**Before — the request as composed.** "What am I actually sending" had no answer
+short of a packet capture. The header map with jinrai's own defaults merged in,
+and the single pinned resolution the whole run is bound to, exist only inside the
+engine, so this is where they can be shown:
+
+```
+---- debug: the request as composed ----
+  method     POST
+  url        https://api.staging.internal/web/client/login
+  resolved   10.0.0.10:443 (pinned for the whole run)
+  varying    cache-bust (the url above is the base)
+  header     user-agent: jinrai/0.44.0
+  header     content-type: application/json
+  body       12 bytes, type: application/json
+  policies   http negotiated (ALPN for https), redirects counted, never followed,
+             request timeout 10s, in flight 1024
+----------------------------------------
+```
+
+A `body ... type: NONE — the target cannot tell what this is` here is the whole
+diagnosis of a POST flood that reported 4xx and tested nothing.
+
+**During — one line a second.** A sixty-second run printed nothing at all until
+it was over, so neither "is it doing anything" nor "when did it start failing"
+could be answered from outside. The rate in brackets is the **last second**, not
+the cumulative average, because that is what shows a target degrading mid-run:
+
+```
+  debug   1.0s  attempts 100 (100/s)  2xx 86 3xx 0 4xx 14 5xx 0  failed 0
+  debug   2.0s  attempts 200 (100/s)  2xx 172 3xx 0 4xx 28 5xx 0  failed 0
+```
+
+**After — the sentence behind each errno bucket.** `4 x internal` names a
+category; the text underneath names the cause, and it was being discarded at
+classification time:
+
+```
+   debug    distinct failure messages, most frequent first:
+            300 x  error sending request for url (<url>): client error (Connect):
+            tcp connect error: Connection refused (os error 111)
+```
+
+The URL is replaced with a placeholder because it varies per request — with
+`--cache-bust` or `--random-path` every message would otherwise be unique and the
+sample would degenerate into a list of URLs. The sample is capped at 16 distinct
+messages, with the overflow counted rather than dropped: the text is chosen by
+the thing being tested, so it is not given an unbounded map. For the same reason
+it never reaches the audit log, which stays a bounded, hash-chained record.
+
+What `--debug` deliberately is **not** is per-request logging. At the rates this
+engine dispatches, a line per request is not a log anyone reads — it is a second
+workload competing with the one under test, and it would change the measurement
+it exists to explain. Everything above is once, once a second, or aggregated.
+
+It applies to the fast `get`/`post`/`head` flood; the other methods build their
+own frames and report through the summary alone, and say so rather than leaving
+you waiting for output that is not coming.
+
 ### HTTP/1.1 vs HTTP/2 (`--http-version`)
 
 For the fast `get`/`post`/`head` methods the protocol version is the operator's

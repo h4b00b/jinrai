@@ -313,6 +313,15 @@ OPTIONS:
                           latency is the socket count, so this is what keeps a run
                           from becoming a descriptor self-test on YOUR box. 0
                           means unbounded — an explicit choice, never the default
+    --debug               Narrate the run on stderr: the request as composed
+                          (url after variation, every header actually sent, the
+                          body and its declared type, the pinned resolution and
+                          the policies in force), a progress line each second
+                          while it runs, and the DISTINCT FAILURE MESSAGES behind
+                          the errno buckets at the end — the sentence, not just
+                          the category. Not per-request logging: at these rates
+                          that is a second workload, so everything is once, once
+                          a second, or aggregated. Fast get/post/head flood only
     --follow-redirects <N>  Follow up to N SAME-ORIGIN redirect hops per request,
                           so the status recorded is the one at the end of the
                           chain and not the 3xx that started it (default: 0 —
@@ -553,6 +562,9 @@ struct Args {
     /// How many same-origin redirect hops one l7 request may follow. `0` counts
     /// the 3xx without following it — the historical (and safe) default.
     follow_redirects: u32,
+    /// Narrate the run on stderr: the composed request, a progress line each
+    /// second, and the distinct failure messages behind the errno buckets.
+    debug: bool,
     request_timeout_ms: u64,
     drain_timeout_ms: u64,
     layer: Layer,
@@ -978,6 +990,7 @@ fn run_l7(
                 .with_slo(args.slo)
                 .with_max_connections(args.max_connections)
                 .with_follow_redirects(args.follow_redirects)
+                .with_debug(args.debug)
                 .with_request_timeout(Duration::from_millis(args.request_timeout_ms))
                 .with_drain_grace(Duration::from_millis(args.drain_timeout_ms));
             if let Some(p) = l7_profile(args, rate_cap, duration) {
@@ -1560,6 +1573,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut drip_ms = 10_000u64;
     let mut max_connections = jinrai_l7::DEFAULT_MAX_CONNS;
     let mut follow_redirects = 0u32;
+    let mut debug = false;
     let mut request_timeout_ms = jinrai_l7::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64;
     let mut drain_timeout_ms = jinrai_l7::DEFAULT_DRAIN_GRACE.as_millis() as u64;
     let mut layer = Layer::L7;
@@ -1816,6 +1830,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             // from its name; the old spelling keeps working so existing runbooks
             // and scripts do not break on upgrade.
             "--ack-lab" | "--ack-l34-lab" => ack_lab = true,
+            "--debug" => debug = true,
             "--dry-run" => dry_run = true,
             "--no-audit" => no_audit = true,
             "--header" => {
@@ -1936,7 +1951,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         ),
         Layer::L3 | Layer::L4 => {
             ("--target", &["--url", "--header", "--l7-method", "--max-connections",
-                "--follow-redirects"][..])
+                "--follow-redirects", "--debug"][..])
         }
     };
     // Reported through the same warning as the rest when the run is not l7 at all.
@@ -2032,6 +2047,16 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 shaping.join(", "),
             );
         }
+        // The narration is built from the fast flood's own composed request,
+        // counters and client errors; the raw-socket and h2-frame engines have
+        // none of those. Silently accepting the flag would leave an operator
+        // waiting for output that is never coming.
+        if debug {
+            eprintln!(
+                "warning: --debug narrates the get/post/head flood only — this --l7-method \
+                 builds its own frames and reports through the summary alone",
+            );
+        }
     }
 
     let ignored: Vec<&str> =
@@ -2064,6 +2089,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         drip_ms,
         max_connections,
         follow_redirects,
+        debug,
         request_timeout_ms,
         drain_timeout_ms,
         layer,

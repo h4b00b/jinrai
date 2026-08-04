@@ -390,7 +390,24 @@ pub struct L7Engine {
     /// default) refuses every redirect, so a 3xx is counted as the response it
     /// is. See [`with_follow_redirects`](Self::with_follow_redirects).
     follow_redirects: u32,
+    /// Narrate the run on stderr: the composed request before it is sent, a
+    /// progress line while it runs, and the distinct failure messages behind the
+    /// errno buckets. See [`with_debug`](Self::with_debug).
+    debug: bool,
 }
+
+/// How many distinct failure messages `--debug` keeps.
+///
+/// The text comes from the peer's behaviour, so it is not ours to trust with an
+/// unbounded map: a target answering with a different error each time would grow
+/// it for the length of the run. Sixteen is far more variety than a real failure
+/// mode produces — past that the run has a different problem, and the overflow
+/// is counted rather than dropped.
+const MAX_FAILURE_SAMPLES: usize = 16;
+
+/// The key the overflow beyond [`MAX_FAILURE_SAMPLES`] is counted under, so a
+/// truncated sample still says it was truncated.
+const FAILURE_OVERFLOW_KEY: &str = "(further distinct messages, not shown)";
 
 /// The `User-Agent` every request carries unless the operator overrides it.
 ///
@@ -462,6 +479,7 @@ impl L7Engine {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             drain_grace: DEFAULT_DRAIN_GRACE,
             follow_redirects: 0,
+            debug: false,
         }
     }
 
@@ -552,6 +570,34 @@ impl L7Engine {
         self
     }
 
+    /// Narrate the run on stderr. Off by default; the end-of-run summary is the
+    /// report, and this is the thing you turn on when the summary raised a
+    /// question it could not answer.
+    ///
+    /// Three things, in the three places a question actually gets asked:
+    ///
+    ///   - **before** — the request as composed: the URL after variation, every
+    ///     header that will go on the wire (including the defaults the engine
+    ///     adds), the body and its declared type, and the policies in force.
+    ///     "What am I actually sending" had no answer short of a packet capture;
+    ///     the composed headers exist only inside [`prepare`](Self::prepare), so
+    ///     this is where they can be shown.
+    ///   - **during** — one progress line per second: elapsed, attempts,
+    ///     achieved rate, completions by class, errors. A sixty-second run used
+    ///     to print nothing at all until it was over.
+    ///   - **after** — the distinct failure messages behind the errno buckets.
+    ///     [`ErrnoBucket`] sorts a failure into one word; the sentence
+    ///     underneath it is the diagnosis, and it was being discarded.
+    ///
+    /// Deliberately **not** per-request logging: at the rates this engine
+    /// dispatches, a line per request is not a log an operator reads, it is a
+    /// second workload competing with the one under test. Everything here is
+    /// either once, once a second, or aggregated.
+    pub fn with_debug(mut self, on: bool) -> Self {
+        self.debug = on;
+        self
+    }
+
     /// Authorize the URL's host as a datum: IP literal against IP/CIDR rules, or
     /// DNS name against DNS rules. Public so the CLI can validate + report before
     /// building a plan. No DNS resolution happens here for name targets — the
@@ -636,6 +682,9 @@ impl L7Engine {
         let addrs = resolve_addrs(&datum)?;
 
         let headers = self.headers()?;
+        // Kept for the `--debug` preamble below: `default_headers` consumes the
+        // map, and the merged result is exactly what the preamble exists to show.
+        let headers_dump = if self.debug { headers.clone() } else { HeaderMap::new() };
         let mut builder = reqwest::Client::builder()
             .resolve_to_addrs(&datum.host, addrs.all())
             .redirect(self.redirect_policy(&datum))
@@ -659,7 +708,81 @@ impl L7Engine {
         // rather than per request.
         self.spec.variation.check_paths(&datum.url).map_err(L7Error::BadPathList)?;
 
+        // The composed request, before a byte of it exists on the wire. It is
+        // printed from here rather than from the CLI because this is the only
+        // place the finished picture exists: the header map with the engine's own
+        // defaults merged in, and the single resolution the whole run is pinned
+        // to — which the CLI cannot ask for again without resolving a second
+        // time, and resolving once is the safety property.
+        if self.debug {
+            eprint!("{}", self.debug_request(&datum, addrs.all(), &headers_dump));
+        }
+
         Ok((client, datum.url))
+    }
+
+    /// The `--debug` preamble: what this run will put on the wire, and under
+    /// which policies.
+    fn debug_request(
+        &self,
+        datum: &Datum,
+        addrs: &[SocketAddr],
+        headers: &HeaderMap,
+    ) -> String {
+        let mut out = String::from("---- debug: the request as composed ----\n");
+        out.push_str(&format!(
+            "  method     {}\n  url        {}\n",
+            match self.spec.method {
+                L7Method::Get => "GET",
+                L7Method::Post => "POST",
+                L7Method::Head => "HEAD",
+            },
+            datum.url
+        ));
+        // The pin, spelled out: a name target shows what it resolved to exactly
+        // once, which is the fact every "why is it not reaching the box I meant"
+        // question turns on.
+        let pinned: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        out.push_str(&format!("  resolved   {} (pinned for the whole run)\n", pinned.join(", ")));
+        if let Some(label) = self.spec.variation.label() {
+            out.push_str(&format!("  varying    {label} (the url above is the base)\n"));
+        }
+        for (name, value) in headers.iter() {
+            out.push_str(&format!(
+                "  header     {name}: {}\n",
+                value.to_str().unwrap_or("<non-utf8>")
+            ));
+        }
+        match (&self.spec.body, self.spec.method) {
+            (Some(b), L7Method::Post) => {
+                let declared = headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("NONE — the target cannot tell what this is");
+                out.push_str(&format!("  body       {} bytes, type: {declared}\n", b.len()));
+            }
+            (Some(_), _) => out.push_str("  body       ignored (only POST carries one)\n"),
+            (None, _) => {}
+        }
+        out.push_str(&format!(
+            "  policies   http {}, redirects {}, request timeout {:?}, in flight {}\n",
+            match self.spec.http_version {
+                HttpVersion::Auto => "negotiated (ALPN for https)",
+                HttpVersion::Http11 => "1.1 forced",
+                HttpVersion::Http2 => "2 forced",
+            },
+            match self.follow_redirects {
+                0 => "counted, never followed".to_string(),
+                n => format!("up to {n} same-origin hops"),
+            },
+            self.request_timeout,
+            match self.max_conns {
+                Some(n) => n.to_string(),
+                None => "unbounded".to_string(),
+            },
+        ));
+        out.push_str("----------------------------------------\n");
+        out
     }
 
     /// This primitive could not start. See [`crate::module_error`] for why the
@@ -761,6 +884,10 @@ impl StressModule for L7Engine {
         // The exact status code of every completion, beside its class. See
         // `RunReport::status_codes` for why the class alone is not actionable.
         let codes: Arc<Mutex<BTreeMap<u16, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        // The sentence behind each errno bucket, under `--debug` only. Bounded:
+        // see `MAX_FAILURE_SAMPLES`.
+        let failures: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let debug = self.debug;
         // Why each failed attempt failed — refused / unanswered / protocol / a
         // local ceiling of ours. See `classify_reqwest`.
         let errno = Arc::new(Mutex::new(ErrnoTally::default()));
@@ -803,6 +930,7 @@ impl StressModule for L7Engine {
         let hist_w = hist.clone();
         let protos_w = protos.clone();
         let codes_w = codes.clone();
+        let failures_w = failures.clone();
         let errno_w = errno.clone();
         let wd_flag = aborted_by_watchdog.clone();
 
@@ -820,6 +948,22 @@ impl StressModule for L7Engine {
                     errors_w.clone(),
                     s5xx_w.clone(),
                     s4xx_w.clone(),
+                ))
+            });
+
+            // `--debug`: one line a second while the run is in flight. A long
+            // run printed nothing at all until it was over, so "is it doing
+            // anything" and "when did it start failing" were both unanswerable
+            // from the outside. Reads the same atomics the watchdog does — it
+            // never touches them, so it cannot change what the run measures.
+            let progress_task = debug.then(|| {
+                tokio::spawn(run_progress(
+                    sent_w.clone(),
+                    errors_w.clone(),
+                    s2xx_w.clone(),
+                    s3xx_w.clone(),
+                    s4xx_w.clone(),
+                    s5xx_w.clone(),
                 ))
             });
 
@@ -931,6 +1075,7 @@ impl StressModule for L7Engine {
                     let hist = hist_w.clone();
                     let protos = protos_w.clone();
                     let codes = codes_w.clone();
+                    let failures = failures_w.clone();
                     let errno = errno_w.clone();
                     let body = body.clone();
                     let variation = variation.clone();
@@ -1022,6 +1167,23 @@ impl StressModule for L7Engine {
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
                                     .record(classify_reqwest(&e));
+                                // The bucket says which kind; this says which
+                                // failure. Only under --debug: the text is the
+                                // peer's, and the map is capped for it.
+                                if debug {
+                                    let mut seen =
+                                        failures.lock().unwrap_or_else(|p| p.into_inner());
+                                    let msg = failure_message(&e);
+                                    if seen.len() >= MAX_FAILURE_SAMPLES
+                                        && !seen.contains_key(&msg)
+                                    {
+                                        *seen
+                                            .entry(FAILURE_OVERFLOW_KEY.to_string())
+                                            .or_insert(0) += 1;
+                                    } else {
+                                        *seen.entry(msg).or_insert(0) += 1;
+                                    }
+                                }
                             }
                         }
                     });
@@ -1094,6 +1256,9 @@ impl StressModule for L7Engine {
             if let Some(handle) = watchdog_task {
                 handle.abort();
             }
+            if let Some(handle) = progress_task {
+                handle.abort();
+            }
             (aborted, knee, skipped)
         });
 
@@ -1109,6 +1274,8 @@ impl StressModule for L7Engine {
         let http_versions =
             std::mem::take(&mut *protos.lock().unwrap_or_else(|p| p.into_inner()));
         let status_codes = std::mem::take(&mut *codes.lock().unwrap_or_else(|p| p.into_inner()));
+        let failure_samples =
+            std::mem::take(&mut *failures.lock().unwrap_or_else(|p| p.into_inner()));
         let errno = std::mem::take(&mut *errno.lock().unwrap_or_else(|p| p.into_inner()));
         let by_watchdog = aborted_by_watchdog.load(Ordering::Relaxed);
         let note = match (by_watchdog, knee.is_some(), self.spec.http_version.forced_label()) {
@@ -1143,6 +1310,7 @@ impl StressModule for L7Engine {
             knee,
             http_versions,
             status_codes,
+            failure_samples,
             // The fast flood's completions all mean the same thing; the status
             // classes above are the breakdown that matters here.
             detail: None,
@@ -1218,6 +1386,77 @@ async fn run_watchdog(
 /// the real cause, so this walks the source chain down to the underlying
 /// [`std::io::Error`] and reuses the shared classifier; a failure with no I/O
 /// cause is a protocol-level one.
+/// The `--debug` progress line: what the run has done so far, once a second, on
+/// stderr so it never contaminates `--output line` on stdout.
+///
+/// Read-only over the run's counters. It reports the *cumulative* totals plus
+/// the rate over the last tick — the instantaneous rate is what shows a target
+/// degrading mid-run, which a cumulative average smooths away exactly when it
+/// matters.
+async fn run_progress(
+    sent: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+    s2xx: Arc<AtomicU64>,
+    s3xx: Arc<AtomicU64>,
+    s4xx: Arc<AtomicU64>,
+    s5xx: Arc<AtomicU64>,
+) {
+    let started = Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick is immediate; nothing has happened yet
+    let mut prev = 0u64;
+    loop {
+        ticker.tick().await;
+        let done = sent.load(Ordering::Relaxed);
+        let err = errors.load(Ordering::Relaxed);
+        let attempts = done + err;
+        eprintln!(
+            "  debug {:>5.1}s  attempts {attempts} ({}/s)  2xx {} 3xx {} 4xx {} 5xx {}  failed {err}",
+            started.elapsed().as_secs_f64(),
+            attempts.saturating_sub(prev),
+            s2xx.load(Ordering::Relaxed),
+            s3xx.load(Ordering::Relaxed),
+            s4xx.load(Ordering::Relaxed),
+            s5xx.load(Ordering::Relaxed),
+        );
+        prev = attempts;
+    }
+}
+
+/// The full text behind a failed request: reqwest's own message plus every cause
+/// beneath it.
+///
+/// reqwest's own `Display` is usually the category ("error sending request");
+/// the sentence that identifies the failure ("connection closed before message
+/// completed", "unexpected end of file") lives further down the source chain,
+/// which is exactly the chain [`classify_reqwest`] walks and throws away.
+///
+/// The URL is replaced with a placeholder because it is *per request*: with
+/// `--cache-bust` or `--random-path` every message would otherwise be unique and
+/// the sample would degenerate into a list of URLs. Duplicate links in the chain
+/// are dropped for the same reason hyper produces them — it wraps the same
+/// sentence more than once.
+fn failure_message(e: &reqwest::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |text: String| {
+        if !text.is_empty() && !parts.contains(&text) {
+            parts.push(text);
+        }
+    };
+    let mut first = e.to_string();
+    if let Some(u) = e.url() {
+        first = first.replace(u.as_str(), "<url>");
+    }
+    push(first);
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = src {
+        push(err.to_string());
+        src = err.source();
+    }
+    parts.join(": ")
+}
+
 fn classify_reqwest(e: &reqwest::Error) -> ErrnoBucket {
     // Our own request timeout (`Client::timeout`) first: it can surface with or
     // without an I/O cause, and either way *we* gave up, not the OS.
@@ -1519,6 +1758,62 @@ mod tests {
             assert!(req.contains("user-agent: curl/8.4.0"), "operator UA missing: {req}");
             assert!(!req.contains("jinrai/"), "the default UA was sent as well: {req}");
         }
+    }
+
+    /// The whole point of `--debug`: `4 x internal` names a category, and the
+    /// sentence underneath it names the cause. That sentence was thrown away at
+    /// classification time, so nothing could recover it after the fact.
+    #[test]
+    fn debug_keeps_the_sentence_behind_each_errno_bucket() {
+        // A listener that accepts and closes without answering: every request
+        // fails, and the message says why in words the bucket cannot.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let handle = thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => drop(s),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine =
+            L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url)).with_debug(true);
+        let report = run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.errors > 0, "the target answers nothing, so every attempt must fail");
+        assert!(!report.failure_samples.is_empty(), "--debug must keep the failure text");
+        // The counts are the failures, not a subset of them.
+        let sampled: u64 = report.failure_samples.values().sum();
+        assert_eq!(sampled, report.errors, "every failure must be accounted for: {report:?}");
+        // And the URL is not in the text: with --cache-bust it is per request,
+        // which would make every message distinct and the sample useless.
+        for msg in report.failure_samples.keys() {
+            assert!(!msg.contains(&url), "the per-request url must not key the sample: {msg}");
+        }
+    }
+
+    /// Off by default, and it costs nothing when it is off — the map stays empty
+    /// rather than being collected and discarded.
+    #[test]
+    fn without_debug_no_failure_text_is_collected() {
+        let (port, stop, handle) = spawn_http_server("500 Internal Server Error");
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let report = run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert!(report.failure_samples.is_empty(), "{report:?}");
     }
 
     /// The default stays what it was: a 3xx is a response, not a hop.

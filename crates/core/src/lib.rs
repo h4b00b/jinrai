@@ -527,6 +527,22 @@ pub struct RunReport {
     /// Layers without a response leave it empty and the reporter omits it. Sums
     /// to `units_sent` for the fast L7 methods.
     pub status_codes: BTreeMap<u16, u64>,
+    /// Distinct failure *messages* behind `errors`, with a count each — the text
+    /// the client actually produced, not the bucket it was sorted into.
+    ///
+    /// [`ErrnoBucket`] answers "whose failure was it" in one word, which is what
+    /// a summary needs and not enough to debug with: `4 x internal` names a
+    /// category, and the sentence underneath it ("connection closed before
+    /// message completed") names the cause. That sentence was being discarded at
+    /// classification time, so the only way to see it was to guess.
+    ///
+    /// Populated **only under `--debug`** and bounded there (a capped number of
+    /// distinct messages, with the overflow counted under one key), because the
+    /// text is peer-controlled and a pathological target could otherwise make it
+    /// grow without limit. Empty for every other run, and never written to the
+    /// audit record — a hashed, append-only log is not the place for unbounded
+    /// strings chosen by the thing being tested.
+    pub failure_samples: BTreeMap<String, u64>,
     /// The module's own breakdown of what `units_sent` was made of, when the
     /// completed/failed split does not carry the finding.
     ///

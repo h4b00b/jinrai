@@ -26,6 +26,50 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.45.0] — 2026-08-04
+
+There was no way to see a run while it happened, and no way to recover *why* a
+failure was a failure once it had been sorted into a bucket. The summary is a
+report — aggregated, bounded, the same shape every time — and every question in
+this changelog's last two releases had to be answered by reading jinrai's source
+instead of its output.
+
+### Added
+
+- **`--debug`** — narration on **stderr** (so `--output line` on stdout stays
+  scriptable), in the three places a question actually gets asked:
+  - **before**, the request as composed: the URL after variation, every header
+    that will go on the wire *including the defaults the engine merges in*, the
+    body with its declared type, the single pinned resolution, and the policies
+    in force. "What am I actually sending" previously had no answer short of a
+    packet capture — and the composed header map and the one resolution exist
+    only inside the engine, which is why it is printed from there. A `body …
+    type: NONE — the target cannot tell what this is` is the entire diagnosis of
+    a POST flood that reported 4xx and tested nothing.
+  - **during**, one line a second: elapsed, attempts, the rate over the **last
+    tick** (a cumulative average smooths away exactly the mid-run degradation
+    worth seeing), completions by class, failures. A sixty-second run printed
+    nothing until it was over.
+  - **after**, the distinct failure messages behind the errno buckets:
+    `300 x error sending request for url (<url>): client error (Connect): tcp
+    connect error: Connection refused (os error 111)`. `ErrnoBucket` sorts a
+    failure into one word, which is what a summary needs and not enough to debug
+    with; the sentence underneath was being discarded at classification time, so
+    nothing could recover it afterwards.
+- Bounded on purpose: the failure text is chosen by the peer, so it gets a capped
+  map (16 distinct messages, the overflow counted rather than dropped) and never
+  reaches the audit log — a hash-chained, append-only record is not the place for
+  unbounded strings supplied by the thing under test. The per-request URL is
+  replaced with a placeholder, or `--cache-bust` and `--random-path` would make
+  every message unique and the sample a list of URLs.
+- Deliberately **not** per-request logging. At the rates this engine dispatches,
+  a line per request is not a log anyone reads — it is a second workload
+  competing with the one under test, and it would change the measurement it
+  exists to explain. Everything is once, once a second, or aggregated.
+- Applies to the fast `get`/`post`/`head` flood; the other `--l7-method`s build
+  their own frames and warn rather than leaving an operator waiting for output
+  that is not coming.
+
 ## [0.44.0] — 2026-08-04
 
 Four ways the run summary answered a question with the wrong number, or with a
@@ -2185,6 +2229,7 @@ Phases 0–4.
   builds packets from the real source only.
 
 [Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.41.0...HEAD
+[0.45.0]: https://github.com/h4b00b/jinrai/compare/v0.44.0...v0.45.0
 [0.44.0]: https://github.com/h4b00b/jinrai/compare/v0.43.0...v0.44.0
 [0.43.0]: https://github.com/h4b00b/jinrai/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/h4b00b/jinrai/compare/v0.41.0...v0.42.0
