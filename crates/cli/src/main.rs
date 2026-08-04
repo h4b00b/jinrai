@@ -269,7 +269,12 @@ OPTIONS:
                           the responses actually came back on. Slow modes are
                           HTTP/1.1 by construction and the h2-* methods are HTTP/2
                           by construction, so this flag does not apply to them.
-    --body <STRING>       Request body sent with each POST (l7-method post)
+    --body <STRING>       Request body sent with each POST (l7-method post). Sent
+                          verbatim, with NO Content-Type of its own — pair it with
+                          --header 'Content-Type: ...' or the target will reject
+                          the body (415/400) or ignore it, and the parsing cost
+                          you meant to measure is never paid. Warns when the
+                          header is missing
 
     Request shaping (get/post/head flood only — every request differs from the
     last). All of these touch the path, query, body or cookie ONLY: the host is
@@ -1989,6 +1994,24 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         None => PathMode::Fixed,
     };
     let variation = Variation::new(cache_bust, path, search_param, session_cookie);
+
+    // A body with no declared type is a POST flood that does not test what the
+    // operator thinks it tests. jinrai sends `--body` verbatim and adds no
+    // `Content-Type` of its own — deliberately, because guessing one from the
+    // bytes would put a header on the wire the operator never wrote. But a
+    // target that cannot tell what the body *is* rejects it (415/400) or ignores
+    // it, and either way the parse, validation and persistence cost the run was
+    // meant to measure is never paid. The 4xx that comes back then reads as a
+    // finding about the target instead of a broken request. Warn rather than
+    // refuse: an endpoint that genuinely ignores the body is a legitimate test.
+    if body.is_some() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+        eprintln!(
+            "warning: --body was given without a Content-Type, so the target is likely to \
+             reject it (415/400) or ignore it — either way the body is never parsed and the \
+             run measures less than it appears to. Add e.g. \
+             --header 'Content-Type: application/json'"
+        );
+    }
 
     // Request shaping applies to the fast get/post/head flood. The other l7
     // methods build their own requests (or raw frames), so a variation flag

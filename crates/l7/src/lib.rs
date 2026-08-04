@@ -758,6 +758,9 @@ impl StressModule for L7Engine {
         // `HttpVersion::Auto` (especially then): it is the only way an operator can
         // see that an https run they read as HTTP/1.1 was negotiated up to h2.
         let protos: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        // The exact status code of every completion, beside its class. See
+        // `RunReport::status_codes` for why the class alone is not actionable.
+        let codes: Arc<Mutex<BTreeMap<u16, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         // Why each failed attempt failed — refused / unanswered / protocol / a
         // local ceiling of ours. See `classify_reqwest`.
         let errno = Arc::new(Mutex::new(ErrnoTally::default()));
@@ -799,6 +802,7 @@ impl StressModule for L7Engine {
         let residency_w = residency.clone();
         let hist_w = hist.clone();
         let protos_w = protos.clone();
+        let codes_w = codes.clone();
         let errno_w = errno.clone();
         let wd_flag = aborted_by_watchdog.clone();
 
@@ -926,6 +930,7 @@ impl StressModule for L7Engine {
                     let residency = residency_w.clone();
                     let hist = hist_w.clone();
                     let protos = protos_w.clone();
+                    let codes = codes_w.clone();
                     let errno = errno_w.clone();
                     let body = body.clone();
                     let variation = variation.clone();
@@ -976,13 +981,21 @@ impl StressModule for L7Engine {
                                 // A response of ANY status is a completed unit; the
                                 // status class is what tells health from failure.
                                 sent.fetch_add(1, Ordering::Relaxed);
-                                let counter = match resp.status().as_u16() {
+                                let code = resp.status().as_u16();
+                                let counter = match code {
                                     s if s >= 500 => &s5xx,
                                     400..=499 => &s4xx,
                                     300..=399 => &s3xx,
                                     _ => &s2xx,
                                 };
                                 counter.fetch_add(1, Ordering::Relaxed);
+                                // The exact code as well as its class: inside
+                                // `4xx`, a 429 and a 400 are opposite findings.
+                                *codes
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .entry(code)
+                                    .or_insert(0) += 1;
                                 // The version actually used on the wire, not the
                                 // one we asked for.
                                 *protos
@@ -1095,6 +1108,7 @@ impl StressModule for L7Engine {
         let hist = hist.lock().unwrap_or_else(|p| p.into_inner());
         let http_versions =
             std::mem::take(&mut *protos.lock().unwrap_or_else(|p| p.into_inner()));
+        let status_codes = std::mem::take(&mut *codes.lock().unwrap_or_else(|p| p.into_inner()));
         let errno = std::mem::take(&mut *errno.lock().unwrap_or_else(|p| p.into_inner()));
         let by_watchdog = aborted_by_watchdog.load(Ordering::Relaxed);
         let note = match (by_watchdog, knee.is_some(), self.spec.http_version.forced_label()) {
@@ -1128,6 +1142,7 @@ impl StressModule for L7Engine {
             mean_micros: residency.load(Ordering::Relaxed).checked_div(resolved).unwrap_or(0),
             knee,
             http_versions,
+            status_codes,
             // The fast flood's completions all mean the same thing; the status
             // classes above are the breakdown that matters here.
             detail: None,

@@ -4,7 +4,7 @@ One section per row of a test plan, with the ready-to-paste command and an
 explanation of **every switch in it**, so whoever runs the test knows exactly
 what lands on the wire and how to read the result.
 
-Reference version: **0.43.0**.
+Reference version: **0.44.0**.
 
 ---
 
@@ -491,15 +491,21 @@ Example `endpoints.txt`:
 ### 23 — POST flood
 
 ```sh
-jinrai $A --url $URL --l7-method post --body '{"q":"load"}' --cache-bust \
+jinrai $A --url $URL --l7-method post --body '{"q":"load"}' \
+  --header 'Content-Type: application/json' --cache-bust \
   --rate 1000 --duration 60 $REQ
 ```
 
 | Switch | What it does here |
 |---|---|
 | `--l7-method post` | The write path. |
-| `--body '<STRING>'` | The body sent with every POST. |
+| `--body '<STRING>'` | The body sent with every POST, **verbatim**. |
+| `--header 'Content-Type: ...'` | Not optional in practice. jinrai adds no `Content-Type` of its own — guessing one from the bytes would put a header on the wire you never wrote — and a target that cannot tell what the body *is* rejects it (`415`/`400`) or ignores it. Either way the parsing and validation cost you meant to measure is never paid, and the `4xx` that comes back reads as a finding about the target instead of a broken request. jinrai warns when the header is missing. |
 | `--cache-bust` | Appends a unique `_cb=<n>` query so a cache or CDN cannot answer for the origin. |
+
+> Read the `of which` row of the summary before concluding anything from a `4xx`
+> count: a `400` means the request was malformed and the run measured nothing, a
+> `429` means you found the rate limiter.
 
 ---
 
@@ -934,7 +940,7 @@ Every run ends with this block. On a terminal it is coloured
 | Colour | Meaning |
 |---|---|
 | 🟢 **green** | the run did what it set out to do: `completed`, `failed 0`, `2xx`, `SLO: PASS`, `ran to completion` |
-| 🟡 **yellow** | a caveat about **our** side: `bound by`, `not offered`, local errno buckets (EMFILE, EADDRNOTAVAIL…), an operator abort, `4xx` |
+| 🟡 **yellow** | a caveat about **our** side: `bound by`, `not sent`, local errno buckets (EMFILE, EADDRNOTAVAIL…), an operator abort, `4xx` |
 | 🔴 **red** | failure, and the target's own errors: `failed`, `5xx`, remote errno buckets, `SLO: FAIL`, a watchdog abort, the hollow-run `WARNING` |
 
 The lines never to skip:

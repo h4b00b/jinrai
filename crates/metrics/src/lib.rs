@@ -38,6 +38,13 @@ pub fn render(report: &RunReport) -> String {
             report.timeouts,
         ));
     }
+    // The exact codes, not just their classes: a 429 and a 400 are both `4xx`
+    // and mean opposite things. See `RunReport::status_codes`.
+    if !report.status_codes.is_empty() {
+        let codes: Vec<String> =
+            report.status_codes.iter().map(|(c, n)| format!("{c}={n}")).collect();
+        line.push_str(&format!(" codes({})", codes.join(" ")));
+    }
     // Which HTTP version the responses actually came back on — an https run can
     // negotiate h2 without the operator asking for it (see `--http-version`).
     if !report.http_versions.is_empty() {
@@ -243,14 +250,20 @@ pub fn render_summary(
     // full. Not an attempt and not an error — but without it, "the target
     // absorbed everything" and "we never sent it" print identically.
     if report.not_offered > 0 {
+        // `  not offered` was 13 characters for an 11-character column, so the
+        // label ran straight into its own value (`not offered8855 attempts…`)
+        // in every release build — the width guard below `row` is a
+        // `debug_assert`, and no test rendered this row. The phrase lives in the
+        // value now, where it has the room to be a sentence.
         out.push_str(&row(
             p,
-            "  not offered",
+            "  not sent",
             &p.warn(&format!(
-                "{} attempt{} skipped — our in-flight budget was saturated, not the \
-                 target's capacity (raise --concurrency to offer more)",
+                "{} attempt{} never offered — our in-flight budget was saturated, not \
+                 the target's capacity (raise {} to offer more)",
                 report.not_offered,
-                if report.not_offered == 1 { "" } else { "s" }
+                if report.not_offered == 1 { "" } else { "s" },
+                ceiling_flag(ctx)
             )),
         ));
     }
@@ -298,6 +311,14 @@ pub fn render_summary(
             ),
         ));
     }
+    // The exact codes behind those classes. `4xx 121` is three different
+    // findings depending on whether they were 400s (our request was malformed
+    // and the run measured nothing), 401/403s (the target behaving normally) or
+    // 429s (the rate limiter engaged — usually the result being looked for), and
+    // the class row cannot tell them apart. See `RunReport::status_codes`.
+    if let Some(codes) = status_code_detail(report) {
+        out.push_str(&row(p, "  of which", &codes));
+    }
     if !report.http_versions.is_empty() {
         let protos: Vec<String> =
             report.http_versions.iter().map(|(v, n)| format!("{v} {n}")).collect();
@@ -312,7 +333,7 @@ pub fn render_summary(
         }
         out.push_str(&row(p, "failed", &p.bad(&failed)));
         for (bucket, n) in report.errno.iter() {
-            let line = format!("{n} x {bucket} — {}", errno_meaning(bucket));
+            let line = format!("{n} x {bucket} — {}", errno_meaning(bucket, is_l7(ctx)));
             // Our ceiling vs. the target's behaviour, in colour: a local bucket
             // is a caveat about the run (fix the host and run it again), a
             // remote one is the result the run went looking for.
@@ -461,7 +482,59 @@ fn outcome_line(report: &RunReport) -> &'static str {
 /// What one errno bucket tells the operator to do about it: the local buckets are
 /// the tool's own ceiling (fix the host), the rest are target behaviour (the
 /// result you came for).
-fn errno_meaning(bucket: ErrnoBucket) -> &'static str {
+/// The exact status codes behind the class row, most frequent first, or `None`
+/// when the classes already said everything.
+///
+/// Silent for a run that was entirely `2xx`: `200 x1000` under `2xx 1000
+/// (100.0%)` is the same line twice. Anything else earns the detail — including
+/// a single code, because `4xx 1000` and `429 x1000` are not the same sentence.
+///
+/// Ordered by count rather than numerically: the operator wants the dominant
+/// code first, and a target answering with a long tail of codes would otherwise
+/// push it off the end of a truncated line.
+fn status_code_detail(report: &RunReport) -> Option<String> {
+    const SHOWN: usize = 8;
+    let codes = &report.status_codes;
+    if codes.is_empty() {
+        return None;
+    }
+    if codes.len() == 1 && codes.keys().all(|c| (200..300).contains(c)) {
+        return None;
+    }
+    let mut ranked: Vec<(u16, u64)> = codes.iter().map(|(c, n)| (*c, *n)).collect();
+    // Count descending, then code ascending so equal counts have a stable order.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let shown: Vec<String> =
+        ranked.iter().take(SHOWN).map(|(c, n)| format!("{c} x{n}")).collect();
+    let mut out = shown.join("   ");
+    if ranked.len() > SHOWN {
+        out.push_str(&format!("   (+{} more code(s))", ranked.len() - SHOWN));
+    }
+    Some(out)
+}
+
+/// Whether this run was the HTTP layer. Two of the explanations below are only
+/// true for one side of that split, and printing the wrong one sends an operator
+/// looking for a problem that cannot exist on the layer they ran.
+fn is_l7(ctx: &RunContext) -> bool {
+    ctx.layer.eq_ignore_ascii_case("l7")
+}
+
+/// The flag that raises the in-flight ceiling on this layer.
+///
+/// L7 warns that `--concurrency` is not one of its flags and then ignored it, so
+/// a summary telling an L7 operator to raise `--concurrency` was advice the tool
+/// itself would refuse to take. The ceiling is real either way — only its name
+/// differs.
+fn ceiling_flag(ctx: &RunContext) -> &'static str {
+    if is_l7(ctx) {
+        "--max-connections"
+    } else {
+        "--concurrency"
+    }
+}
+
+fn errno_meaning(bucket: ErrnoBucket, l7: bool) -> &'static str {
     match bucket {
         ErrnoBucket::Emfile => "we hit our OWN open-file limit — local ceiling, not the target",
         ErrnoBucket::Enfile => "the host's system-wide file table is full — local, not the target",
@@ -487,6 +560,17 @@ fn errno_meaning(bucket: ErrnoBucket) -> &'static str {
              target does not speak the forced --http-version)"
         }
         ErrnoBucket::Other(_) => "OS error — see the code",
+        // Same absent errno, opposite ends of the stack. Naming the packet-layer
+        // cause on an L7 run sent operators hunting an IPv6 mismatch that the L7
+        // path cannot even produce: it is decided at setup and refuses the whole
+        // run, never four requests out of a thousand.
+        ErrnoBucket::Internal if l7 => {
+            "no OS error behind it: the socket worked and the HTTP stack itself \
+             failed the request — most often one in flight when the peer closed \
+             the connection under it (an HTTP/2 GOAWAY, a per-connection request \
+             limit, an idle reaper). A few of these is normal; a share that grows \
+             with --rate is the target's per-connection ceiling"
+        }
         ErrnoBucket::Internal => "refused before the OS (structural mismatch, e.g. IPv6 vs IPv4-only)",
     }
 }
@@ -561,17 +645,18 @@ fn concurrency_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) 
     );
     // Where the budget went. A slot spent on an attempt that never completes is
     // the usual reason the ceiling is this low, and it points at a different
-    // knob than "raise --concurrency" does.
+    // knob than raising the ceiling does.
+    let flag = ceiling_flag(ctx);
     if basis == "mean" && report.errors > 0 && residency_micros > report.p50_micros.saturating_mul(2)
     {
         note.push_str(&format!(
             ". Failed attempts hold a slot far longer than the {} median completion, \
              so they dominate that budget — lowering the attempt timeout buys more \
-             offered load than raising --concurrency",
+             offered load than raising {flag}",
             fmt_micros(report.p50_micros)
         ));
     } else {
-        note.push_str(" — raise --concurrency to offer more load");
+        note.push_str(&format!(" — raise {flag} to offer more load"));
     }
     Some(note)
 }
@@ -884,6 +969,117 @@ mod tests {
         assert!(out.contains("ran to completion"), "{out}");
         // Percentages, not just counts — the point of the block.
         assert!(out.contains("2xx 5900 (98.4%)"), "{out}");
+    }
+
+    /// REGRESSION: `4xx 121` was the whole story the summary told, and it is
+    /// three opposite findings — a malformed request of ours (400), the target
+    /// behaving normally (401/403), or the rate limiter engaging (429). The exact
+    /// codes must be on the screen, ranked so the dominant one leads.
+    #[test]
+    fn the_exact_status_codes_are_reported_beside_their_classes() {
+        let mut r = RunReport {
+            layer_label: "L7 post".into(),
+            units_sent: 996,
+            status_2xx: 875,
+            status_4xx: 121,
+            ..Default::default()
+        };
+        r.status_codes.insert(200, 875);
+        r.status_codes.insert(429, 118);
+        r.status_codes.insert(400, 3);
+        let out = render_summary(&r, &ctx(), None, &Palette::PLAIN);
+        assert!(out.contains("4xx 121"), "the class row is still there: {out}");
+        // Ranked by count, so the finding leads rather than the numerically
+        // smallest code.
+        let detail = out.lines().find(|l| l.contains("429")).unwrap_or_default();
+        assert!(detail.contains("200 x875"), "{out}");
+        assert!(detail.contains("429 x118"), "{out}");
+        assert!(detail.contains("400 x3"), "{out}");
+        assert!(
+            detail.find("429").unwrap() < detail.find("400").unwrap(),
+            "codes must rank by count, not by number: {detail}"
+        );
+        // And into the line form, which is what the audit log carries.
+        assert!(render(&r).contains("codes(200=875 400=3 429=118)"), "{}", render(&r));
+    }
+
+    /// A clean run says everything twice otherwise: `200 x1000` under
+    /// `2xx 1000 (100.0%)` is noise, not detail.
+    #[test]
+    fn an_all_2xx_run_gets_no_status_code_detail() {
+        let mut r = RunReport {
+            layer_label: "L7 get".into(),
+            units_sent: 1000,
+            status_2xx: 1000,
+            ..Default::default()
+        };
+        r.status_codes.insert(200, 1000);
+        let out = render_summary(&r, &ctx(), None, &Palette::PLAIN);
+        assert!(!out.contains("of which"), "{out}");
+
+        // But a single NON-2xx code earns the line: `4xx 1000` and
+        // `429 x1000` are not the same sentence.
+        let mut limited = RunReport {
+            layer_label: "L7 get".into(),
+            units_sent: 1000,
+            status_4xx: 1000,
+            ..Default::default()
+        };
+        limited.status_codes.insert(429, 1000);
+        assert!(
+            render_summary(&limited, &ctx(), None, &Palette::PLAIN).contains("429 x1000"),
+            "a single rate-limit code is the finding, not noise"
+        );
+    }
+
+    /// REGRESSION: the `internal` bucket printed the packet-layer meaning on an
+    /// L7 run, sending operators hunting an IPv6/IPv4 mismatch that the L7 path
+    /// cannot produce — it is decided at setup and refuses the whole run.
+    #[test]
+    fn the_internal_bucket_is_explained_per_layer() {
+        use jinrai_core::{ErrnoBucket, ErrnoTally};
+        let mut errno = ErrnoTally::default();
+        errno.record(ErrnoBucket::Internal);
+        let r = RunReport {
+            layer_label: "run".into(),
+            units_sent: 996,
+            errors: 4,
+            errno,
+            ..Default::default()
+        };
+        let l7 = render_summary(&r, &ctx(), None, &Palette::PLAIN);
+        assert!(l7.contains("HTTP stack"), "{l7}");
+        assert!(!l7.contains("IPv6"), "the packet-layer cause cannot happen here: {l7}");
+
+        // The packet layers keep the meaning that is true for them.
+        let l4 = render_summary(&r, &ctx_l4(), None, &Palette::PLAIN);
+        assert!(l4.contains("IPv6"), "{l4}");
+    }
+
+    /// REGRESSION: an L7 run was told to `raise --concurrency`, a flag L7 warns
+    /// about and then ignores — advice the tool itself would refuse to take.
+    #[test]
+    fn the_in_flight_ceiling_is_named_with_this_layers_flag() {
+        let r = RunReport {
+            layer_label: "L7 get".into(),
+            units_sent: 3204,
+            p50_micros: 3_000,
+            not_offered: 500,
+            ..Default::default()
+        };
+        let out = render_summary(
+            &r,
+            &RunContext { concurrency: Some(1), rate_per_sec: 10_000, ..ctx() },
+            None,
+            &Palette::PLAIN,
+        );
+        assert!(out.contains("--max-connections"), "{out}");
+        assert!(!out.contains("--concurrency"), "L7 does not have that flag: {out}");
+        // REGRESSION: the label was 13 chars wide for an 11-char column, so it
+        // rendered as `not offered8855 attempts` in every release build. The
+        // width guard is a `debug_assert`, and until this test nothing rendered
+        // the row at all.
+        assert!(out.contains("not sent 500 attempts never offered"), "{out}");
     }
 
     /// The reading that used to be a mystery: "320/s achieved (3% of the 10000/s

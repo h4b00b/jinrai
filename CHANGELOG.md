@@ -26,6 +26,57 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.44.0] — 2026-08-04
+
+Four ways the run summary answered a question with the wrong number, or with a
+number that could not be acted on. All four came out of one real POST run against
+a login endpoint: `2xx 875 / 4xx 121`, four `internal` failures, and a body the
+target never parsed.
+
+### Added
+
+- **Exact status codes beside their classes** — `RunReport::status_codes`, an
+  `of which 200 x875   429 x118   400 x3` row in the summary, `codes(...)` in the
+  line form, and a `status_codes` object in the audit record. `4xx 121` is three
+  opposite findings and the class could not tell them apart: a `400` says the
+  request *jinrai* sent was malformed and the run measured nothing, a `401`/`403`
+  is the target behaving normally, and a `429` is the rate limiter engaging —
+  usually the result the run went looking for. `5xx` splits the same way (a `503`
+  from a shedding balancer is not a `500` from a crashing handler). Ranked by
+  count so the dominant code leads; silent for an all-`2xx` run, where it would
+  only repeat the class row.
+
+### Fixed
+
+- **`--body` was sent with no `Content-Type`, and nothing said so.** The engine
+  sends the bytes verbatim and adds no type of its own, which is the right
+  behaviour — guessing `application/json` from a leading `{` would put a header
+  on the wire the operator never wrote. But a target that cannot tell what the
+  body *is* rejects it (`415`/`400`) or ignores it, so the parsing, validation
+  and persistence cost the run was meant to measure is never paid, and the `4xx`
+  that comes back reads as a finding about the target rather than a broken
+  request. jinrai now **warns** when `--body` arrives without the header, naming
+  the fix; `--help` and the playbook's POST case carry it too.
+- **The `internal` errno bucket printed the packet-layer meaning on L7 runs.**
+  `refused before the OS (structural mismatch, e.g. IPv6 vs IPv4-only)` describes
+  a condition the L7 path cannot produce: it is decided at setup and refuses the
+  whole run, never four requests out of a thousand. On L7 the same bucket means
+  the opposite end of the stack — the socket worked and the HTTP stack itself
+  failed the request with a synthetic `io::Error` carrying no errno, typically
+  one in flight when the peer closed the connection under it (an HTTP/2 `GOAWAY`,
+  a per-connection request limit, an idle reaper). The explanation is now chosen
+  per layer, and says that a share which grows with `--rate` is the target's
+  per-connection ceiling.
+- **An L7 run was told to raise `--concurrency`** — a flag L7 warns about and
+  then ignores, so the summary was giving advice the tool itself would refuse to
+  take. Both the `not sent` row and the `bound by` note now name the ceiling flag
+  of the layer that ran (`--max-connections` for L7, `--concurrency` for L3/L4).
+- **The `not offered` row ran its label into its own value** — `not
+  offered8855 attempts skipped` — in every release build. The label was 13
+  characters for an 11-character column; the width guard below `row` is a
+  `debug_assert`, and no test had ever rendered that row. It is `not sent` now,
+  with the phrase moved into the value where it has room to be a sentence.
+
 ## [0.43.0] — 2026-08-04
 
 Two ways a run measured the appliance in front of the target instead of the
@@ -2134,6 +2185,7 @@ Phases 0–4.
   builds packets from the real source only.
 
 [Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.41.0...HEAD
+[0.44.0]: https://github.com/h4b00b/jinrai/compare/v0.43.0...v0.44.0
 [0.43.0]: https://github.com/h4b00b/jinrai/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/h4b00b/jinrai/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/h4b00b/jinrai/compare/v0.40.0...v0.41.0
