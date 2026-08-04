@@ -398,6 +398,8 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
     kill: jinrai_safety::KillSwitch,
     tally: &Tally,
 ) {
+    // One `User-Agent` for the whole crate — see [`crate::DEFAULT_USER_AGENT`].
+    let ua = crate::DEFAULT_USER_AGENT;
     let opening = match kind {
         // The Sec-WebSocket-Key is a fresh 16-byte nonce per connection, as RFC
         // 6455 requires; servers and proxies are entitled to reject a malformed
@@ -406,13 +408,13 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
             "GET {target} HTTP/1.1\r\nHost: {host_header}\r\n\
              Upgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\
-             User-Agent: jinrai\r\n\r\n",
+             User-Agent: {ua}\r\n\r\n",
             ws_key()
         ),
         LongLivedKind::Sse => format!(
             "GET {target} HTTP/1.1\r\nHost: {host_header}\r\n\
              Accept: text/event-stream\r\nCache-Control: no-cache\r\n\
-             Connection: keep-alive\r\nUser-Agent: jinrai\r\n\r\n"
+             Connection: keep-alive\r\nUser-Agent: {ua}\r\n\r\n"
         ),
     };
     if stream.write_all(opening.as_bytes()).await.is_err() {

@@ -26,6 +26,64 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.43.0] — 2026-08-04
+
+Two ways a run measured the appliance in front of the target instead of the
+target. Both produced the same unfalsifiable result: a status class in the
+summary that the operator could not reproduce with a browser against the same
+URL, and no line anywhere explaining the gap. A real run against a WAF-fronted
+login endpoint reported `3xx 100%` while the WAF's own log showed `404` for the
+same requests.
+
+### Fixed
+
+- **The fast `get`/`post`/`head` flood sent no `User-Agent` at all.** The engine
+  built its header map from `--header` alone, and `reqwest` adds no UA of its
+  own — so every request went out with the header absent. That is not the
+  neutral request it looks like: WAFs, CDNs and bot filters answer a headerless
+  request differently from the same request carrying *any* UA, typically with a
+  challenge or a redirect. The run then measured the filter's opinion of an
+  unusual client, and reported it as the target's behaviour. Requests now carry
+  `User-Agent: jinrai/<version>` — the same identification the raw-socket
+  engines (`slowloris`, `slowbody`, `slow-read`, `websocket`, `sse`) have always
+  sent, now a single shared constant. `--header "User-Agent: ..."` overrides it,
+  as before; the default is a default, not a policy, and the engine still ships
+  no vendor-specific evasion of its own.
+
+### Added
+
+- **`--follow-redirects <N>`** (default `0`, max 10) — follow up to `N`
+  **same-origin** redirect hops per request, so the status recorded is the one at
+  the end of the chain rather than the `3xx` that started it. At `0` (unchanged
+  behaviour) a target that answers `302` to a login page reports `3xx 100%`,
+  while a browser would end on the `404` two hops later; the summary and the
+  target's log then disagree about the same traffic.
+- The flag **costs rate, and says so**: a followed hop is a second request
+  `--rate` never counted, so `N` hops can put up to `(1 + N) x --rate`
+  requests/sec on the target. The rate cap still bounds what jinrai *dispatches*;
+  it no longer bounds what the target receives. Opt-in for that reason, capped at
+  10 for the same one, and the run summary prints
+  `following up to N same-origin redirects` — without it `attempts` would quietly
+  stop meaning "requests the target saw".
+
+### Security
+
+- **The redirect control was narrowed to what it actually protects, not
+  loosened.** `Policy::none()` existed because `resolve_to_addrs` pins one host:
+  a `Location:` naming another origin would resolve through the system resolver
+  to a host the gate never saw, carrying the operator's `--header` values with
+  it. What that has to prevent is the client *moving*, not the client
+  *following*. So at any `N > 0` the hop is taken only when the `Location:` still
+  names the approved datum — same host, same port, same scheme — which the DNS
+  pin already covers and the headers already belong to. Anything else stops the
+  chain and reports the `3xx`, exactly as at `N = 0`. The peer cannot choose
+  where the client connects at any setting of the flag, and a test asserts that
+  with following turned up to 5.
+- Off-origin redirects `stop()` rather than `error()`: "it left the authorized
+  origin" is answered honestly by reporting the `3xx` that says so, not by
+  turning the response into a transport failure the errno breakdown cannot
+  explain.
+
 ## [0.42.0] — 2026-08-03
 
 HTTP/3 and QUIC. Every technique jinrai had reached the target's TCP front door;
@@ -2076,6 +2134,7 @@ Phases 0–4.
   builds packets from the real source only.
 
 [Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.41.0...HEAD
+[0.43.0]: https://github.com/h4b00b/jinrai/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/h4b00b/jinrai/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/h4b00b/jinrai/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/h4b00b/jinrai/compare/v0.39.0...v0.40.0
