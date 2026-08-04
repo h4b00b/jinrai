@@ -313,6 +313,18 @@ OPTIONS:
                           latency is the socket count, so this is what keeps a run
                           from becoming a descriptor self-test on YOUR box. 0
                           means unbounded — an explicit choice, never the default
+    --allow-underpowered  Run the fast get/post/head flood even when the slot
+                          budget cannot carry --rate. A slot is held for a whole
+                          attempt, so once attempts run to the request timeout
+                          only --max-connections / --request-timeout-ms of them
+                          can start each second (the stock 1024 over 10s = 102/s);
+                          asking for more offers load the target never sees.
+                          jinrai refuses that up front, because the shortfall
+                          appears only once the target starts to struggle — the
+                          moment the run is finally measuring something — and the
+                          summary would then be reporting OUR ceiling as the
+                          target's capacity. The refusal prints the two knobs that
+                          fix it. Use this flag when the shortfall is the point
     --debug               Narrate the run on stderr: the request as composed
                           (url after variation, every header actually sent, the
                           body and its declared type, the pinned resolution and
@@ -559,6 +571,9 @@ struct Args {
     slow_connections: usize,
     drip_ms: u64,
     max_connections: usize,
+    /// Proceed with a fast-l7 run whose slot budget cannot carry `--rate`. See
+    /// [`underpowered_refusal`] for what is being waived.
+    allow_underpowered: bool,
     /// How many same-origin redirect hops one l7 request may follow. `0` counts
     /// the 3xx without following it — the historical (and safe) default.
     follow_redirects: u32,
@@ -943,6 +958,92 @@ fn l7_profile(args: &Args, rate_cap: RateCap, duration: Duration) -> Option<Load
     }
 }
 
+/// Refuse a fast-L7 run whose in-flight budget cannot carry the rate it asks
+/// for, naming the knob to turn. `None` when the budget can deliver the cap.
+///
+/// `--rate`, `--max-connections` and `--request-timeout-ms` are not three
+/// independent knobs, and nothing said so. A slot is held for an attempt's whole
+/// life, so once attempts run to the timeout the dispatcher can start only
+/// `slots / timeout` of them per second — see
+/// [`jinrai_l7::worst_case_offered_rate`]. Everything above that is load the
+/// target never sees.
+///
+/// This refuses rather than warns because the shortfall arrives exactly when the
+/// measurement matters. A healthy target answers in milliseconds and never comes
+/// near the ceiling, so an underpowered budget looks fine right up until the
+/// target begins to struggle — and from there the run reports OUR ceiling as the
+/// target's capacity, which is the one wrong answer this tool must not give
+/// quietly. The summary does say so afterwards (`not sent` / `bound by`), but
+/// afterwards costs a whole window, and the operator has to know to read for it.
+///
+/// The stock defaults pass by construction (1024 slots at 10s carry 102/s,
+/// against `--rate 100`), so this only fires on a rate someone raised without
+/// the budget to match. `--allow-underpowered` is how an operator says the
+/// shortfall is understood and wanted — holding a fixed slot budget against a
+/// target on purpose, say.
+fn underpowered_refusal(
+    max_connections: usize,
+    request_timeout: Duration,
+    rate: u64,
+) -> Option<String> {
+    let ceiling = jinrai_l7::worst_case_offered_rate(max_connections, request_timeout)?;
+    if rate == 0 || ceiling >= rate as f64 {
+        return None;
+    }
+    let timeout_secs = request_timeout.as_secs_f64();
+
+    // Both levers, then the option of asking for less. Each is a command-line
+    // fragment the operator can paste, because a refusal that only diagnoses is
+    // another thing to work out at the exact moment they wanted to be running.
+    let mut fixes: Vec<(String, String)> = Vec::new();
+    // Shortening the timeout is the cheaper lever: it buys slot turnover without
+    // a descriptor per slot. Unavailable when the arithmetic lands below a
+    // millisecond — at that point no timeout is short enough and only slots help.
+    let timeout_fix_ms = (max_connections as f64 * 1000.0 / rate as f64).floor();
+    if timeout_fix_ms >= 1.0 {
+        fixes.push((
+            format!("--request-timeout-ms {timeout_fix_ms:.0}"),
+            format!("{max_connections} slots turning over that fast carry {rate}/s"),
+        ));
+    }
+    // More slots is the other lever, and it costs a descriptor each — worth
+    // saying, because a fix that quietly needs an fd ceiling raise is not a fix.
+    let conns_fix = (rate as f64 * timeout_secs).ceil();
+    if conns_fix <= MAX_CONNECTIONS as f64 {
+        fixes.push((
+            format!("--max-connections {conns_fix:.0}"),
+            format!("{rate}/s at the current {timeout_secs:.1}s timeout, one descriptor each"),
+        ));
+    }
+    // Asking for less is the third way out, but only where it leaves a run:
+    // `--rate 0` means "send nothing" here, so a budget whose ceiling rounds
+    // below 1/s must not be handed its own floor back as a suggestion.
+    if ceiling >= 1.0 {
+        fixes
+            .push((format!("--rate {:.0}", ceiling.floor()), "what this budget already delivers".into()));
+    }
+
+    let w = fixes.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
+    let advice = if fixes.is_empty() {
+        // Every lever is off the end of its own scale — the three numbers are not
+        // reconcilable and there is nothing honest to suggest.
+        "\n  no combination of --request-timeout-ms, --max-connections and --rate within \
+         their limits reaches this; the run as described cannot be generated."
+            .to_string()
+    } else {
+        let lines: Vec<String> =
+            fixes.iter().map(|(f, why)| format!("    {f:<w$}   {why}")).collect();
+        format!("\n  raise the ceiling past {rate}/s:\n{}", lines.join("\n"))
+    };
+    Some(format!(
+        "--rate {rate} cannot be offered with this in-flight budget: {max_connections} slots \
+         over a {timeout_secs:.1}s attempt timeout carry {ceiling:.0}/s once attempts run to \
+         timeout, and a target that stops answering is what a stress run is looking for. The \
+         shortfall would land exactly when the target starts to struggle, and the summary would \
+         report OUR ceiling as its capacity.{advice}\n  --allow-underpowered runs it as asked."
+    ))
+}
+
 /// L7: the operator supplies a URL. The engine validates the URL's host as a
 /// *datum* — an IP literal against the CIDR rules, a DNS name against the DNS
 /// rules — and only then (for a name) resolves once to connect.
@@ -970,6 +1071,20 @@ fn run_l7(
             "--discover-knee needs a rate SLO to detect the knee \
              (add e.g. --slo-max-5xx-rate or --slo-max-error-rate)",
         )?);
+    }
+
+    // The in-flight budget must be able to carry the rate being asked for, or the
+    // run measures this generator instead of the target. Checked here, with the
+    // other pre-traffic argument refusals, so `--dry-run` catches it too — the
+    // point is to fail on the command line, not after the window has closed.
+    if matches!(args.l7_kind, L7Kind::Fast(_)) && !args.allow_underpowered {
+        if let Some(msg) = underpowered_refusal(
+            args.max_connections,
+            Duration::from_millis(args.request_timeout_ms),
+            args.rate,
+        ) {
+            return Err(audit_refusal(&mut audit, "arguments", &msg)?);
+        }
     }
 
     // Build the selected engine and authorize its datum up front. Both engines
@@ -1124,6 +1239,29 @@ fn run_l7(
         eprintln!("warning: --slo-* / --watchdog are ignored for the slow-connection / h2 / tls-* / websocket / sse / quic methods (no per-request response to classify)");
     } else if args.watchdog && !args.slo.has_rate_thresholds() {
         eprintln!("warning: --watchdog is inert without a --slo-max-*-rate to watch");
+    }
+    // A latency SLO the attempt timeout sits inside cannot fail honestly. A
+    // timed-out attempt is a failure, and failures are not in the percentiles —
+    // so every attempt slow enough to breach the threshold leaves the sample
+    // instead of breaching it, and p99 PASSES on a run where almost nothing
+    // completed. That is the wrong direction for a check whose whole job is to
+    // notice slowness, and the trap sits right where an operator is sent by the
+    // advice for the opposite problem (shorten the timeout to offer more load).
+    if is_fast {
+        if let Some(p99) = args.slo.max_p99_micros {
+            let timeout_micros = args.request_timeout_ms.saturating_mul(1000);
+            if timeout_micros <= p99 {
+                eprintln!(
+                    "warning: --request-timeout-ms {} is at or below --slo-max-p99-ms {} — \
+                     attempts slower than the timeout are counted as failures, not as slow \
+                     completions, so they leave the percentile rather than breach it and the \
+                     p99 SLO cannot fail. Give the timeout headroom over the threshold \
+                     (and read the failure count, which is where that slowness lands)",
+                    args.request_timeout_ms,
+                    p99 / 1000,
+                );
+            }
+        }
     }
     // Load profiles / knee discovery only shape the fast request-flood dispatch.
     if !is_fast && (args.discover_knee || args.profile != ProfileKind::Constant) {
@@ -1572,6 +1710,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut slow_connections = 100usize;
     let mut drip_ms = 10_000u64;
     let mut max_connections = jinrai_l7::DEFAULT_MAX_CONNS;
+    let mut allow_underpowered = false;
     let mut follow_redirects = 0u32;
     let mut debug = false;
     let mut request_timeout_ms = jinrai_l7::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64;
@@ -1737,6 +1876,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
                 max_connections =
                     parse_capped(&mut it, "--max-connections", MAX_CONNECTIONS as u64)? as usize;
             }
+            "--allow-underpowered" => allow_underpowered = true,
             "--follow-redirects" => {
                 follow_redirects =
                     parse_capped(&mut it, "--follow-redirects", MAX_FOLLOW_REDIRECTS as u64)? as u32;
@@ -1951,7 +2091,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         ),
         Layer::L3 | Layer::L4 => {
             ("--target", &["--url", "--header", "--l7-method", "--max-connections",
-                "--follow-redirects", "--debug"][..])
+                "--allow-underpowered", "--follow-redirects", "--debug"][..])
         }
     };
     // Reported through the same warning as the rest when the run is not l7 at all.
@@ -2088,6 +2228,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         slow_connections,
         drip_ms,
         max_connections,
+        allow_underpowered,
         follow_redirects,
         debug,
         request_timeout_ms,
@@ -2336,6 +2477,83 @@ mod tests {
     fn a_malformed_target_ip_is_refused() {
         let err = parse(&["--allow", "10.0.0.0/8", "--target", "10.1.2"]).unwrap_err();
         assert!(err.contains("invalid --target IP"), "{err}");
+    }
+
+    // ---- a budget that cannot carry the rate it was given ---------------
+
+    /// The run this check was written for: 2000/s asked of the stock 1024 slots
+    /// at the stock 10s timeout, which can only start 102 attempts a second once
+    /// the target stops answering. It ran for a full minute, offered 19% of its
+    /// cap, and reported that as the target's behaviour.
+    #[test]
+    fn a_rate_the_slot_budget_cannot_carry_is_refused() {
+        let msg = underpowered_refusal(1024, Duration::from_secs(10), 2000)
+            .expect("1024 slots over 10s cannot offer 2000/s");
+        assert!(msg.contains("102/s"), "the reachable ceiling must be stated: {msg}");
+        // Both levers, as pasteable fragments: 1024 slots clear 2000/s at 512ms,
+        // and 2000/s over a 10s timeout needs 20000 of them.
+        assert!(msg.contains("--request-timeout-ms 512"), "{msg}");
+        assert!(msg.contains("--max-connections 20000"), "{msg}");
+        assert!(msg.contains("--rate 102"), "{msg}");
+        assert!(msg.contains("--allow-underpowered"), "the way out must be named: {msg}");
+    }
+
+    /// REGRESSION: a safety check that fires on the tool's own defaults teaches
+    /// operators to reach for the override, which is the opposite of the point.
+    /// `--rate 100` with everything else untouched must run.
+    #[test]
+    fn the_stock_defaults_do_not_refuse_themselves() {
+        let a = args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]);
+        assert_eq!(
+            underpowered_refusal(
+                a.max_connections,
+                Duration::from_millis(a.request_timeout_ms),
+                a.rate
+            ),
+            None
+        );
+    }
+
+    /// No ceiling means nothing to refuse against: an unbounded budget and a
+    /// budget that clears the cap both run untouched.
+    #[test]
+    fn a_budget_that_carries_the_rate_is_not_refused() {
+        assert_eq!(underpowered_refusal(0, Duration::from_secs(10), 2_000_000), None);
+        assert_eq!(underpowered_refusal(4096, Duration::from_secs(1), 2000), None);
+        // Exactly at the ceiling is enough; the check is a shortfall, not headroom.
+        assert_eq!(underpowered_refusal(2000, Duration::from_secs(1), 2000), None);
+    }
+
+    /// A lever that cannot reach must not be printed as if it could. Below a
+    /// millisecond no timeout is short enough, and past MAX_CONNECTIONS no slot
+    /// count is buyable — in each case the refusal drops that line rather than
+    /// suggesting a value the parser would then reject.
+    #[test]
+    fn only_the_levers_that_can_actually_reach_are_offered() {
+        // 100 slots asked for 200000/s: no timeout above a millisecond turns them
+        // over fast enough, but 200000 slots at the 1s timeout is buyable.
+        let msg = underpowered_refusal(100, Duration::from_secs(1), 200_000).unwrap();
+        assert!(!msg.contains("--request-timeout-ms"), "sub-millisecond lever offered: {msg}");
+        assert!(msg.contains("--max-connections 200000"), "{msg}");
+
+        // The mirror image: 1000/s over an hour-long timeout needs 3.6M slots,
+        // past the ceiling --max-connections itself enforces, so only the timeout
+        // is left. Suggesting a value the parser would reject is not advice.
+        let msg = underpowered_refusal(1024, Duration::from_secs(3600), 1000).unwrap();
+        assert!(!msg.contains("--max-connections"), "unbuyable slot count offered: {msg}");
+        assert!(msg.contains("--request-timeout-ms 1024"), "{msg}");
+        // 1024 slots over an hour carry 0.28/s, and `--rate 0` sends nothing —
+        // the one suggestion that would leave the operator with no run at all.
+        assert!(!msg.contains("--rate 0"), "a do-nothing rate was suggested: {msg}");
+    }
+
+    #[test]
+    fn allow_underpowered_parses() {
+        let a = args_of(&[
+            "--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/", "--allow-underpowered",
+        ]);
+        assert!(a.allow_underpowered);
+        assert!(!args_of(&["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"]).allow_underpowered);
     }
 
     // ---- values that must not be silently accepted ----------------------

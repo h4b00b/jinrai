@@ -4,7 +4,7 @@ One section per row of a test plan, with the ready-to-paste command and an
 explanation of **every switch in it**, so whoever runs the test knows exactly
 what lands on the wire and how to read the result.
 
-Reference version: **0.46.0**.
+Reference version: **0.47.0**.
 
 ---
 
@@ -32,8 +32,32 @@ export T=10.0.0.10                       # the target address
 export A="--allow $T"                    # the authorization rule
 export URL=http://10.0.0.10/             # the L7 datum
 export REQ='--ack-lab --audit-log ./runs.jsonl'
+export BUDGET='--max-connections 8192 --request-timeout-ms 1000'   # see below
 export JINRAI_OPERATOR="$(whoami)"       # recorded in every audit record
 ```
+
+`$BUDGET` appears on every fast `get`/`post`/`head` case, and it is not
+decoration. A slot is held for an attempt's whole life, so once attempts run to
+the request timeout only `--max-connections / --request-timeout-ms` of them can
+start each second. **The defaults — 1024 slots over a 10 s timeout — carry
+102/s**, which is why `--rate` defaults to 100. Ask a default budget for 2000/s
+and 95% of that load is never offered: the run measures jinrai's ceiling, and
+the summary reports it where the target's capacity should be. jinrai now refuses
+such a run before sending anything and prints the two knobs that fix it, so this
+is a mistake you get told about on the command line rather than sixty seconds
+later. `8192 / 1 s` carries 8192/s, above every rate used here.
+
+Two things to keep in mind when you change it:
+
+- **More slots cost a descriptor each.** jinrai raises its own soft limit to the
+  hard limit at startup and prints the result (`fd ceiling: …`); if the budget
+  is near that number, raise the hard limit rather than let `EMFILE` masquerade
+  as target behaviour.
+- **Keep the timeout well above any `--slo-max-p99-ms`.** A timed-out attempt is
+  a *failure*, and failures are not in the percentiles — so with the timeout at
+  or under the threshold, every attempt slow enough to breach it leaves the
+  sample instead, and the p99 SLO passes a run that served almost nothing.
+  jinrai warns when the two are set that way.
 
 **Add `--dry-run` to any command** to walk the whole refusable path (allowlist,
 authorization gate, privilege preflight) and print the plan **without sending a
@@ -430,7 +454,7 @@ None of these need privileges. All use `--url` instead of `--target`.
 
 ```sh
 jinrai $A --url $URL --l7-method get --rate 2000 --duration 60 \
-  --slo-max-5xx-rate 0.01 --slo-max-p99-ms 500 $REQ
+  --slo-max-5xx-rate 0.01 --slo-max-p99-ms 500 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -438,6 +462,7 @@ jinrai $A --url $URL --l7-method get --rate 2000 --duration 60 \
 | `--url $URL` | The authorized datum. The host is resolved once and pinned. |
 | `--l7-method get` | Fast request flood (the default). Swap for `post` or `head`. |
 | `--rate 2000` | Requests per second. |
+| `$BUDGET` | **Required to actually offer 2000/s** — the default budget carries 102/s and jinrai would refuse this run. See [Setup](#setup). Note the 1 s timeout sits deliberately *above* the 500 ms p99 SLO below: a timed-out attempt is a failure and failures are not in the percentiles, so a timeout at or under the threshold lets slow attempts leave the sample instead of breaching it. |
 | `--slo-max-5xx-rate 0.01` | **The run FAILS if more than 1% of responses are 5xx.** An unmet SLO exits non-zero: that is how a pipeline tells "the target held" from "the target buckled". |
 | `--slo-max-p99-ms 500` | FAIL if end-of-run p99 latency exceeds 500 ms. |
 
@@ -452,12 +477,13 @@ Every request asks for a URI that **does not exist**: nothing is cacheable, and
 the origin answers (and usually logs) all of it.
 
 ```sh
-jinrai $A --url $URL --l7-method get --random-path --rate 2000 --duration 60 $REQ
+jinrai $A --url $URL --l7-method get --random-path --rate 2000 --duration 60 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
 |---|---|
 | `--random-path` | Appends a fresh random segment to the path on every request. It touches the path **only**: the host is never altered, so the authorization and the DNS pin hold for every request of the run. |
+| `$BUDGET` | Same reason as case 20: the default 1024 slots over a 10 s timeout carry only 102/s, so jinrai refuses a 2000/s run rather than quietly offer a twentieth of it. See [Setup](#setup). |
 
 **How to read it:** 100% 4xx here is the test working, not the target failing —
 the summary says so with `varying: random path`.
@@ -471,7 +497,7 @@ lands on real handlers rather than the 404 path.
 
 ```sh
 jinrai $A --url $URL --l7-method get --path-file ./endpoints.txt \
-  --rate 2000 --duration 60 $REQ
+  --rate 2000 --duration 60 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -494,7 +520,7 @@ Example `endpoints.txt`:
 ```sh
 jinrai $A --url $URL --l7-method post --body '{"q":"load"}' \
   --header 'Content-Type: application/json' --cache-bust \
-  --rate 1000 --duration 60 $REQ
+  --rate 1000 --duration 60 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -516,7 +542,7 @@ The one query a cache can never serve: a fresh term on every request.
 
 ```sh
 jinrai $A --url ${URL}search --l7-method get --search-param q \
-  --rate 2000 --duration 60 $REQ
+  --rate 2000 --duration 60 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -532,7 +558,7 @@ session store can absorb any of it.
 
 ```sh
 jinrai $A --url $URL --l7-method get --session-cookie JSESSIONID --search-param q \
-  --rate 2000 --duration 60 $REQ
+  --rate 2000 --duration 60 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -548,12 +574,14 @@ The controlled form of the connection-slot attacks: the load is pinned to a
 maximum number of connections held busy.
 
 ```sh
-jinrai $A --url $URL --l7-method get --max-connections 50 --rate 5000 --duration 60 $REQ
+jinrai $A --url $URL --l7-method get --max-connections 50 --rate 5000 --duration 60 \
+  --allow-underpowered $REQ
 ```
 
 | Switch | What it does here |
 |---|---|
 | `--max-connections 50` | Caps concurrent in-flight requests ≈ concurrent keep-alive connections (default 1024). It is how you probe a server's connection-slot / worker limit. **`--rate` alone does not bound connections**: against a slow target, rate × latency *is* the socket count, and this flag is what keeps the run from becoming a descriptor self-test on your own box. `0` means unbounded — an explicit choice, never the default. |
+| `--allow-underpowered` | 50 slots over the default 10s timeout carry 5/s, far below the 5000/s asked for, and jinrai normally refuses that — a run whose rate the slot budget cannot deliver measures *us*, not the target. **This is the one case where that is the point.** The 50 connections are the instrument; `--rate 5000` only says "keep them busy", and the shortfall is the ceiling being probed. Read the result as a connection-slot finding, not a throughput one — the summary's `bound by` row will say concurrency, and here that is correct. |
 
 ---
 
@@ -732,7 +760,7 @@ For all of them, `--rate` counts **frames per second**.
 ```sh
 jinrai $A --url $URL --l7-method get \
   --header 'User-Agent: LoadTest/1.0' --header 'Referer: https://intranet/' \
-  --rate 2000 --duration 60 $REQ
+  --rate 2000 --duration 60 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -830,7 +858,7 @@ reporting the knee of the capacity curve.
 
 ```sh
 jinrai $A --url $URL --rate 5000 --duration 300 --discover-knee \
-  --slo-max-5xx-rate 0.02 $REQ
+  --slo-max-5xx-rate 0.02 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -852,7 +880,7 @@ fast autoscaling reacts.
 
 ```sh
 jinrai $A --url $URL --profile spike --spike-base 200 --spike-secs 30 \
-  --rate 5000 --duration 300 $REQ
+  --rate 5000 --duration 300 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -868,7 +896,7 @@ jinrai $A --url $URL --profile spike --spike-base 200 --spike-secs 30 \
 
 ```sh
 jinrai $A --url $URL --profile soak --rate 500 --duration 3600 \
-  --watchdog --slo-max-5xx-rate 0.05 $REQ
+  --watchdog --slo-max-5xx-rate 0.05 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
@@ -890,7 +918,7 @@ non-zero.
 
 ```sh
 jinrai $A --url $URL --profile ramp --ramp-start 100 --ramp-steps 10 \
-  --rate 5000 --duration 300 $REQ
+  --rate 5000 --duration 300 $BUDGET $REQ
 ```
 
 | Switch | What it does here |
