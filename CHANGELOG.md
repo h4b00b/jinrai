@@ -26,6 +26,63 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.49.0] — 2026-08-04
+
+0.47.0 refused a fast-L7 run whose slot budget could not carry its `--rate`. The
+L4 connect flood has the identical arithmetic — a worker is held for a whole
+handshake, so `--concurrency` over `--connect-timeout-ms` is what it can offer
+once the target stops answering — and was never checked. The stock defaults carry
+512/s; `--l4-mode tcp --rate 10000` ran for its whole window and reported jinrai's
+ceiling where the target's capacity belongs. `--debug` started *reporting* that
+number in 0.48.0; this refuses on it.
+
+### Added
+
+- **`--l4-mode tcp` is refused up front when its budget cannot offer its rate**,
+  on the same terms as the L7 flood: fail-closed rather than warning, reachable
+  by `--dry-run`, waived by `--allow-underpowered` for the run where holding a
+  fixed slot budget against the target *is* the test.
+
+  The refusal is **layer-aware**, which is the whole reason it is not a copy of
+  the L7 one. It names `--concurrency` and `--connect-timeout-ms`, never
+  `--max-connections` and `--request-timeout-ms`: a refusal whose advice names a
+  flag the layer does not have is worse than no refusal. Its slot suggestion stops
+  at the connect pool's own worker ceiling rather than the parser's, because past
+  that `--concurrency` buys nothing — the pool clamps, and the operator would
+  paste the fix and get the identical refusal back.
+
+  In a **multi-vector** run `--rate` is one ceiling split between the vectors, so
+  the check runs against the connect vector's *share*. Two consequences, both
+  visible in the message: it says where the smaller number came from (an operator
+  should not have to hunt their command line for a `--rate` they never typed), and
+  it scales the `--rate` suggestion back up to a total that survives the split.
+
+  The other L3/L4 modes are deliberately **not** checked. A packet flood holds no
+  slot — `sendto` returns and the unit is gone — so there is no ceiling to breach.
+  `--l4-mode data` holds connections, but opens its pool once and then writes into
+  it: the connect cost bounds its first second, not its steady state.
+
+### Changed
+
+- **`worst_case_offered_rate` moves from `l7` to `core`.** It is not one layer's
+  arithmetic — it is the same slot ledger wherever a run holds a bounded pool for
+  the life of an attempt. Two copies would be two chances for the refusal and the
+  `--debug` diagnostic to quote different ceilings for the same run, which is
+  exactly what had begun to happen: 0.48.0's `in flight` preamble line had its own
+  private version of the division.
+- **`--allow-underpowered` is no longer reported as a flag of the wrong layer at
+  `l3`/`l4`.** It is the way out of a check those layers can now fail.
+
+### Fixed
+
+- **Three documented commands were teaching an underpowered connect flood** —
+  the README cookbook's connect flood (`--rate 5000` against a budget carrying
+  1024/s), playbook case 10 (`--rate 10000` against the same), and the `--debug`
+  example added in 0.48.0. The same class of error 0.47.0 found in 21 L7 recipes.
+  Each now sets `--connect-timeout-ms` to a value that makes the three numbers
+  add up, and playbook case 10 spells the arithmetic out rather than leaving it
+  to be discovered as a refusal.
+
 ## [0.48.0] — 2026-08-04
 
 `--debug` shipped in 0.45.0 for L7 only. At `--layer l3` and `--layer l4` it was
@@ -2389,7 +2446,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.48.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/h4b00b/jinrai/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/h4b00b/jinrai/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/h4b00b/jinrai/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/h4b00b/jinrai/compare/v0.45.0...v0.46.0

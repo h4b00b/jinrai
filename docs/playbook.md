@@ -272,15 +272,25 @@ kernel stack, and it works over IPv6 too.
 
 ```sh
 jinrai $A --target $T --port 445 --layer l4 --l4-mode tcp \
-  --concurrency 512 --connect-timeout-ms 500 --rate 10000 --duration 60 $REQ
+  --concurrency 512 --connect-timeout-ms 50 --rate 10000 --duration 60 $REQ
 ```
 
 | Switch | What it does here |
 |---|---|
 | `--l4-mode tcp` | Connect flood: opens complete connections and holds them. |
 | `--concurrency 512` | **Simultaneously open sockets** (default 256, capped at 4096 threads). It is the run's local footprint *and* the handshake parallelism. Once N are open, admitting a new attempt closes the oldest connection. |
-| `--connect-timeout-ms 500` | How long one attempt may stay unresolved before it is abandoned and counted in the `timeout` errno bucket (default 500). **This is the real lever:** an attempt that times out holds its slot for the whole timeout, so once a meaningful share of attempts fail, lowering this buys far more offered load than raising `--concurrency`. |
-| `--rate 10000` | Ceiling on attempts/s. The reachable rate is about `--concurrency` ÷ mean attempt time. |
+| `--connect-timeout-ms 50` | How long one attempt may stay unresolved before it is abandoned and counted in the `timeout` errno bucket (default 500). **This is the real lever:** an attempt that times out holds its slot for the whole timeout, so once a meaningful share of attempts fail, lowering this buys far more offered load than raising `--concurrency`. |
+| `--rate 10000` | Ceiling on attempts/s. A slot is held for a whole handshake, so the budget above carries `512 ÷ 0.05s` = **10240/s** even if nothing completes — which is why these three numbers are chosen together. |
+
+**These three numbers are not independent, and jinrai refuses the run if they do
+not add up.** `--concurrency ÷ --connect-timeout-ms` is the rate still reachable
+once the target stops answering, and asking for more offers load it will never
+see — the shortfall arriving exactly when the target starts to struggle, so the
+summary would report *our* ceiling as its capacity. At the stock 256 slots and
+500 ms the ceiling is 512/s; the refusal prints the arithmetic and both levers as
+pasteable fragments. `--allow-underpowered` runs it as asked, for the case where
+holding a fixed slot budget *is* the test. `--dry-run` reaches the check, so a
+command line can be validated without sending.
 
 **How to read it:** if `attempts` falls well short of the cap, the yellow
 `bound by` line says **which of the two knobs** to reach for, with the arithmetic
@@ -1033,7 +1043,7 @@ jinrai $A --url $URL --l7-method post --body '{"q":"load"}' \
 
 # l3/l4: the same three answers for a packet flood
 jinrai $A --layer l4 --l4-mode udp --l4-mode tcp --target $IP --port 443 \
-  --payload-size 1400 --debug --rate 2000 --duration 30
+  --payload-size 1400 --debug --rate 1000 --duration 30
 ```
 
 Three things the `l3`/`l4` preamble is worth running once for, before a long
