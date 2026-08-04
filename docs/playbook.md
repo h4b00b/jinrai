@@ -1014,28 +1014,42 @@ HMAC or an external anchor, and it is out of scope.
 
 ## Seeing a run while it happens (`--debug`)
 
-For the fast `get`/`post`/`head` flood, `--debug` narrates on **stderr** — stdout
-stays exactly as scriptable as before. Use it when the summary left a question it
-could not answer, which is normally one of these three:
+`--debug` narrates on **stderr** — stdout stays exactly as scriptable as before.
+It works at every layer: the fast `get`/`post`/`head` flood at `l7`, and **every
+mode** at `l3`/`l4`. Use it when the summary left a question it could not answer,
+which is normally one of these three:
 
 | Question | What `--debug` shows |
 |---|---|
-| *What am I actually sending?* | The composed request before the first byte: URL after variation, **every header including the ones jinrai adds**, the body and its declared type, the single pinned resolution, and the policies in force. A `body … type: NONE — the target cannot tell what this is` is the whole diagnosis of a POST flood that reported `4xx` and tested nothing. |
-| *Is it doing anything? When did it start failing?* | One line a second: attempts, the rate **over the last second** (not the average — that hides mid-run degradation), completions by class, failures. |
-| *What does `4 x internal` actually mean?* | The distinct failure messages behind the errno buckets, with counts — `error sending request …: tcp connect error: Connection refused (os error 111)`. The bucket is the category; this is the cause. |
+| *What am I actually sending?* | **l7:** the composed request before the first byte — URL after variation, **every header including the ones jinrai adds**, the body and its declared type, the single pinned resolution, the policies in force. A `body … type: NONE — the target cannot tell what this is` is the whole diagnosis of a POST flood that reported `4xx` and tested nothing. **l3/l4:** the composed packet — the vectors, the targets, the ports, the **clamped** payload per mode, the real source address, the raw-socket privilege needed, the per-vector share of `--rate`, and the socket ceiling with what it can offer under it. |
+| *Is it doing anything? When did it start failing?* | One line a second: attempts, the rate **over the last second** (not the average — that hides mid-run degradation), then completions by class (l7) or sent/failed/not-sent (l3/l4). At `l3`/`l4` there is one line **per vector**, so a multi-vector run cannot hide the vector that stopped. |
+| *What does `4 x internal` actually mean?* | The distinct failure messages behind the errno buckets, with counts — `error sending request …: tcp connect error: Connection refused (os error 111)` at l7, `Message too long (os error 90)` at l3/l4. The bucket is the category; this is the cause. |
 
 ```sh
+# l7: what is actually on the wire, and why the failures failed
 jinrai $A --url $URL --l7-method post --body '{"q":"load"}' \
   --header 'Content-Type: application/json' --debug \
   --rate 100 --duration 30 $REQ
+
+# l3/l4: the same three answers for a packet flood
+jinrai $A --layer l4 --l4-mode udp --l4-mode tcp --target $IP --port 443 \
+  --payload-size 1400 --debug --rate 2000 --duration 30
 ```
+
+Three things the `l3`/`l4` preamble is worth running once for, before a long
+campaign: `--payload-size` is clamped per mode and the preamble prints the size
+that will actually leave; `--rate` is a **shared** ceiling that a multi-vector run
+splits between its vectors; and the `in flight` line is the Little's-law
+arithmetic — `sockets / connect-timeout` — that decides whether `--rate` or
+`--concurrency` binds first. A `--rate` above that figure is offered load the
+target will never see.
 
 It is **not** per-request logging, and deliberately so: at these rates a line per
 request is a second workload competing with the one under test, which would
 change the measurement it exists to explain. Everything is once, once a second,
-or aggregated. The failure sample is capped at 16 distinct messages and never
-enters the audit log — that text is chosen by the target, and the log is a
-bounded, hash-chained record.
+or aggregated. The failure sample is capped at 16 distinct messages — one cap
+shared by both layers — and never enters the audit log: that text is chosen by
+the target, and the log is a bounded, hash-chained record.
 
 ---
 

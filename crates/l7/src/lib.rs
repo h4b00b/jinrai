@@ -71,8 +71,8 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
 use jinrai_core::{
-    ErrnoBucket, ErrnoTally, Knee, Layer, LoadProfile, LoadStage, ModuleError, RunPlan, RunReport,
-    SloSpec, StressModule,
+    record_failure_sample, ErrnoBucket, ErrnoTally, Knee, Layer, LoadProfile, LoadStage,
+    ModuleError, RunPlan, RunReport, SloSpec, StressModule,
 };
 use jinrai_safety::{AuthorizedTarget, Authorization, KillSwitch, SafetyError};
 
@@ -395,19 +395,6 @@ pub struct L7Engine {
     /// errno buckets. See [`with_debug`](Self::with_debug).
     debug: bool,
 }
-
-/// How many distinct failure messages `--debug` keeps.
-///
-/// The text comes from the peer's behaviour, so it is not ours to trust with an
-/// unbounded map: a target answering with a different error each time would grow
-/// it for the length of the run. Sixteen is far more variety than a real failure
-/// mode produces — past that the run has a different problem, and the overflow
-/// is counted rather than dropped.
-const MAX_FAILURE_SAMPLES: usize = 16;
-
-/// The key the overflow beyond [`MAX_FAILURE_SAMPLES`] is counted under, so a
-/// truncated sample still says it was truncated.
-const FAILURE_OVERFLOW_KEY: &str = "(further distinct messages, not shown)";
 
 /// The `User-Agent` every request carries unless the operator overrides it.
 ///
@@ -913,7 +900,7 @@ impl StressModule for L7Engine {
         // `RunReport::status_codes` for why the class alone is not actionable.
         let codes: Arc<Mutex<BTreeMap<u16, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         // The sentence behind each errno bucket, under `--debug` only. Bounded:
-        // see `MAX_FAILURE_SAMPLES`.
+        // see `jinrai_core::MAX_FAILURE_SAMPLES`.
         let failures: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let debug = self.debug;
         // Why each failed attempt failed — refused / unanswered / protocol / a
@@ -1197,18 +1184,11 @@ impl StressModule for L7Engine {
                                 // failure. Only under --debug: the text is the
                                 // peer's, and the map is capped for it.
                                 if debug {
-                                    let mut seen =
-                                        failures.lock().unwrap_or_else(|p| p.into_inner());
-                                    let msg = failure_message(&e);
-                                    if seen.len() >= MAX_FAILURE_SAMPLES
-                                        && !seen.contains_key(&msg)
-                                    {
-                                        *seen
-                                            .entry(FAILURE_OVERFLOW_KEY.to_string())
-                                            .or_insert(0) += 1;
-                                    } else {
-                                        *seen.entry(msg).or_insert(0) += 1;
-                                    }
+                                    record_failure_sample(
+                                        &mut failures.lock().unwrap_or_else(|p| p.into_inner()),
+                                        failure_message(&e),
+                                        1,
+                                    );
                                 }
                             }
                         }

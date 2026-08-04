@@ -896,7 +896,9 @@ bounded, the same shape every time. `--debug` is what you turn on when it left
 you with a question — narration on **stderr**, so `--output line` on stdout stays
 exactly as scriptable as it was.
 
-Three things, in the three places a question actually gets asked.
+Three things, in the three places a question actually gets asked — and the same
+three at **every layer**: `l3`, `l4` and `l7` all narrate, each with the preamble
+its own traffic has.
 
 **Before — the request as composed.** "What am I actually sending" had no answer
 short of a packet capture. The header map with jinrai's own defaults merged in,
@@ -920,6 +922,34 @@ engine, so this is where they can be shown:
 A `body ... type: NONE — the target cannot tell what this is` here is the whole
 diagnosis of a POST flood that reported 4xx and tested nothing.
 
+**For `l3`/`l4` the same preamble describes the packet**, and every number in it
+is the *effective* one rather than the flag you typed — which is the only reason
+it is worth printing:
+
+```
+---- debug: the packets as composed ----
+  vectors    udp-flood + tcp-connect-flood (L4)
+  targets    10.0.0.10 (authorized; the gate is not consulted again)
+  ports      port 19999
+  payload    udp-flood: 1472 bytes (--payload-size 9000 clamped)
+  payload    tcp-connect-flood: none — this mode crafts a bodyless packet
+  source     10.1.2.3 (the host's real address; there is no spoof path)
+  privilege  none — every vector uses ordinary sockets
+  rate       101/s, shared: udp-flood 51/s, tcp-connect-flood 50/s
+  window     30s
+  in flight  tcp-connect-flood: 256 sockets, connect timeout 500ms — at most
+             512/s can be offered if nothing completes
+----------------------------------------
+```
+
+Read top to bottom, that answers the questions the L3/L4 summary cannot: the
+`--payload-size` you asked for is not the one on the wire (each mode clamps
+differently, and GRE has to leave room for its own encapsulation); `--rate` is a
+**shared** ceiling that a multi-vector run splits; the source address is the one
+the OS picked for the route, which is what the target's logs will show and what
+the no-spoofing guarantee actually resolves to; and the last line is the Little's-
+law arithmetic that decides whether `--rate` or `--concurrency` will bind first.
+
 **During — one line a second.** A sixty-second run printed nothing at all until
 it was over, so neither "is it doing anything" nor "when did it start failing"
 could be answered from outside. The rate in brackets is the **last second**, not
@@ -928,6 +958,15 @@ the cumulative average, because that is what shows a target degrading mid-run:
 ```
   debug   1.0s  attempts 100 (100/s)  2xx 86 3xx 0 4xx 14 5xx 0  failed 0
   debug   2.0s  attempts 200 (100/s)  2xx 172 3xx 0 4xx 28 5xx 0  failed 0
+```
+
+At `l3`/`l4` there is one line **per vector**, because a multi-vector run is
+several floods sharing one rate cap and a merged line would hide the one that
+stopped sending:
+
+```
+  debug   1.0s  udp-flood                units 52 (52/s)  sent 52  failed 0  not sent 0
+  debug   1.0s  tcp-connect-flood        units 50 (50/s)  sent 0  failed 50  not sent 0
 ```
 
 **After — the sentence behind each errno bucket.** `4 x internal` names a
@@ -945,16 +984,28 @@ The URL is replaced with a placeholder because it varies per request — with
 sample would degenerate into a list of URLs. The sample is capped at 16 distinct
 messages, with the overflow counted rather than dropped: the text is chosen by
 the thing being tested, so it is not given an unbounded map. For the same reason
-it never reaches the audit log, which stays a bounded, hash-chained record.
+it never reaches the audit log, which stays a bounded, hash-chained record. The
+cap is one number shared by both layers, so a truncated L4 sample and a truncated
+L7 one mean the same thing.
 
-What `--debug` deliberately is **not** is per-request logging. At the rates this
-engine dispatches, a line per request is not a log anyone reads — it is a second
+At `l3`/`l4` the sentence is the OS error the send actually returned, which is
+where the layer's own confusions live: `Message too long (os error 90)` says your
+`--payload-size` does not fit the path, not that the target rejected anything.
+The two failures with no OS error behind them — an attempt still in flight when
+the window closed, and jinrai's own connect dispatcher having already shut down —
+carry a written explanation instead of being left out, because a block that
+listed every other bucket's cause and silently skipped those would read as though
+they had none.
+
+What `--debug` deliberately is **not** is per-request logging. At the rates these
+engines dispatch, a line per request is not a log anyone reads — it is a second
 workload competing with the one under test, and it would change the measurement
 it exists to explain. Everything above is once, once a second, or aggregated.
 
-It applies to the fast `get`/`post`/`head` flood; the other methods build their
-own frames and report through the summary alone, and say so rather than leaving
-you waiting for output that is not coming.
+At `l7` it applies to the fast `get`/`post`/`head` flood; the other methods build
+their own frames and report through the summary alone, and say so rather than
+leaving you waiting for output that is not coming. At `l3`/`l4` it applies to
+every mode.
 
 ### HTTP/1.1 vs HTTP/2 (`--http-version`)
 
