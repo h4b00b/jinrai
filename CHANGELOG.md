@@ -26,6 +26,73 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.48.0] — 2026-08-04
+
+`--debug` shipped in 0.45.0 for L7 only. At `--layer l3` and `--layer l4` it was
+listed as a flag of the wrong layer and dropped with a warning, so the three
+questions it exists to answer had no answer at all below L7 — and those are the
+layers where the summary is *least* able to answer them, because a packet flood
+has no status codes, no response bodies, and often no reply of any kind. The one
+narration now covers every layer.
+
+### Added
+
+- **`--debug` at `l3`/`l4`**, in the same three places as at L7 and with the same
+  guarantees: stderr only (stdout stays scriptable), nothing per-unit, everything
+  once, once a second, or aggregated.
+
+  - **before — the packets as composed.** Printed from the engine, because every
+    number in it is the *effective* one and the command line cannot be read for
+    any of them: the payload after its **per-mode clamp** (a `--payload-size
+    9000` UDP flood sends 1472; GRE has to leave room for its own encapsulation;
+    a raw flag flood carries no body at all), the **real source address** the OS
+    picked for the route — which is what the target's logs will show, and what
+    the no-spoofing guarantee resolves to in practice — the raw-socket privilege
+    each vector needs, the **per-vector share** of a `--rate` that is shared
+    rather than per-vector, and the socket ceiling with the Little's-law figure
+    it can actually offer under it.
+  - **during — one line a second, per vector.** A multi-vector run is several
+    floods sharing one rate cap, and a single merged line hides the one vector
+    that stopped sending. Driven from inside each vector's own send loop rather
+    than by a reporting thread: the counters are owned by the sending thread, and
+    the narration must not become a second workload competing with the one under
+    test.
+  - **after — the sentence behind each errno bucket.** `40 x timeout` is what a
+    summary needs; `Message too long (os error 90)` is what says the failure was
+    a `--payload-size` that does not fit the path rather than anything the target
+    did. The text reached `classify_io` and went no further, so nothing
+    downstream could recover it. The two failures with **no OS error behind
+    them** — an attempt still in flight when the window closed, and jinrai's own
+    connect dispatcher having already shut down — carry a written explanation
+    instead of being omitted, because a block that listed every other bucket's
+    cause and silently skipped those would read as though they had none.
+
+### Changed
+
+- **The failure-sample cap is one definition, in `core`, read by both engines.**
+  It was a private constant in the L7 crate. Two engines with two caps would be
+  two different disclosures of the same truncation, and an operator comparing an
+  L4 run with an L7 one should not have to know which crate wrote the number —
+  the same reasoning that already puts `ErrnoBucket::from_io_error` there. A
+  multi-vector run merges its vectors' samples *through* that cap rather than by
+  extending one map with another, so three vectors each holding sixteen distinct
+  messages cannot produce a forty-eight-entry "bounded" sample.
+- **The per-mode payload clamps are one definition too.** They were inline in
+  `Sender::setup`, which was fine while nothing else needed them; the preamble
+  does, and a preamble that reported a size the sender did not use would be the
+  exact "the run I described is not the run that happened" the flag exists to
+  close. A test reads the number out of a constructed sender and asserts the
+  preamble prints that one.
+
+### Documentation
+
+- README and `docs/playbook.md`: `--debug` is documented as a whole-tool flag
+  with a per-layer preamble, rather than an L7 feature. The playbook adds the
+  `l3`/`l4` invocation and the three things the packet preamble is worth one run
+  for before a long campaign.
+- `--help`: the `--debug` entry describes both preambles and the per-vector
+  progress line, and no longer claims the flag is L7-only.
+
 ## [0.47.0] — 2026-08-04
 
 An operator asked a login endpoint for 2000 requests a second and got 390. The
@@ -2322,7 +2389,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.47.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.48.0...HEAD
+[0.48.0]: https://github.com/h4b00b/jinrai/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/h4b00b/jinrai/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/h4b00b/jinrai/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/h4b00b/jinrai/compare/v0.44.0...v0.45.0

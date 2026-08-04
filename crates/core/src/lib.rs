@@ -580,6 +580,41 @@ impl RunReport {
     }
 }
 
+/// How many distinct failure messages a `--debug` run keeps.
+///
+/// The text comes from the peer's behaviour, so it is not ours to trust with an
+/// unbounded map: a target answering with a different error each time would grow
+/// it for the length of the run. Sixteen is far more variety than a real failure
+/// mode produces — past that the run has a different problem, and the overflow is
+/// counted rather than dropped.
+pub const MAX_FAILURE_SAMPLES: usize = 16;
+
+/// The key the overflow beyond [`MAX_FAILURE_SAMPLES`] is counted under, so a
+/// truncated sample still says it was truncated.
+pub const FAILURE_OVERFLOW_KEY: &str = "(further distinct messages, not shown)";
+
+/// Add `count` occurrences of one failure message to a
+/// [`RunReport::failure_samples`] map, keeping it inside
+/// [`MAX_FAILURE_SAMPLES`].
+///
+/// Lives here, beside the field it fills, for the same reason
+/// [`ErrnoBucket::from_io_error`] does: an operator comparing an L4 run with an
+/// L7 one must not have to know which crate wrote the number. Two engines with
+/// two caps would have been two different disclosures of the same truncation.
+///
+/// `count` is what lets a multi-vector run merge its per-vector maps through the
+/// same cap the vectors filled them under. Folding one vector's sixteen distinct
+/// messages into another's by extending the map would produce a thirty-two-entry
+/// "bounded" sample; folding them one call per occurrence would walk a counter
+/// that reaches the millions.
+pub fn record_failure_sample(into: &mut BTreeMap<String, u64>, message: String, count: u64) {
+    if into.len() >= MAX_FAILURE_SAMPLES && !into.contains_key(&message) {
+        *into.entry(FAILURE_OVERFLOW_KEY.to_string()).or_insert(0) += count;
+    } else {
+        *into.entry(message).or_insert(0) += count;
+    }
+}
+
 /// A Service-Level Objective: the thresholds a run's traffic must stay within
 /// for the target to be judged healthy under load. Every threshold is optional
 /// (`None` = not evaluated); an all-`None` spec is inert.

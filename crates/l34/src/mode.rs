@@ -343,6 +343,15 @@ pub struct L34Config {
     /// How long a single connection attempt may stay unresolved before it is
     /// abandoned and bucketed as `ErrnoBucket::Timeout`.
     pub connect_timeout: Duration,
+    /// Narrate the run on stderr (`--debug`): the packets as composed before the
+    /// first one leaves, a line a second per vector while it runs, and the
+    /// distinct failure messages behind the errno buckets.
+    ///
+    /// A run-shape flag rather than a primitive's parameter, which is why it sits
+    /// here beside the others rather than being threaded through every sender: it
+    /// changes nothing about what goes on the wire, only what the operator is told
+    /// about it.
+    pub debug: bool,
 }
 
 /// Default in-flight cap: high enough to apply real connection-table pressure,

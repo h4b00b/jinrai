@@ -71,7 +71,7 @@ mod ports;
 pub use mode::{L34Config, L4Mode, DEFAULT_CONCURRENCY, DEFAULT_CONNECT_TIMEOUT};
 pub use ports::{PortOrder, PortSet, Rng};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -81,7 +81,8 @@ use hdrhistogram::Histogram;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use jinrai_core::{
-    ErrnoBucket, ErrnoTally, Layer, ModuleError, RateCap, RunPlan, RunReport, StressModule,
+    record_failure_sample, ErrnoBucket, ErrnoTally, Layer, ModuleError, RateCap, RunPlan,
+    RunReport, StressModule,
 };
 
 use crate::mode::{IcmpQuery, TcpFlags};
@@ -121,6 +122,19 @@ enum Emission {
 /// same OS failure identically.
 fn classify_io(e: &std::io::Error) -> ErrnoBucket {
     ErrnoBucket::from_io_error(e)
+}
+
+/// One failed send: bucketed for the summary, and — under `--debug` — with the
+/// sentence behind the bucket kept before it is lost.
+///
+/// Every send path goes through here rather than building
+/// `Emission::Failed(classify_io(&e))` itself, because classification is exactly
+/// where the text was being discarded: `ErrnoBucket::Other(90)` is what the
+/// summary can act on, and "Message too long (os error 90)" is what tells an
+/// operator their `--payload-size` does not fit the path's MTU.
+fn failed(tally: &mut Tally, e: &std::io::Error) -> Emission {
+    tally.note_failure(|| e.to_string());
+    Emission::Failed(classify_io(e))
 }
 
 /// Why an L3/L4 run could not be prepared or fully run. Fail-closed.
@@ -308,6 +322,13 @@ impl L34Engine {
         let ips: Vec<IpAddr> = plan.targets.iter().filter_map(|t| t.as_ip()).collect();
         let label = self.run_label(ips.len());
 
+        // Before the rate-0 early return, deliberately: `--rate 0` is the whole-run
+        // no-op, and "what would this command have sent" is exactly the question it
+        // is used to ask.
+        if self.config.debug {
+            eprint!("{}", self.debug_plan(&ips, plan));
+        }
+
         // Rate 0 => send nothing (this is a safety control, honoured before we
         // even open a socket, so it is deterministic).
         if plan.rate_cap.min_interval().is_none() {
@@ -353,6 +374,138 @@ impl L34Engine {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// The `--debug` preamble: what this run will put on the wire, and under
+    /// which ceilings.
+    ///
+    /// Printed from the engine rather than from the CLI for the same reason the
+    /// L7 one is — this is the only place the finished picture exists. Every
+    /// number here is the *effective* one, not the flag: the payload after its
+    /// per-mode clamp, the socket ceiling after the hard cap, the per-vector share
+    /// of `--rate` rather than `--rate` itself, and the source address the OS
+    /// picked rather than one the command line could name. A preamble that echoed
+    /// the flags back would answer no question the operator could not answer by
+    /// re-reading what they typed.
+    fn debug_plan(&self, ips: &[IpAddr], plan: &RunPlan) -> String {
+        fn row(key: &str, value: &str) -> String {
+            format!("  {key:<11}{value}\n")
+        }
+        let cfg = &self.config;
+        let mut out = String::from("---- debug: the packets as composed ----\n");
+        out.push_str(&row(
+            "vectors",
+            &format!(
+                "{} ({})",
+                cfg.modes.iter().map(|m| m.label()).collect::<Vec<_>>().join(" + "),
+                layer_tag(cfg.layer()),
+            ),
+        ));
+        out.push_str(&row(
+            "targets",
+            &format!(
+                "{} (authorized; the gate is not consulted again)",
+                ips.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
+            ),
+        ));
+        // ICMP is portless, so an all-ICMP run naming a port set would describe a
+        // field its packets do not carry — the same reason `run_label` omits it.
+        if !cfg.modes.iter().all(|m| m.is_icmp()) {
+            out.push_str(&row("ports", &cfg.ports.label()));
+        }
+        // Per mode, because the clamps differ and a single "payload 4000" would be
+        // a number no vector actually used: UDP tops out at an unfragmented
+        // datagram, GRE has to leave room for its own encapsulation, and the modes
+        // that craft a bare segment carry no body at all.
+        for &mode in &cfg.modes {
+            match effective_payload(mode, cfg.payload_size) {
+                Some(n) if n != cfg.payload_size => out.push_str(&row(
+                    "payload",
+                    &format!("{}: {n} bytes (--payload-size {} clamped)", mode.label(), cfg.payload_size),
+                )),
+                Some(n) => out.push_str(&row("payload", &format!("{}: {n} bytes", mode.label()))),
+                None => out.push_str(&row(
+                    "payload",
+                    &format!("{}: none — this mode crafts a bodyless packet", mode.label()),
+                )),
+            }
+        }
+        if let Some(note) = self.wire_note() {
+            out.push_str(&row("unit", &note));
+        }
+        // The no-spoofing guarantee, spelled out as the address it actually
+        // resolves to. This is the one line that answers "the target's logs show a
+        // source I did not expect" without a packet capture, and it is the same
+        // call every packet builder makes — see `packet::source_ipv4_for`.
+        if let Some(IpAddr::V4(dst)) = ips.iter().copied().find(|i| i.is_ipv4()) {
+            out.push_str(&row(
+                "source",
+                &match source_ipv4_for(dst, 0) {
+                    Ok(src) => format!("{src} (the host's real address; there is no spoof path)"),
+                    // Best effort: a preamble that cannot answer says so. Guessing
+                    // here would print an address the run will not use.
+                    Err(e) => format!("could not be determined ({e})"),
+                },
+            ));
+        }
+        let raw: Vec<&str> =
+            cfg.modes.iter().filter(|m| m.needs_raw_socket()).map(|m| m.label()).collect();
+        out.push_str(&row(
+            "privilege",
+            &if raw.is_empty() {
+                "none — every vector uses ordinary sockets".to_string()
+            } else {
+                format!("CAP_NET_RAW/root, for {}", raw.join(", "))
+            },
+        ));
+        out.push_str(&row(
+            "rate",
+            &if cfg.is_multi_vector() {
+                let shares = plan.rate_cap.split_across(cfg.modes.len());
+                format!(
+                    "{}/s, shared: {}",
+                    plan.rate_cap.per_second,
+                    cfg.modes
+                        .iter()
+                        .zip(shares.iter())
+                        .map(|(m, s)| format!("{} {}/s", m.label(), s.per_second))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!("{}/s", plan.rate_cap.per_second)
+            },
+        ));
+        out.push_str(&row("window", &format!("{:?}", plan.duration)));
+        // Only the two connection-holding modes have an in-flight budget, and only
+        // the connect flood is bound by it in steady state — the data flood's pool
+        // is opened once and then written to, so quoting an offerable ceiling for
+        // it would describe its first second and none of the rest.
+        for &mode in &cfg.modes {
+            let cap = cfg.effective_concurrency();
+            let line = match mode {
+                L4Mode::TcpConnect => {
+                    let slots = effective_parallelism(cap);
+                    format!(
+                        "{}: {slots} sockets, connect timeout {:?} — at most {}/s can be \
+                         offered if nothing completes",
+                        mode.label(),
+                        cfg.connect_timeout,
+                        offerable_per_second(slots, cfg.connect_timeout),
+                    )
+                }
+                L4Mode::Data => format!(
+                    "{}: {} connections held, connect timeout {:?}",
+                    mode.label(),
+                    effective_data_connections(cap),
+                    cfg.connect_timeout,
+                ),
+                _ => continue,
+            };
+            out.push_str(&row("in flight", &line));
+        }
+        out.push_str("----------------------------------------\n");
+        out
+    }
+
     /// Drive every vector at once, each on its own thread, each with its own
     /// share of the one `--rate` ceiling.
     ///
@@ -369,7 +522,7 @@ impl L34Engine {
         label: String,
     ) -> Result<RunReport, L34Error> {
         let shares = plan.rate_cap.split_across(self.config.modes.len());
-        let mut merged = Tally::new();
+        let mut merged = Tally::new(self.config.debug);
         let mut aborted = false;
         let mut per_vector: Vec<String> = Vec::with_capacity(self.config.modes.len());
         // A vector that could not start is the run's failure, not a footnote:
@@ -456,12 +609,12 @@ impl L34Engine {
         // split that rounds a vector to nothing) deterministic.
         let interval = match rate_cap.min_interval() {
             Some(i) => i,
-            None => return Ok((Tally::new(), false)),
+            None => return Ok((Tally::new(self.config.debug), false)),
         };
 
         let mut sender = Sender::setup(&self.config, mode)?;
 
-        let mut tally = Tally::new();
+        let mut tally = Tally::new(self.config.debug);
         let mut aborted = false;
         let mut idx = 0usize;
         // Only consulted by `PortOrder::Random`; constructed either way because
@@ -475,6 +628,10 @@ impl L34Engine {
 
         let start = Instant::now();
         let mut next = start;
+        // `--debug`: one line a second, from inside this loop. A 60-second run
+        // printed nothing at all until it was over, so "is it doing anything" and
+        // "when did it start failing" were both unanswerable from the outside.
+        let mut progress = self.config.debug.then(|| Progress::new(mode, start));
         'run: while start.elapsed() < plan.duration {
             if plan.kill.is_tripped() {
                 aborted = true;
@@ -531,6 +688,14 @@ impl L34Engine {
                 }
             }
 
+            // After the batch, before the sleep: the tally is as current as it
+            // gets, and a vector blocked inside `send` reports late rather than
+            // pretending. Reads the counters, never writes them, so it cannot
+            // change what the run measures.
+            if let Some(p) = progress.as_mut() {
+                p.tick(&tally);
+            }
+
             next += tick;
             let now = Instant::now();
             if next > now {
@@ -577,10 +742,19 @@ struct Tally {
     residency_n: u64,
     /// Units the pool refused to admit — see [`RunReport::not_offered`].
     not_offered: u64,
+    /// Whether this run narrates (`--debug`). Held on the tally because that is
+    /// where the failure text is kept, and the check has to happen before the
+    /// message is built rather than after: `e.to_string()` on the send path of a
+    /// packet flood is an allocation per failed unit, at flood rates.
+    debug: bool,
+    /// The distinct sentences behind the errno buckets, with a count each.
+    /// Populated only under `--debug` and bounded there — see
+    /// [`jinrai_core::record_failure_sample`].
+    failures: BTreeMap<String, u64>,
 }
 
 impl Tally {
-    fn new() -> Self {
+    fn new(debug: bool) -> Self {
         Self {
             sent: 0,
             errors: 0,
@@ -588,6 +762,8 @@ impl Tally {
             residency_micros: 0,
             residency_n: 0,
             not_offered: 0,
+            debug,
+            failures: BTreeMap::new(),
             // 1us .. 60s at 3 significant figures — bounded memory regardless of
             // how long the run holds, unlike retaining every sample.
             latency: Histogram::new_with_bounds(1, 60_000_000, 3)
@@ -610,6 +786,26 @@ impl Tally {
         // the mean report an infinite ceiling.
         self.residency_micros = self.residency_micros.saturating_add(held.as_micros().max(1));
         self.residency_n += 1;
+    }
+
+    /// Keep the sentence behind one failure, before [`ErrnoBucket`] reduces it to
+    /// a word.
+    ///
+    /// The bucket is what a summary needs: `4 x internal` sorts a failure into a
+    /// category with a fix attached. It is not what a *diagnosis* needs — the
+    /// sentence underneath it ("Message too long (os error 90)") names the cause,
+    /// and it was being discarded at classification time, so nothing downstream
+    /// could recover it.
+    ///
+    /// Takes a closure rather than a `String` so the message is never built on a
+    /// run that is not narrating: this sits on the send path of floods that emit
+    /// tens of thousands of units a second, and an allocation per failed unit for
+    /// text nobody will read is a cost the measurement would pay for.
+    fn note_failure(&mut self, message: impl FnOnce() -> String) {
+        if !self.debug {
+            return;
+        }
+        record_failure_sample(&mut self.failures, message(), 1);
     }
 
     fn record(&mut self, emission: Emission) {
@@ -653,6 +849,13 @@ impl Tally {
         self.residency_micros = self.residency_micros.saturating_add(other.residency_micros);
         self.residency_n += other.residency_n;
         self.errno.absorb(&other.errno);
+        // Merged through the shared recorder rather than by extending the map, so
+        // the combined sample obeys the same cap a single vector's does — three
+        // vectors each holding sixteen distinct messages must not produce a
+        // forty-eight-entry "bounded" map.
+        for (message, n) in other.failures {
+            record_failure_sample(&mut self.failures, message, n);
+        }
         // Only fails on a bounds mismatch, and every tally uses the same bounds.
         let _ = self.latency.add(other.latency);
     }
@@ -678,6 +881,8 @@ impl Tally {
                 0
             },
             not_offered: self.not_offered,
+            // Empty unless the run narrated; the reporter omits the block then.
+            failure_samples: self.failures,
             ..Default::default()
         }
     }
@@ -809,6 +1014,104 @@ pub fn effective_data_connections(concurrency: usize) -> usize {
     concurrency.clamp(1, MAX_DATA_CONNECTIONS)
 }
 
+/// How many payload bytes one unit of this mode actually carries, given what the
+/// operator asked for — or `None` for the modes whose packet has no
+/// operator-sized body at all.
+///
+/// The clamps used to live inline in [`Sender::setup`], which was fine while
+/// nothing else needed to know them. The `--debug` preamble does: reporting the
+/// requested size for a UDP flood that will silently send 1472 bytes of it is the
+/// exact class of "the run I described is not the run that happened" the flag
+/// exists to close. One definition, read by the sender that applies it and the
+/// preamble that reports it.
+fn effective_payload(mode: L4Mode, requested: usize) -> Option<usize> {
+    match mode {
+        // Both cap at an unfragmented datagram: for UDP that is the point, for the
+        // ICMP echo body it avoids fragmenting a packet whose whole purpose is to
+        // be handled as one.
+        L4Mode::Udp | L4Mode::Icmp => Some(requested.min(MAX_UDP_PAYLOAD)),
+        L4Mode::Data => Some(requested.clamp(1, MAX_DATA_PAYLOAD)),
+        L4Mode::UdpFrag => Some(requested.clamp(MIN_FRAG_PAYLOAD, MAX_UDP_PAYLOAD)),
+        L4Mode::Gre => Some(requested.min(MAX_GRE_PAYLOAD)),
+        // A crafted flag segment, a bare SYN cut into fragments, a handshake, and
+        // the two fixed-format ICMP messages: the bytes on the wire are decided by
+        // the protocol, not by `--payload-size`.
+        _ => None,
+    }
+}
+
+/// The most attempts a slot-bound flood can *start* per second, given its socket
+/// budget and its per-attempt timeout.
+///
+/// A slot is held for an attempt's whole life, so when attempts run to the
+/// timeout — which is exactly the case a saturating target produces — the
+/// dispatcher can begin only `slots / timeout` of them per second, whatever
+/// `--rate` says. Reported rather than assumed: a run that cannot offer the rate
+/// it was given reports our ceiling as the target's capacity.
+fn offerable_per_second(slots: usize, timeout: Duration) -> u64 {
+    let secs = timeout.as_secs_f64();
+    // A zero timeout is not reachable through the CLI, and treating it as an
+    // infinite ceiling beats dividing by zero in a diagnostic line.
+    if secs <= 0.0 {
+        return u64::MAX;
+    }
+    (slots as f64 / secs) as u64
+}
+
+/// The `--debug` progress line for one vector: what it has done so far, once a
+/// second, on stderr so it never contaminates `--output line` on stdout.
+///
+/// Driven from inside the send loop rather than by a reporting thread. The L7
+/// engine can afford a background task because its counters are atomics shared
+/// with a runtime that is already scheduling; here the counters are a plain
+/// `Tally` owned by the sending thread, and the cheapest correct way to read it
+/// once a second is to look at the clock at the end of a tick. It also keeps the
+/// promise the flag was introduced with — the narration must not become a second
+/// workload competing with the one under test.
+///
+/// One line **per vector**, because a multi-vector run is several floods sharing
+/// a rate cap: a merged line would hide the one vector that stopped sending.
+struct Progress {
+    mode: L4Mode,
+    started: Instant,
+    /// When the next line is due. Advanced by whole ticks so a slow vector does
+    /// not print a burst of catch-up lines.
+    next: Instant,
+    /// Attempts at the previous line, so the rate reported is the one over the
+    /// last tick. A cumulative average smooths away exactly the mid-run
+    /// degradation worth seeing.
+    prev: u64,
+}
+
+/// How often a `--debug` run narrates its progress.
+const PROGRESS_TICK: Duration = Duration::from_secs(1);
+
+impl Progress {
+    fn new(mode: L4Mode, started: Instant) -> Self {
+        Self { mode, started, next: started + PROGRESS_TICK, prev: 0 }
+    }
+
+    /// Print a line if one is due. Cheap enough to call every tick of the pacer.
+    fn tick(&mut self, tally: &Tally) {
+        let now = Instant::now();
+        if now < self.next {
+            return;
+        }
+        self.next = now + PROGRESS_TICK;
+        let attempts = tally.sent + tally.errors;
+        eprintln!(
+            "  debug {:>5.1}s  {:<23}  units {attempts} ({}/s)  sent {}  failed {}  not sent {}",
+            self.started.elapsed().as_secs_f64(),
+            self.mode.label(),
+            attempts.saturating_sub(self.prev),
+            tally.sent,
+            tally.errors,
+            tally.not_offered,
+        );
+        self.prev = attempts;
+    }
+}
+
 /// Stack size for a connect worker. The thread does nothing but block in
 /// `connect_timeout` and hand the result back, so the default 8 MiB reservation
 /// is pure waste at 512 threads.
@@ -831,6 +1134,27 @@ const CONNECT_WORKER_STACK: usize = 256 * 1024;
 /// [`ErrnoBucket::Abandoned`] rather than waited out.
 const ABORT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
+/// What `--debug` reports behind an [`ErrnoBucket::Abandoned`] attempt.
+///
+/// These are the one class of failure with no OS error to quote: nothing failed,
+/// the run simply ended while the attempt was still out. A `--debug` block that
+/// listed every other bucket's sentence and silently skipped this one would read
+/// as though those attempts had no explanation, when they have the plainest one
+/// of all.
+const ABANDONED_MESSAGE: &str =
+    "the run's window closed while this attempt was still in flight (no answer was \
+     waited for; not a failure of the target)";
+
+/// What `--debug` reports when the connect pool's own dispatch queue is gone.
+///
+/// [`ErrnoBucket::Internal`] is the bucket for a failure with no OS error behind
+/// it, and for the packet layers that means jinrai, not the target. Saying so is
+/// the difference between an operator re-running against a different host and one
+/// filing a bug here.
+const DISPATCHER_GONE_MESSAGE: &str =
+    "jinrai's own connect dispatcher had already shut down when this attempt was \
+     offered (a jinrai fault, not the target's)";
+
 /// How long [`ConnectPool::send`] will wait for an in-flight slot to free up
 /// before giving the run loop control back. Bounded so the kill switch is still
 /// polled promptly when the pool is saturated; under load a result almost always
@@ -852,7 +1176,12 @@ enum ConnectOutcome {
     /// timeout in full whenever the target simply never answered. Carried
     /// because a failure's residency is what actually bounds offered load; see
     /// [`Tally::record_residency`].
-    Failed { bucket: ErrnoBucket, held: Duration },
+    ///
+    /// `message` is the sentence behind `bucket`, and is empty on a run that is
+    /// not narrating: the worker cannot reach the tally to ask whether `--debug`
+    /// is on, so it is told once at construction and carries the text only when
+    /// something will read it.
+    Failed { bucket: ErrnoBucket, held: Duration, message: String },
 }
 
 /// TCP full-handshake connect flood, backed by a small pool of blocking workers.
@@ -903,7 +1232,7 @@ struct ConnectPool {
 }
 
 impl ConnectPool {
-    fn new(cap: usize, timeout: Duration) -> Result<Self, L34Error> {
+    fn new(cap: usize, timeout: Duration, debug: bool) -> Result<Self, L34Error> {
         // Never more workers than the descriptor budget: a worker that can never
         // be admitted is a thread that only ever sleeps.
         let parallelism = effective_parallelism(cap);
@@ -944,6 +1273,11 @@ impl ConnectPool {
                         Err(e) => ConnectOutcome::Failed {
                             bucket: classify_io(&e),
                             held: began.elapsed(),
+                            // Only when a run is narrating: at a saturating
+                            // target this arm is most of the traffic, and it
+                            // would otherwise be an allocation per attempt for
+                            // text nobody reads.
+                            message: if debug { e.to_string() } else { String::new() },
                         },
                     };
                     if res_tx.send(outcome).is_err() {
@@ -980,8 +1314,9 @@ impl ConnectPool {
                 tally.record_residency(latency);
                 tally.record(Emission::Sent { latency: Some(latency) });
             }
-            ConnectOutcome::Failed { bucket, held } => {
+            ConnectOutcome::Failed { bucket, held, message } => {
                 tally.record_residency(held);
+                tally.note_failure(|| message);
                 tally.record(Emission::Failed(bucket));
             }
         }
@@ -1026,11 +1361,18 @@ impl ConnectPool {
                 // `recv`); skip this tick rather than block the pacer. Skipped is
                 // not offered, so it is disclosed as such.
                 Err(mpsc::TrySendError::Full(_)) => Emission::Dropped,
+                // Both `Internal` arms below are jinrai's own dispatcher having
+                // gone, not the target's doing — which is precisely the confusion
+                // the bucket alone invites, so `--debug` says whose fault it was.
                 Err(mpsc::TrySendError::Disconnected(_)) => {
+                    tally.note_failure(|| DISPATCHER_GONE_MESSAGE.to_string());
                     Emission::Failed(ErrnoBucket::Internal)
                 }
             },
-            None => Emission::Failed(ErrnoBucket::Internal),
+            None => {
+                tally.note_failure(|| DISPATCHER_GONE_MESSAGE.to_string());
+                Emission::Failed(ErrnoBucket::Internal)
+            }
         }
     }
 
@@ -1073,6 +1415,7 @@ impl ConnectPool {
 
         // Whatever never reported is disclosed, not silently dropped.
         for _ in 0..self.in_flight {
+            tally.note_failure(|| ABANDONED_MESSAGE.to_string());
             tally.record(Emission::Failed(ErrnoBucket::Abandoned));
         }
         self.in_flight = 0;
@@ -1098,10 +1441,12 @@ impl Sender {
             L4Mode::Udp => {
                 let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
                     .map_err(|e| L34Error::Setup(e.to_string()))?;
-                let payload = vec![0u8; payload_size.min(MAX_UDP_PAYLOAD)];
+                let payload = vec![0u8; effective_payload(mode, payload_size).unwrap_or_default()];
                 Ok(Sender::Udp { sock, payload })
             }
-            L4Mode::TcpConnect => Ok(Sender::Tcp(ConnectPool::new(cap, connect_timeout)?)),
+            L4Mode::TcpConnect => {
+                Ok(Sender::Tcp(ConnectPool::new(cap, connect_timeout, config.debug)?))
+            }
             L4Mode::Data => {
                 // Hard ceiling, like the connect flood's. `cap` also sizes the
                 // allocation below, so an unclamped `--concurrency` was a
@@ -1110,7 +1455,7 @@ impl Sender {
                 Ok(Sender::TcpData {
                     conns: Vec::with_capacity(cap),
                     // Non-zero, bounded payload for each PSH-ACK write.
-                    payload: vec![0u8; payload_size.clamp(1, MAX_DATA_PAYLOAD)],
+                    payload: vec![0u8; effective_payload(mode, payload_size).unwrap_or_default()],
                     cap,
                     timeout: connect_timeout,
                     idx: 0,
@@ -1125,8 +1470,12 @@ impl Sender {
                     srcs: HashMap::new(),
                     counter: 0,
                     // Only the UDP variant carries one; the TCP variant fragments
-                    // a bare SYN, whose 20-byte header is the whole datagram.
-                    payload: vec![0u8; payload_size.clamp(MIN_FRAG_PAYLOAD, MAX_UDP_PAYLOAD)],
+                    // a bare SYN, whose 20-byte header is the whole datagram, and
+                    // declares no payload at all.
+                    payload: vec![
+                        0u8;
+                        effective_payload(L4Mode::UdpFrag, payload_size).unwrap_or_default()
+                    ],
                 })
             }
             L4Mode::Gre => {
@@ -1136,7 +1485,7 @@ impl Sender {
                     raw,
                     srcs: HashMap::new(),
                     counter: 0,
-                    payload: vec![0u8; payload_size.min(MAX_GRE_PAYLOAD)],
+                    payload: vec![0u8; effective_payload(mode, payload_size).unwrap_or_default()],
                 })
             }
             L4Mode::Icmp | L4Mode::IcmpTimestamp | L4Mode::IcmpAddressMask => {
@@ -1151,8 +1500,10 @@ impl Sender {
                 let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
                     .map_err(|e| L34Error::RawSocket(e.to_string()))?;
                 // Payload capped like UDP to avoid accidental fragmentation (echo
-                // only; the timestamp/address-mask messages are fixed-length).
-                let payload = vec![0u8; payload_size.min(MAX_UDP_PAYLOAD)];
+                // only; the timestamp/address-mask messages are fixed-length,
+                // which is why they declare no payload in the preamble).
+                let payload =
+                    vec![0u8; effective_payload(L4Mode::Icmp, payload_size).unwrap_or_default()];
                 // Identifier from the PID, so replies (if any) are attributable.
                 let id = std::process::id() as u16;
                 Ok(Sender::Icmp { raw, query, id, counter: 0, payload })
@@ -1207,7 +1558,7 @@ impl Sender {
                 match sock.send_to(payload, SocketAddr::new(ip, port)) {
                     // A datagram send has no completion to observe.
                     Ok(_) => Emission::Sent { latency: None },
-                    Err(e) => Emission::Failed(classify_io(&e)),
+                    Err(e) => failed(tally, &e),
                 },
             ),
 
@@ -1226,6 +1577,7 @@ impl Sender {
                         *timeout,
                         payload,
                         conns,
+                        tally,
                         plan,
                     ));
                 }
@@ -1235,7 +1587,7 @@ impl Sender {
                 let n = conns.len();
                 *idx = (*idx + 1) % n;
                 let i = *idx;
-                match write_pshack(&mut conns[i], payload) {
+                match write_pshack(&mut conns[i], payload, tally) {
                     // A write onto an established connection has no handshake to time.
                     WriteOutcome::Sent => Ok(Emission::Sent { latency: None }),
                     WriteOutcome::Dead(_) => {
@@ -1247,6 +1599,7 @@ impl Sender {
                             *timeout,
                             payload,
                             conns,
+                            tally,
                             plan,
                         ))
                     }
@@ -1267,7 +1620,7 @@ impl Sender {
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
                 Ok(match raw.send_to(&packet, &dest) {
                     Ok(_) => Emission::Sent { latency: None },
-                    Err(e) => Emission::Failed(classify_io(&e)),
+                    Err(e) => failed(tally, &e),
                 })
             }
 
@@ -1294,7 +1647,7 @@ impl Sender {
                 // reassembly entry.
                 for fragment in &fragments {
                     if let Err(e) = raw.send_to(fragment, &dest) {
-                        return Ok(Emission::Failed(classify_io(&e)));
+                        return Ok(failed(tally, &e));
                     }
                 }
                 Ok(Emission::Sent { latency: None })
@@ -1315,7 +1668,7 @@ impl Sender {
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
                 Ok(match raw.send_to(&packet, &dest) {
                     Ok(_) => Emission::Sent { latency: None },
-                    Err(e) => Emission::Failed(classify_io(&e)),
+                    Err(e) => failed(tally, &e),
                 })
             }
 
@@ -1329,7 +1682,7 @@ impl Sender {
                 let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(dst), 0));
                 Ok(match raw.send_to(&packet, &dest) {
                     Ok(_) => Emission::Sent { latency: None },
-                    Err(e) => Emission::Failed(classify_io(&e)),
+                    Err(e) => failed(tally, &e),
                 })
             }
         }
@@ -1395,14 +1748,20 @@ enum WriteOutcome {
 /// PSH-ACK segment. A full send buffer (`WouldBlock`/`TimedOut`) is *pressure
 /// applied*, not a failure — the target simply is not draining fast enough, which
 /// is the point — so it counts as sent. Any other error retires the connection.
-fn write_pshack(stream: &mut TcpStream, payload: &[u8]) -> WriteOutcome {
+fn write_pshack(stream: &mut TcpStream, payload: &[u8], tally: &mut Tally) -> WriteOutcome {
     use std::io::{ErrorKind, Write};
     match stream.write(payload) {
         Ok(_) => WriteOutcome::Sent,
         Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
             WriteOutcome::Sent
         }
-        Err(e) => WriteOutcome::Dead(classify_io(&e)),
+        Err(e) => {
+            // Recorded here rather than by the caller: only this function still
+            // holds the error, and a connection retired as "econnreset" reads very
+            // differently from one retired as "Broken pipe (os error 32)".
+            tally.note_failure(|| e.to_string());
+            WriteOutcome::Dead(classify_io(&e))
+        }
     }
 }
 
@@ -1419,20 +1778,24 @@ fn open_and_prime(
     timeout: Duration,
     payload: &[u8],
     conns: &mut Vec<TcpStream>,
+    tally: &mut Tally,
     plan: &RunPlan,
 ) -> Emission {
     let began = Instant::now();
     let mut stream = match connect_abortable(addr, timeout, plan) {
         Some(Ok(s)) => s,
-        Some(Err(e)) => return Emission::Failed(classify_io(&e)),
+        Some(Err(e)) => return failed(tally, &e),
         // Aborted mid-handshake. The SYN went out, so this is offered load that
         // never got an answer — the bucket that exists for exactly that — not a
         // unit we declined to send.
-        None => return Emission::Failed(ErrnoBucket::Abandoned),
+        None => {
+            tally.note_failure(|| ABANDONED_MESSAGE.to_string());
+            return Emission::Failed(ErrnoBucket::Abandoned);
+        }
     };
     let elapsed = began.elapsed();
     let _ = stream.set_write_timeout(Some(timeout));
-    match write_pshack(&mut stream, payload) {
+    match write_pshack(&mut stream, payload, tally) {
         WriteOutcome::Sent => {
             conns.push(stream);
             Emission::Sent { latency: Some(elapsed) }
@@ -1500,7 +1863,7 @@ fn connect_abortable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jinrai_core::RateCap;
+    use jinrai_core::{RateCap, FAILURE_OVERFLOW_KEY, MAX_FAILURE_SAMPLES};
     use jinrai_safety::{Allowlist, Authorization, AuthorizedTarget, KillSwitch};
 
     fn authorized_ip(cidr: &str, ip: &str) -> AuthorizedTarget {
@@ -1520,6 +1883,7 @@ mod tests {
             payload_size,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            debug: false,
         }
     }
 
@@ -1533,6 +1897,7 @@ mod tests {
             payload_size,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            debug: false,
         }
     }
 
@@ -1917,9 +2282,9 @@ mod tests {
     #[test]
     fn retiring_the_connect_pool_is_bounded_by_its_grace_not_the_connect_timeout() {
         let _fd = fd_guard();
-        let mut pool = ConnectPool::new(4, Duration::from_secs(3600))
+        let mut pool = ConnectPool::new(4, Duration::from_secs(3600), false)
             .expect("the pool should start");
-        let mut tally = Tally::new();
+        let mut tally = Tally::new(false);
 
         // Three attempts that will never report back.
         pool.in_flight = 3;
@@ -2241,6 +2606,7 @@ mod tests {
             payload_size: 16,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            debug: false,
         });
         let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
         assert!(report.units_sent >= 4, "sent {} units, too few to cover the set", report.units_sent);
@@ -2276,6 +2642,7 @@ mod tests {
             payload_size: 16,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            debug: false,
         });
         let report = engine.execute(&plan(vec![t], rate, 1)).expect("the run should execute");
 
@@ -2358,6 +2725,7 @@ mod tests {
             payload_size: 16,
             concurrency: DEFAULT_CONCURRENCY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            debug: false,
         });
         // 400 draws over 4 ports: missing one has probability (3/4)^400, which is
         // not a flake worth designing around.
@@ -2427,5 +2795,157 @@ mod tests {
             elapsed < Duration::from_millis(1400),
             "a 1s run at 500000/s took {elapsed:?}"
         );
+    }
+
+    /// A config that narrates, for the `--debug` tests.
+    fn debug_config(mode: L4Mode, port: u16, payload_size: usize) -> L34Config {
+        L34Config { debug: true, ..config(mode, port, payload_size) }
+    }
+
+    /// The whole point of `--debug` at this layer, exactly as at L7: `20 x
+    /// timeout` names a category, and the sentence underneath it names the cause.
+    /// Before this the text reached `classify_io` and went no further, so the only
+    /// way to see why a bucket filled was to guess.
+    #[test]
+    fn debug_keeps_the_sentence_behind_each_errno_bucket() {
+        let _fd = fd_guard();
+        // TEST-NET-1 is reserved and never routed, so every attempt fails and it
+        // does so without involving anything outside this host.
+        let t = authorized_ip("192.0.2.0/24", "192.0.2.1");
+        let mut engine = L34Engine::new(L34Config {
+            concurrency: 8,
+            connect_timeout: Duration::from_millis(50),
+            ..debug_config(L4Mode::TcpConnect, 443, 16)
+        });
+        let report = engine.execute(&plan(vec![t], 20, 1)).expect("the run should execute");
+
+        assert!(report.errors > 0, "an unroutable target must fail every attempt: {report:?}");
+        assert!(!report.failure_samples.is_empty(), "--debug must keep the failure text");
+        // Every failure is accounted for, including the ones abandoned at the
+        // drain — those have no OS error, which is why they carry a sentence of
+        // their own rather than being left out of the sample.
+        let sampled: u64 = report.failure_samples.values().sum();
+        assert_eq!(sampled, report.errors, "every failure must be accounted for: {report:?}");
+        for message in report.failure_samples.keys() {
+            assert!(!message.is_empty(), "a sampled failure must carry its text: {report:?}");
+        }
+    }
+
+    /// The text is the peer's and the map is unbounded input, so a run that did
+    /// not ask for it collects nothing at all — not a truncated sample, none.
+    #[test]
+    fn without_debug_no_failure_text_is_collected() {
+        let _fd = fd_guard();
+        let t = authorized_ip("192.0.2.0/24", "192.0.2.1");
+        let mut engine = L34Engine::new(L34Config {
+            concurrency: 8,
+            connect_timeout: Duration::from_millis(50),
+            ..config(L4Mode::TcpConnect, 443, 16)
+        });
+        let report = engine.execute(&plan(vec![t], 20, 1)).expect("the run should execute");
+        assert!(report.errors > 0, "the run must have failed for this to mean anything");
+        assert!(report.failure_samples.is_empty(), "{report:?}");
+    }
+
+    /// A multi-vector run merges its vectors' samples through the same cap they
+    /// were filled under. Extending one map with another would let three vectors
+    /// produce a "bounded" sample three times the bound.
+    #[test]
+    fn merged_failure_samples_stay_inside_the_shared_cap() {
+        let mut a = Tally::new(true);
+        let mut b = Tally::new(true);
+        for i in 0..MAX_FAILURE_SAMPLES {
+            a.note_failure(|| format!("vector a failure {i}"));
+            b.note_failure(|| format!("vector b failure {i}"));
+        }
+        let expected: u64 =
+            a.failures.values().sum::<u64>() + b.failures.values().sum::<u64>();
+        a.absorb(b);
+
+        assert!(
+            a.failures.len() <= MAX_FAILURE_SAMPLES + 1,
+            "the merged sample must stay bounded (+1 for the overflow key), got {}",
+            a.failures.len()
+        );
+        assert!(
+            a.failures.contains_key(FAILURE_OVERFLOW_KEY),
+            "truncation must say it truncated: {:?}",
+            a.failures
+        );
+        assert_eq!(
+            a.failures.values().sum::<u64>(),
+            expected,
+            "the overflow is counted, not dropped: {:?}",
+            a.failures
+        );
+    }
+
+    /// The preamble must report the payload the run will actually send, not the
+    /// one that was asked for. A UDP flood given 9000 bytes emits 1472, and a
+    /// preamble echoing 9000 back would be the exact "the run I described is not
+    /// the run that happened" the flag exists to close.
+    #[test]
+    fn the_debug_preamble_reports_the_clamped_payload_the_sender_will_use() {
+        let _fd = fd_guard();
+        const ASKED: usize = 9000;
+        let config = debug_config(L4Mode::Udp, 9, ASKED);
+        let engine = L34Engine::new(config.clone());
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let out = engine.debug_plan(&["127.0.0.1".parse().unwrap()], &plan(vec![t], 100, 1));
+
+        // The number in the preamble is the number the sender allocates — read off
+        // the sender itself, so the two cannot drift apart.
+        let sender = Sender::setup(&config, L4Mode::Udp).expect("a UDP sender needs no privilege");
+        let allocated = match &sender {
+            Sender::Udp { payload, .. } => payload.len(),
+            other => panic!("expected a UDP sender, got {:?}", std::mem::discriminant(other)),
+        };
+        assert!(allocated < ASKED, "this test is pointless unless the clamp bites");
+        assert!(
+            out.contains(&format!("{allocated} bytes")),
+            "the preamble must name the sent size, got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("--payload-size {ASKED} clamped")),
+            "and must say the request was clamped, got:\n{out}"
+        );
+    }
+
+    /// The rest of the preamble: what a run needs before it starts, none of which
+    /// can be read off the command line — the vectors that will run, the privilege
+    /// they need, and the real source address the target will see.
+    #[test]
+    fn the_debug_preamble_names_the_vectors_privilege_and_real_source() {
+        let _fd = fd_guard();
+        let engine = L34Engine::new(L34Config {
+            debug: true,
+            ..config_modes(vec![L4Mode::Udp, L4Mode::TcpConnect])
+        });
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let out = engine.debug_plan(&["127.0.0.1".parse().unwrap()], &plan(vec![t], 100, 1));
+
+        assert!(out.contains("udp-flood + tcp-connect-flood"), "{out}");
+        // Two unprivileged vectors: the line must say so rather than be absent,
+        // because "no raw socket needed" is itself the answer to a question
+        // operators ask before every run.
+        assert!(out.contains("none — every vector uses ordinary sockets"), "{out}");
+        assert!(out.contains("never spoofed") || out.contains("no spoof path"), "{out}");
+        // A shared ceiling, split — the number each vector actually gets.
+        assert!(out.contains("100/s, shared:"), "{out}");
+        // And the connect flood's own budget, with what it can offer under it.
+        assert!(out.contains("can be offered"), "{out}");
+    }
+
+    /// An all-ICMP run carries no ports, so naming a port set would describe a
+    /// field its packets do not have — the same omission `run_label` makes.
+    #[test]
+    fn the_debug_preamble_omits_ports_for_a_portless_run() {
+        let _fd = fd_guard();
+        let engine = L34Engine::new(debug_config(L4Mode::Icmp, 443, 32));
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let out = engine.debug_plan(&["127.0.0.1".parse().unwrap()], &plan(vec![t], 100, 1));
+        assert!(!out.contains("ports"), "an ICMP run has no ports to report:\n{out}");
+        assert!(!out.contains("port 443"), "{out}");
+        assert!(out.contains("CAP_NET_RAW"), "and it does need privilege:\n{out}");
     }
 }

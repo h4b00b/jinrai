@@ -325,15 +325,21 @@ OPTIONS:
                           summary would then be reporting OUR ceiling as the
                           target's capacity. The refusal prints the two knobs that
                           fix it. Use this flag when the shortfall is the point
-    --debug               Narrate the run on stderr: the request as composed
-                          (url after variation, every header actually sent, the
-                          body and its declared type, the pinned resolution and
-                          the policies in force), a progress line each second
-                          while it runs, and the DISTINCT FAILURE MESSAGES behind
-                          the errno buckets at the end — the sentence, not just
-                          the category. Not per-request logging: at these rates
-                          that is a second workload, so everything is once, once
-                          a second, or aggregated. Fast get/post/head flood only
+    --debug               Narrate the run on stderr: what will go on the wire as
+                          composed, a progress line each second while it runs,
+                          and the DISTINCT FAILURE MESSAGES behind the errno
+                          buckets at the end — the sentence, not just the
+                          category. For l7 the preamble is the request (url after
+                          variation, every header actually sent, the body and its
+                          declared type, the pinned resolution, the policies in
+                          force); for l3/l4 it is the packet (vectors, targets,
+                          ports, the CLAMPED payload per mode, the real source
+                          address, the raw-socket privilege, the per-vector share
+                          of --rate, the socket ceiling and what it can offer),
+                          and the progress line is one PER VECTOR. Not
+                          per-request logging: at these rates that is a second
+                          workload, so everything is once, once a second, or
+                          aggregated. On l7, the fast get/post/head flood only
     --follow-redirects <N>  Follow up to N SAME-ORIGIN redirect hops per request,
                           so the status recorded is the one at the end of the
                           chain and not the 3xx that started it (default: 0 —
@@ -1548,6 +1554,7 @@ fn run_l4(
         payload_size: args.payload_size,
         concurrency: args.concurrency,
         connect_timeout: Duration::from_millis(args.connect_timeout_ms),
+        debug: args.debug,
     });
 
     // Record the authorized run (targets + rules + params) before any traffic.
@@ -2091,7 +2098,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         ),
         Layer::L3 | Layer::L4 => {
             ("--target", &["--url", "--header", "--l7-method", "--max-connections",
-                "--allow-underpowered", "--follow-redirects", "--debug"][..])
+                "--allow-underpowered", "--follow-redirects"][..])
         }
     };
     // Reported through the same warning as the rest when the run is not l7 at all.
