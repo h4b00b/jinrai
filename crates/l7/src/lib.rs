@@ -860,13 +860,15 @@ impl StressModule for L7Engine {
         let s4xx = Arc::new(AtomicU64::new(0));
         let s5xx = Arc::new(AtomicU64::new(0));
         let timeouts = Arc::new(AtomicU64::new(0));
-        // Total time attempts spent holding a concurrency slot, successes and
-        // failures alike. The histogram below sees only responses that arrived,
-        // but a request that times out holds its permit for the full
-        // `--request-timeout-ms` — so it is the failures, not the completions,
-        // that decide how much load the concurrency budget could offer. Summed
-        // here because the mean is what Little's law needs; see
-        // `RunReport::mean_micros`.
+        // Total time attempts spent holding a concurrency slot — completed,
+        // failed and cancelled alike. The histogram below sees only responses
+        // that arrived, but a request that times out holds its permit for the
+        // full `--request-timeout-ms`, and one cancelled at the drain held it
+        // from dispatch to the deadline — so it is the failures, not the
+        // completions, that decide how much load the concurrency budget could
+        // offer. Summed here because the mean is what Little's law needs; see
+        // `RunReport::mean_micros`. Every attempt is charged by `SlotResidency`,
+        // whose `Drop` is the only accounting a cancelled task still runs.
         let residency = Arc::new(AtomicU64::new(0));
         // Bounds: 1 microsecond .. 60 seconds (well above the default request
         // timeout), 3 significant figures. Explicit bounds so `saturating_record`
@@ -1084,6 +1086,11 @@ impl StressModule for L7Engine {
                         // Hold the connection-cap permit for the whole request;
                         // dropping it at task end frees a slot for the next tick.
                         let _permit = permit;
+                        // Charge the slot for exactly as long as the permit above
+                        // is held, on every exit including cancellation. See
+                        // `SlotResidency` — this is not bookkeeping the settled
+                        // paths can do for themselves.
+                        let _residency = SlotResidency::new(residency);
                         // Variation touches ONLY the path, query, body and
                         // cookie, so the host remains the gate-authorized,
                         // DNS-pinned one. A path list is checked against the
@@ -1122,7 +1129,6 @@ impl StressModule for L7Engine {
                         match req.send().await {
                             Ok(resp) => {
                                 let micros = started.elapsed().as_micros() as u64;
-                                residency.fetch_add(micros, Ordering::Relaxed);
                                 // A response of ANY status is a completed unit; the
                                 // status class is what tells health from failure.
                                 sent.fetch_add(1, Ordering::Relaxed);
@@ -1153,12 +1159,6 @@ impl StressModule for L7Engine {
                                     .saturating_record(micros);
                             }
                             Err(e) => {
-                                // A failed request held its slot too — for the full
-                                // timeout, in the case that matters most.
-                                residency.fetch_add(
-                                    started.elapsed().as_micros() as u64,
-                                    Ordering::Relaxed,
-                                );
                                 errors.fetch_add(1, Ordering::Relaxed);
                                 if e.is_timeout() {
                                     timeouts.fetch_add(1, Ordering::Relaxed);
@@ -1289,6 +1289,11 @@ impl StressModule for L7Engine {
         let label = format!("L7 {} {}{note}", self.spec.method.label(), self.spec.url);
         let units_sent = sent.load(Ordering::Relaxed);
         let errors = errors.load(Ordering::Relaxed);
+        // Every attempt counted here charged the sum above exactly once — the
+        // cancelled ones through `SlotResidency::drop`, which the runtime has
+        // already run by the time `join_next` yielded them. Numerator and
+        // denominator therefore cover the same population, which is the whole
+        // requirement of a mean.
         let resolved = units_sent + errors;
         Ok(RunReport {
             layer_label: label,
@@ -1421,6 +1426,48 @@ async fn run_progress(
             s5xx.load(Ordering::Relaxed),
         );
         prev = attempts;
+    }
+}
+
+/// Charges an attempt's slot occupancy on the way out — however it leaves.
+///
+/// The two settled paths (a response, an error) could add it themselves, and
+/// used to. What neither of them can account for is the attempt **cancelled at
+/// the drain**: its body never resumes, so it recorded nothing, while the
+/// `errors` counter added it all the same. [`RunReport::mean_micros`] then
+/// divided a sum over the attempts that finished by a count that included the
+/// ones that did not — understating slot cost by exactly the share of the run
+/// that stalled, which is the share that makes the figure worth having.
+///
+/// The effect is not marginal. A 10 s POST flood that went silent partway
+/// reported 86.9 ms per slot; 976 of its 6250 attempts were cancelled holding a
+/// slot for seconds each, and charging those puts the true figure near a second.
+/// Since the summary divides the concurrency budget by this mean to decide
+/// whether the ceiling or the target bound the run, a mean understated tenfold
+/// overstates the offerable ceiling tenfold with it.
+///
+/// Dropping is the one thing every path has in common, cancellation included —
+/// so the accounting lives in `Drop` and there is no path left to forget it.
+struct SlotResidency {
+    started: Instant,
+    total: Arc<AtomicU64>,
+}
+
+impl SlotResidency {
+    fn new(total: Arc<AtomicU64>) -> Self {
+        Self { started: Instant::now(), total }
+    }
+}
+
+impl Drop for SlotResidency {
+    fn drop(&mut self) {
+        // Floored at one microsecond, as the l4 pool does: an attempt that held
+        // a slot must never average out to one that was free, or the ceiling
+        // derived from the mean comes out infinite.
+        self.total.fetch_add(
+            (self.started.elapsed().as_micros() as u64).max(1),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -2556,6 +2603,51 @@ mod tests {
             report.errno.total(),
             report.errors,
             "the errno breakdown must still sum to the error count"
+        );
+    }
+
+    /// REGRESSION: an attempt cancelled at the drain still occupied a slot for
+    /// as long as it was in flight, and the mean has to be told.
+    ///
+    /// `mean_micros` summed the attempts that recorded an outcome and divided by
+    /// every attempt including the cancelled ones — which record nothing, their
+    /// bodies never resuming. Against a blackhole that made the numerator zero
+    /// and the reported slot cost zero, from the one run where every slot was
+    /// held right up to the deadline. This is not a cosmetic gap: the summary
+    /// divides the concurrency budget by this number to decide whether the
+    /// ceiling or the target bound the run, so understating it here overstates
+    /// the offerable ceiling by the same factor.
+    #[test]
+    fn attempts_cancelled_at_the_drain_are_charged_the_slot_they_held() {
+        let (port, stop, handle) = spawn_blackhole_server();
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            // Far longer than the whole run, so nothing resolves on its own:
+            // every attempt leaves through cancellation, the path that used to
+            // record nothing.
+            .with_request_timeout(Duration::from_secs(8))
+            .with_drain_grace(Duration::from_millis(200));
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(500),
+            kill: KillSwitch::new(),
+        };
+        let report = engine.execute(&plan).expect("the run should execute");
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert_eq!(report.units_sent, 0, "a blackhole cannot complete a request");
+        assert_eq!(report.timeouts, 0, "the request timeout outlasts the run: {report:?}");
+        assert!(report.errors > 0, "the cancelled attempts must be counted: {report:?}");
+        // Not merely non-zero: the attempts were in flight for a good part of a
+        // half-second window, so a mean down at the one-microsecond floor would
+        // mean the residency is being invented rather than measured.
+        assert!(
+            report.mean_micros > 10_000,
+            "every attempt held its slot to the deadline, so the mean must reflect \
+             that, not round it to free: {}us",
+            report.mean_micros
         );
     }
 

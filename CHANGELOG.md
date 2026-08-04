@@ -26,6 +26,42 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.46.0] — 2026-08-04
+
+A POST run against a login endpoint held its rate for four seconds, decayed to
+zero over the next three, and never recovered. The summary reported that as a
+ceiling *we* had set too low, and told the operator to raise it. Both halves of
+that reading were wrong, and they were wrong for the same reason: the one number
+the judgement rests on had been diluted by the very attempts it was meant to
+account for.
+
+### Fixed
+
+- **An attempt cancelled at the drain was charged nothing for the slot it
+  held.** `mean_micros` — the mean time an attempt occupies an in-flight slot —
+  summed the attempts that recorded an outcome and divided by *every* attempt,
+  including the ones cancelled when the run's window closed. A cancelled task's
+  body never resumes, so it recorded nothing, while the error counter had
+  already added it to the denominator. The dilution is worst exactly where the
+  figure matters: in the run above, 976 of 6250 attempts were cancelled after
+  holding a slot for seconds each, and the reported cost per slot was `86.9ms`
+  against a true figure near a second. The accounting now lives in a `Drop`
+  guard covering the permit's whole lifetime, so completed, failed and cancelled
+  attempts are all charged and there is no path left that can forget. (L3/L4
+  already counted this correctly; the defect was L7-only.)
+- **The `not sent` row blamed the in-flight ceiling in every run, including the
+  ones the summary had already cleared.** `N attempts never offered — our
+  in-flight budget was saturated, not the target's capacity (raise
+  `--max-connections` to offer more)` was printed unconditionally, directly
+  above the silence of the `bound by` note — whose own arithmetic had just found
+  the ceiling covered the entire rate cap, and which stays quiet precisely
+  because a shortfall then belongs to the target. The block contradicted itself,
+  and the half that printed was the half that sent the operator to a knob that
+  would have bought no load at all: against a target that has stopped answering,
+  a larger ceiling only parks more attempts on it. Both rows now read one
+  ceiling, computed once, and when it had headroom the row says so and names the
+  target as the constraint.
+
 ## [0.45.0] — 2026-08-04
 
 There was no way to see a run while it happened, and no way to recover *why* a
@@ -2228,7 +2264,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.41.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.46.0...HEAD
+[0.46.0]: https://github.com/h4b00b/jinrai/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/h4b00b/jinrai/compare/v0.44.0...v0.45.0
 [0.44.0]: https://github.com/h4b00b/jinrai/compare/v0.43.0...v0.44.0
 [0.43.0]: https://github.com/h4b00b/jinrai/compare/v0.42.0...v0.43.0
