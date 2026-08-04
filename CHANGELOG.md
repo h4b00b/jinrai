@@ -26,6 +26,74 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.50.0] — 2026-08-04
+
+An operator reported poor results from the packets jinrai sends, at both L3/L4
+and L7. Measured against local sinks with the kernel's own counters, the
+generator turned out to be honest: at every rate tried, `Udp: OutDatagrams`
+matched jinrai's claimed count exactly and `SndbufErrors` stayed at zero. The
+datagrams left.
+
+**The defect was the report.** A 500000/s loopback flood emitted all 2 497 693
+datagrams it claimed and the receiving *application* read 280 789 of them — 11%.
+The other 89% were counted by the peer's `RcvbufErrors`: the target's stack
+received them and its application never got to them. jinrai's summary for that
+run read `2497693 completed (100.0%)`, in green, above `failed 0` and
+`ran to completion`. The finding the run existed to produce was invisible, and
+what replaced it was a claim the run never established.
+
+### Changed
+
+- **A datagram or raw flood reports `emitted`, not `completed`, and the row is
+  no longer painted green.** `sendto()` returning `Ok` says the local kernel
+  queued the bytes; there is no acknowledgement in a UDP or SYN flood to wait
+  for, so nothing after that point is visible to the generator. Green is reserved
+  for "the run did its job", and handing bytes to the local stack is the premise
+  of the test rather than its result. A new `unacked` row states what the number
+  is and points at the target, where the answer actually is
+  (`nstat -az '*RcvbufErrors*'`, `netstat -su`).
+
+  The connection-oriented primitives are untouched: `tcp` (a completed
+  handshake), `data` (a delivered TCP write) and every L7 method (an HTTP
+  response) really do observe the target. The discriminator is the **socket**,
+  not the timing — the data flood's steady-state writes report no latency either
+  and are delivered, which a measured 6.4 GB run confirmed.
+
+- **`RunReport::unobserved_units` is a count, not a flag**, because a
+  multi-vector run mixes the two. Such a run keeps `completed` and names how much
+  of the total was unacknowledged, rather than rounding the whole run to one
+  answer or the other.
+
+- **The audit record carries the same distinction.** Its human summary said
+  `N completed`; for a packet flood it now says `N emitted (unacknowledged: no
+  completion is observable at this layer)`, and the structured record gains
+  `unobserved_units`. The trail outlives everyone's memory of which primitive a
+  run drove, and `2497693 completed` is exactly the sentence a reader takes at
+  face value years later.
+
+- **The latency row is omitted when nothing was timed.** A packet flood has no
+  completion to measure, so its histogram stays empty and every percentile was a
+  literal `0` that the row then presented as a measurement. `p50 0us p90 0us p99
+  0us max 0us` beside a rate the run really did achieve reads as an extremely
+  fast target; it is four numbers nobody took.
+
+### Documentation
+
+- **`docs/playbook.md` — "What a packet flood's numbers mean, and what they do
+  not"**, replacing the narrower "When a run reaches nothing". It now covers both
+  causes of a flood that lands nowhere — the target's socket never draining
+  (the common one, with the `nstat`/`netstat` deltas that prove it) and a
+  middlebox discarding out-of-state segments (with the paired captures) — and
+  says which modes can prove the *application* saw them at all: only `tcp`,
+  `data` and L7.
+- **`docs/playbook.md` — "Calibrate the generator before you trust a number"**.
+  Every rate in the document is a flag, not a promise, and a rate the generator
+  cannot reach is reported as the target's behaviour. A ten-minute loopback
+  procedure establishes the highest `--rate` worth asking for on a given host,
+  the bandwidth it implies, and which knob binds — once per generator host,
+  recorded beside the test plan.
+- README: the same two points, with the measured figures behind them.
+
 ## [0.49.0] — 2026-08-04
 
 0.47.0 refused a fast-L7 run whose slot budget could not carry its `--rate`. The
@@ -2446,7 +2514,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.49.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.50.0...HEAD
+[0.50.0]: https://github.com/h4b00b/jinrai/compare/v0.49.0...v0.50.0
 [0.49.0]: https://github.com/h4b00b/jinrai/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/h4b00b/jinrai/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/h4b00b/jinrai/compare/v0.46.0...v0.47.0

@@ -558,6 +558,28 @@ pub struct RunReport {
     /// `None` for the layers whose units have one meaning, and the reporter omits
     /// the row entirely.
     pub detail: Option<String>,
+    /// How many of `units_sent` were counted **without anything observing them
+    /// after the local stack accepted them**.
+    ///
+    /// `sendto()` returning `Ok` on a datagram or raw socket says the kernel
+    /// queued the bytes. It does not say they left the host, and it certainly
+    /// does not say the target received or processed them — there is no
+    /// acknowledgement in a UDP flood to wait for. Counting those as `completed`
+    /// and painting the row green states a result the run did not obtain: a
+    /// measured 500000/s loopback flood emitted every datagram it claimed and the
+    /// receiving application read 11% of them, under a summary that said
+    /// `2497693 completed (100.0%), failed 0, ran to completion`.
+    ///
+    /// So the number is kept apart and the reporter renames the row rather than
+    /// asserting a completion. `0` for the connection-oriented primitives, where
+    /// a completed handshake, a delivered HTTP response or a TCP write really is
+    /// an observation of the target; equal to `units_sent` for a pure packet
+    /// flood; somewhere between for a multi-vector run that mixes the two, which
+    /// is why it is a count and not a flag.
+    ///
+    /// It is deliberately **not** subtracted from `units_sent`: the units were
+    /// offered, and the load is real. What is missing is the confirmation.
+    pub unobserved_units: u64,
     /// Attempts the generator declined to make because its own in-flight budget
     /// was saturated — load that was *never offered* to the target.
     ///

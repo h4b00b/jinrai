@@ -628,6 +628,9 @@ Six things the block is there to make unmissable:
 * **A run that tested nothing** — 0 completions with only failures prints an
   explicit warning **and exits non-zero**, so "6000 attempts, 0 responses" can no
   longer be mistaken for a successful test in a pipeline.
+* **Load offered vs. load delivered** — a datagram or raw flood has nothing to
+  acknowledge it, so its row is `emitted`, not `completed`, and is not painted
+  green. See [what a packet flood's numbers mean](#what-a-packet-floods-numbers-mean).
 
 ### When the run falls short of its cap
 
@@ -652,6 +655,39 @@ is *why*, because two of the three reasons say nothing at all about the target:
 The generator note is deliberately narrow: it appears only when nothing failed,
 no in-flight ceiling applied, and the run ran to completion — with any failure on
 the board the errno breakdown is the story instead.
+
+### What a packet flood's numbers mean
+
+A datagram or raw flood has **nothing to acknowledge it**. `sendto()` returning
+`Ok` says the local kernel queued the bytes; it does not say they left the NIC,
+and it certainly does not say the target processed them. So those units are
+reported as offered, not delivered:
+
+```
+ attempts   2497693 total, 499538.6/s achieved (100% of the 500000/s cap)
+ emitted    2497693 (100.0%)
+   unacked  handed to the local stack and not observed again — a datagram/raw
+            flood has no acknowledgement, so this is offered load, not delivery.
+            Confirm at the TARGET (`nstat -az '*RcvbufErrors*'`, `netstat -su`)
+ failed     0
+```
+
+`emitted` rather than `completed`, and the row is not painted green: green is
+reserved for "the run did its job", and handing bytes to the local stack is the
+premise of the test rather than its result. `tcp`, `data` and every L7 method
+keep `completed` — a finished handshake, a delivered TCP write and an HTTP
+response are all observations of the target. A multi-vector run that mixes the
+two keeps `completed` and names how much of the total was unacknowledged.
+
+The gap is not academic. Measured on loopback against a sink that could not
+drain: jinrai emitted every one of 2 497 693 datagrams it claimed — the kernel's
+`OutDatagrams` agreed exactly, `SndbufErrors` was zero — and the receiving
+*application* read 11% of them. The rest landed in the peer's `RcvbufErrors`:
+received by the target's stack, never read by its application. That is a real
+finding, it is the one the run went looking for, and no amount of sending-side
+instrumentation can see it. Read it on the target; the playbook's
+[what a packet flood's numbers mean](docs/playbook.md#what-a-packet-floods-numbers-mean--and-what-they-do-not)
+gives the commands.
 
 **Where the ceiling actually is.** On a modern host the stateless floods sustain
 roughly **half a million packets/second**, bounded by the cost of one send

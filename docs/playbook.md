@@ -19,7 +19,8 @@ Reference version: **0.47.0**.
 - [Reading the run summary](#reading-the-run-summary)
 - [Verifying the audit log](#verifying-the-audit-log)
 - [Seeing a run while it happens](#seeing-a-run-while-it-happens---debug)
-- [When a run reaches nothing](#when-a-run-reaches-nothing)
+- [What a packet flood's numbers mean](#what-a-packet-floods-numbers-mean--and-what-they-do-not)
+- [Calibrate the generator first](#calibrate-the-generator-before-you-trust-a-number)
 
 ---
 
@@ -1063,20 +1064,62 @@ the target, and the log is a bounded, hash-chained record.
 
 ---
 
-## When a run reaches nothing
+## What a packet flood's numbers mean — and what they do not
 
-A stateful firewall, IDS or middlebox anywhere on the path can drop out-of-state
-segments before they are delivered — typically every mode at tests 12 and 13:
-`ack`, `fin`, `rst`, `urg`, `cwr`, `ece`, `syn-ack`, `syn-fin`, `syn-rst`,
-`xmas`, `null`.
+**A datagram or raw flood cannot tell you it was delivered.** `sendto()` returning
+`Ok` says the local kernel queued the bytes. There is no acknowledgement in a UDP
+or SYN flood to wait for, so nothing after that point is visible to jinrai — not
+whether the packet left the NIC, and certainly not whether the target processed
+it.
 
-**The local `sendto()` still succeeds**, so jinrai reports
-`50000 completed (100%), failed 0` for a run that reached nothing at all. There
-is no signal in the summary — the send succeeded, and the tool cannot see past
-its own NIC. Confirming delivery has to happen off-tool.
+The summary says so rather than claiming a completion:
 
-Capture **at the source** to prove what left, and **on the target itself** to
-prove what arrived:
+```
+ attempts   2497693 total, 499538.6/s achieved (100% of the 500000/s cap)
+ emitted    2497693 (100.0%)
+   unacked  handed to the local stack and not observed again — a datagram/raw
+            flood has no acknowledgement, so this is offered load, not delivery.
+            Confirm at the TARGET (`nstat -az '*RcvbufErrors*'`, `netstat -su`)
+ failed     0
+```
+
+`emitted`, not `completed`, and the row is not painted green: green means the run
+did its job, and handing bytes to the local stack is the *premise* of the test,
+not its result. The connection-oriented primitives (`tcp`, `data`, and every L7
+method) still report `completed`, because a finished handshake, a delivered TCP
+write and an HTTP response really are observations of the target.
+
+**This matters more than it sounds.** Measured on loopback, against a sink that
+could not drain fast enough: jinrai emitted every one of 2 497 693 datagrams it
+claimed — the kernel's own `OutDatagrams` agreed exactly and `SndbufErrors` was
+zero — and the receiving *application* read 280 789 of them, 11%. The other 89%
+were counted by the peer's `RcvbufErrors`: the target's stack received them and
+its application never got to them. That is a real and useful finding, and it is
+invisible from the sending side.
+
+### Where the answer actually is
+
+Two independent causes, two different places to look.
+
+**1. The target's socket never drained** — the common one for `udp` and the ICMP
+modes. The receiving stack counts it:
+
+```sh
+# on the target, before and after the run
+nstat -az | grep -iE 'RcvbufErrors|InErrors|NoPorts'
+netstat -su | grep -iE 'receive buffer errors|packet receive errors'
+```
+
+A `RcvbufErrors` delta close to the run's `emitted` count means the load arrived
+and the application could not keep up — which is usually the answer the test went
+looking for. `NoPorts` instead means nothing was listening on that port, and the
+run measured an ICMP-unreachable generator.
+
+**2. Something on the path dropped it** — a stateful firewall, IDS or middlebox
+discarding out-of-state segments. Typically every mode at tests 12 and 13: `ack`,
+`fin`, `rst`, `urg`, `cwr`, `ece`, `syn-ack`, `syn-fin`, `syn-rst`, `xmas`,
+`null`. Capture **at the source** to prove what left and **on the target itself**
+to prove what arrived:
 
 ```sh
 # on the host running jinrai
@@ -1092,6 +1135,47 @@ evidence either way. If the target's own firewall keeps counters, zero them
 before the run and read them after — a counter matching the run's unit count on
 an "invalid state" rule is the signature.
 
-The modes that always get through, because they open legitimate connection
+The modes that at least reach the target's IP stack, because they open legitimate
 state: `syn`, `tcp-options`, `udp`, `tcp`, `data`, the three ICMP modes, and all
-of L7.
+of L7. Of those, only `tcp`, `data` and L7 can also prove the *application* saw
+them.
+
+---
+
+## Calibrate the generator before you trust a number
+
+Every rate in this document is a flag, not a promise. What a run achieves depends
+on the box jinrai runs on, and a rate the generator cannot reach is reported as
+the target's behaviour. Ten minutes against a local sink settles it, and the
+result is a number you can reuse for every test below.
+
+Point each shape at loopback, ask for far more than it could plausibly do, and
+read what came out:
+
+```sh
+# a sink that accepts and discards, so the only ceiling measured is ours
+nc -l -u -p 19999 >/dev/null &          # for the datagram modes
+nc -l -p 19998   >/dev/null &           # for tcp / data
+
+# then ask for an absurd rate and read `achieved`, not `cap`
+jinrai --allow 127.0.0.0/8 --target 127.0.0.1 --ack-lab --no-audit \
+  --layer l4 --l4-mode udp --port 19999 --payload-size 1400 \
+  --rate 2000000 --duration 5
+```
+
+Three things to take from it:
+
+| Reading | What it fixes |
+|---|---|
+| The **achieved** rate at a cap you cannot reach | The highest `--rate` worth asking for on this box. Anything above it is a number in the summary, not load on the target. |
+| `achieved` **× payload** | The bandwidth the run needs. A 1400-byte payload at 500 000/s is ~5.6 Gbit/s — check the path can carry it before blaming the target. |
+| The `bound by` row, if it appears | Which knob is binding: your own budget (`--concurrency`, `--max-connections`) or the target. |
+
+For the slot-bound primitives (`--l4-mode tcp`, the fast L7 flood) jinrai already
+refuses a `--rate` its budget cannot offer and prints the arithmetic, so
+calibration there is about the *achievable* rate rather than the *offerable* one —
+the two differ whenever the target is slower than the timeout.
+
+Run the calibration once per generator host, record the numbers next to the test
+plan, and re-run it when the host changes. A test plan that carries a rate nobody
+measured is how a run ends up reporting the generator.

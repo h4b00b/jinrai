@@ -727,6 +727,14 @@ impl L34Engine {
         };
         sender.finish(&mut tally, grace);
 
+        // A property of the socket this vector ran on, so it is settled once here
+        // rather than carried through every send: on a datagram or raw socket
+        // nothing observed any of these units past the local stack accepting
+        // them, and the summary must not call that a completion.
+        if mode.is_fire_and_forget() {
+            tally.unobserved = tally.sent;
+        }
+
         Ok((tally, aborted))
     }
 }
@@ -747,6 +755,11 @@ struct Tally {
     residency_n: u64,
     /// Units the pool refused to admit — see [`RunReport::not_offered`].
     not_offered: u64,
+    /// Of `sent`, how many nothing observed after the local stack took them —
+    /// see [`RunReport::unobserved_units`]. Set once per vector from its mode
+    /// rather than per unit, because it is a property of the socket the vector
+    /// runs on and not of any individual send.
+    unobserved: u64,
     /// Whether this run narrates (`--debug`). Held on the tally because that is
     /// where the failure text is kept, and the check has to happen before the
     /// message is built rather than after: `e.to_string()` on the send path of a
@@ -767,6 +780,7 @@ impl Tally {
             residency_micros: 0,
             residency_n: 0,
             not_offered: 0,
+            unobserved: 0,
             debug,
             failures: BTreeMap::new(),
             // 1us .. 60s at 3 significant figures — bounded memory regardless of
@@ -851,6 +865,7 @@ impl Tally {
         self.sent += other.sent;
         self.errors += other.errors;
         self.not_offered += other.not_offered;
+        self.unobserved += other.unobserved;
         self.residency_micros = self.residency_micros.saturating_add(other.residency_micros);
         self.residency_n += other.residency_n;
         self.errno.absorb(&other.errno);
@@ -886,6 +901,7 @@ impl Tally {
                 0
             },
             not_offered: self.not_offered,
+            unobserved_units: self.unobserved,
             // Empty unless the run narrated; the reporter omits the block then.
             failure_samples: self.failures,
             ..Default::default()
@@ -2786,6 +2802,92 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(1400),
             "a 1s run at 500000/s took {elapsed:?}"
+        );
+    }
+
+    /// A datagram flood's units are offered load, not delivered load: nothing
+    /// observed them past the local stack, so the engine must say so and let the
+    /// summary stop calling them completions.
+    #[test]
+    fn a_datagram_flood_reports_its_units_as_unobserved() {
+        let _fd = fd_guard();
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(config(L4Mode::Udp, port, 16));
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
+
+        assert!(report.units_sent > 0, "{report:?}");
+        assert_eq!(
+            report.unobserved_units, report.units_sent,
+            "a sendto() that returned Ok observed nothing: {report:?}"
+        );
+    }
+
+    /// The counterpart, and the reason this is not simply "L4 is unobserved": a
+    /// completed handshake IS an observation of the target, and marking it
+    /// unacknowledged would have been a second wrong answer.
+    #[test]
+    fn a_connect_flood_reports_real_completions() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _fd = fd_guard();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let acceptor = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                let mut held = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((s, _)) => held.push(s),
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        let mut engine = L34Engine::new(config(L4Mode::TcpConnect, port, 16));
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
+        stop.store(true, Ordering::Relaxed);
+        acceptor.join().unwrap();
+
+        assert!(report.units_sent > 0, "{report:?}");
+        assert_eq!(
+            report.unobserved_units, 0,
+            "a completed handshake is an observation of the target: {report:?}"
+        );
+    }
+
+    /// A multi-vector run mixes the two, which is why the engine carries a count
+    /// rather than a flag: the merged report must name the datagram share exactly,
+    /// not round the whole run to one answer or the other.
+    #[test]
+    fn a_mixed_run_counts_only_its_datagram_units_as_unobserved() {
+        let _fd = fd_guard();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let t = authorized_ip("127.0.0.0/8", "127.0.0.1");
+        // The tcp vector aims at the UDP port, so its handshakes fail — which is
+        // the point: failures are not units_sent, so whatever units_sent holds
+        // came from the udp vector and must be entirely unobserved.
+        let mut engine = L34Engine::new(L34Config {
+            modes: vec![L4Mode::Udp, L4Mode::TcpConnect],
+            ports: PortSet::single(port),
+            payload_size: 16,
+            concurrency: DEFAULT_CONCURRENCY,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            debug: false,
+        });
+        let report = engine.execute(&plan(vec![t], 200, 1)).expect("the run should execute");
+
+        assert!(report.units_sent > 0, "{report:?}");
+        assert!(
+            report.unobserved_units > 0 && report.unobserved_units <= report.units_sent,
+            "the datagram share must be counted, not rounded away: {report:?}"
         );
     }
 
