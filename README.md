@@ -261,6 +261,35 @@ reinterpreted per family, and a flag belonging to another family is inert
 | Family | `--rate` counts | Bound the footprint with | Does **not** read |
 |---|---|---|---|
 | `get` / `post` / `head` | requests/sec | `--max-connections` (default 1024; `0` = unbounded), `--request-timeout-ms`, `--drain-timeout-ms`, `--follow-redirects` | — |
+
+These three are not independent. A slot is held for an attempt's whole life, so
+once attempts run to the timeout only `--max-connections / --request-timeout-ms`
+of them can start each second — the stock 1024 over 10s is **102/s**, which is
+why `--rate` defaults to 100. Ask for more than the budget carries and the
+surplus is never offered: the run measures jinrai's ceiling and the summary
+reports it where the target's capacity should be. Worse, it looks fine until the
+target starts to struggle, because a target answering in milliseconds recycles a
+slot far faster than the timeout does — so the shortfall arrives exactly when the
+run was finally measuring something.
+
+jinrai therefore refuses such a run before it sends anything, and prints the two
+knobs that fix it:
+
+```
+$ jinrai --url https://host/path --rate 2000 --duration 60 ...
+error: --rate 2000 cannot be offered with this in-flight budget: 1024 slots over
+a 10.0s attempt timeout carry 102/s once attempts run to timeout, ...
+  raise the ceiling past 2000/s:
+    --request-timeout-ms 512   1024 slots turning over that fast carry 2000/s
+    --max-connections 20000    2000/s at the current 10.0s timeout, one descriptor each
+    --rate 102                 what this budget already delivers
+  --allow-underpowered runs it as asked.
+```
+
+`--dry-run` reaches this check, so a command line can be validated without
+sending anything. `--allow-underpowered` proceeds anyway, for a run where
+holding a fixed slot budget against the target *is* the test.
+
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
 | `websocket` / `sse` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (Ping tick, `websocket` only) | same as above |
 | `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
@@ -292,60 +321,64 @@ target, run — nothing is implied or omitted.
 # variable here so the commands below stay about the technique. Add --dry-run to
 # any of them to validate and print the plan without sending.
 REQ='--ack-lab --audit-log runs.jsonl'
+# The in-flight budget. --max-connections / --request-timeout-ms is the rate still
+# reachable once attempts run to the timeout, and the defaults (1024 over 10s) carry
+# only 102/s — jinrai refuses a run asking for more than its budget can offer.
+BUDGET='--max-connections 8192 --request-timeout-ms 1000'
 
 # Capacity, with a verdict: fails the run (exit != 0) if the target misses the SLO
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 200 --duration 60 \
-       --slo-max-5xx-rate 0.01 --slo-max-p99-ms 250
+       --slo-max-5xx-rate 0.01 --slo-max-p99-ms 250 $BUDGET
 
 # Write path: POST with a body, cache-busted so a CDN cannot answer for the origin
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method post \
        --url https://api.staging.internal/ingest --body '{"probe":1}' \
-       --cache-bust --rate 200 --duration 60
+       --cache-bust --rate 200 --duration 60 $BUDGET
 
 # Random-path flood: every request asks for a URI that does not exist, so nothing
 # is cacheable and the origin answers (and logs) all of it
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
-       --url https://www.staging.internal/ --random-path --rate 500 --duration 60
+       --url https://www.staging.internal/ --random-path --rate 500 --duration 60 $BUDGET
 
 # Valid-random flood: same idea, but drawn from endpoints that DO exist, so the
 # load lands on real handlers rather than the 404 path
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/ --path-file endpoints.txt \
-       --rate 500 --duration 60
+       --rate 500 --duration 60 $BUDGET
 
 # Search-field flood + session exhaustion: a fresh term AND a fresh session per
 # request — neither the cache nor the session store can absorb any of it
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://www.staging.internal/search --search-param q \
-       --session-cookie JSESSIONID --rate 500 --duration 120
+       --session-cookie JSESSIONID --rate 500 --duration 120 $BUDGET
 
 # Breaking point: ramp to the ceiling, stop at the first stage that breaks the SLO
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 5000 --duration 300 \
        --profile ramp --ramp-start 100 --ramp-steps 20 \
-       --discover-knee --slo-max-5xx-rate 0.01
+       --discover-knee --slo-max-5xx-rate 0.01 $BUDGET
 
 # Burst: hold a baseline, jump to the ceiling for 30s, fall back (autoscaling test)
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 2000 --duration 300 \
-       --profile spike --spike-base 200 --spike-secs 30
+       --profile spike --spike-base 200 --spike-secs 30 $BUDGET
 
 # Endurance: a long flat hold that surfaces leaks and slow degradation
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --rate 300 --duration 3600 \
-       --profile soak --slo-max-p99-ms 500 --watchdog --slo-max-error-rate 0.05
+       --profile soak --slo-max-p99-ms 500 --watchdog --slo-max-error-rate 0.05 $BUDGET
 
 # Same load over a pinned protocol version (auto would negotiate h2 on https)
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/health --http-version 1.1 \
-       --rate 200 --duration 60
+       --rate 200 --duration 60 $BUDGET
 
 # Connection-slot exhaustion: at most 50 keep-alive connections held busy
 # (the controlled form of GoldenEye/XerXes)
 jinrai $REQ --layer l7 --allow '*.staging.internal' --l7-method get \
        --url https://api.staging.internal/ --max-connections 50 \
-       --cache-bust --rate 1000 --duration 60
+       --cache-bust --rate 1000 --duration 60 --allow-underpowered
 
 # Slowloris: 200 half-open connections, one header line each every 10s
 #   swap --l7-method for slowbody (trickled POST body, RUDY)
@@ -596,7 +629,7 @@ is *why*, because two of the three reasons say nothing at all about the target:
 
 | `bound by` says | what it means | what to do |
 | --- | --- | --- |
-| `concurrency, not the target` | the in-flight ceiling made the cap unreachable: `--concurrency / RTT` lands below `--rate` (Little's law) | raise `--concurrency` / `--max-connections` |
+| `concurrency, not the target` | the in-flight ceiling made the cap unreachable: `--concurrency / RTT` lands below `--rate` (Little's law) | shorten `--request-timeout-ms` before raising `--max-connections` — a failing attempt holds its slot for the whole timeout, so the timeout usually buys more offered load than slots do. For `get`/`post`/`head` this is now refused up front (see below), so it should only appear on an `--allow-underpowered` run |
 | `the generator, not the target` | this host could not emit any faster — nothing failed and no ceiling applied | treat the achieved rate as the real offered load; run from more hosts if you need more |
 | *(nothing printed)* | the run had the headroom and still fell short, or it got within 90% of the cap | **this one is about the target** — read it as a finding |
 
@@ -700,7 +733,7 @@ counts as a unit of `--rate`, see
 
 | Method | Kind | Mechanism |
 |---|---|---|
-| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host); `--max-connections <N>` caps concurrent connections; `--http-version <auto\|1.1\|2>` pins the protocol version |
+| `get` / `post` / `head` | fast, constant-rate | `--body` sets the POST body; `--cache-bust` appends a unique `_cb=<n>` query per request (query only — never the host); `--max-connections <N>` caps concurrent connections (and must be able to carry `--rate` — see [the knob table](#rate-concurrency-and-which-knobs-apply), or `--allow-underpowered` to waive it); `--http-version <auto\|1.1\|2>` pins the protocol version |
 | `slowloris` | slow connection | partial request headers, never terminated |
 | `slowbody` | slow connection | oversized `Content-Length`, body trickled a byte at a time (RUDY) |
 | `slow-read` | slow connection | send a *complete* request, then drain the response one small chunk per tick with a shrunken receive window (`SO_RCVBUF`) so the server cannot flush it — the read-side mirror of `slowbody` |
@@ -748,6 +781,7 @@ cacheable anywhere in it:
 ```bash
 jinrai $REQ --url https://staging.internal/search --allow '*.staging.internal' \
        --search-param q --session-cookie JSESSIONID --cache-bust \
+       --max-connections 4096 --request-timeout-ms 4000 \
        --rate 500 --duration 120 --slo-max-p99-ms 2000
 ```
 

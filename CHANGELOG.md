@@ -26,6 +26,64 @@ release (`0.MINOR.0`); breaking changes would too, until the API stabilises at
   already succeeded, which the summary cannot see. Addresses in the examples are
   placeholders, not any real environment.
 
+## [0.47.0] — 2026-08-04
+
+An operator asked a login endpoint for 2000 requests a second and got 390. The
+summary said so honestly — `19% of the 2000/s cap`, `96215 attempts never
+offered`, `bound by concurrency, not the target` — but it said so after sixty
+seconds, in the ninth row of a block, about a run that could never have done
+anything else. `--rate`, `--max-connections` and `--request-timeout-ms` are not
+three independent knobs, and nothing in the tool had ever said so.
+
+### Added
+
+- **A run that cannot offer its own `--rate` is refused before it sends
+  anything.** A slot is held for an attempt's whole life, so once attempts run
+  to the request timeout the dispatcher can start only
+  `--max-connections / --request-timeout-ms` of them per second — for the stock
+  defaults, 1024 over 10s, that is **102/s**. Ask for more and the surplus is
+  never offered: the run measures jinrai's own budget and the summary reports it
+  where the target's capacity belongs.
+
+  The check fails closed rather than warning, because the shortfall arrives
+  exactly when the measurement matters. A healthy target answers in milliseconds
+  and recycles a slot hundreds of times faster than the timeout does, so an
+  underpowered budget looks fine right up until the target begins to struggle —
+  which is the thing the operator came to measure. The refusal prints the
+  arithmetic and both levers as pasteable fragments, and drops any lever that
+  cannot actually reach (a sub-millisecond timeout, a slot count past
+  `--max-connections`' own ceiling) rather than suggest a value the parser would
+  then reject. `--dry-run` reaches the check, so a command line can be validated
+  without sending. Applies to the fast `get`/`post`/`head` flood, where all three
+  flags bind; the stock defaults pass by construction, so it only fires on a rate
+  someone raised without the budget to match.
+
+- **`--allow-underpowered`** waives it, for the run where the shortfall is the
+  point: pinning load to 50 keep-alive connections to probe a worker limit asks
+  for a rate those 50 slots cannot carry *by design*.
+
+- **A warning when `--request-timeout-ms` is at or below `--slo-max-p99-ms`.**
+  A timed-out attempt is a failure, and failures are not in the percentiles — so
+  with the timeout inside the threshold, every attempt slow enough to breach the
+  SLO leaves the sample instead of breaching it, and **p99 passes a run that
+  served almost nothing**. The trap sits directly on the path out of the problem
+  above, where the advice is to shorten the timeout.
+
+### Documentation
+
+- **Every documented fast-L7 command was asking for more than its budget could
+  offer** — 21 of the 29 in `README.md` and `docs/playbook.md`, including the
+  `--rate 2000` recipe behind the run that prompted this release. The docs had
+  been teaching the underpowered command. The playbook now sets the budget once
+  in `$BUDGET` (with the descriptor cost and the p99 interaction explained
+  there), the README examples carry it, and the two connection-slot exhaustion
+  cases carry `--allow-underpowered` with a note on why that run is read as a
+  connection-slot finding rather than a throughput one.
+- The `bound by / concurrency, not the target` row of the summary-reading table
+  now says to shorten the timeout before buying slots — a failing attempt holds
+  its slot for the whole timeout, so the timeout usually buys more offered load
+  than descriptors do.
+
 ## [0.46.0] — 2026-08-04
 
 A POST run against a login endpoint held its rate for four seconds, decayed to
@@ -2264,7 +2322,8 @@ Phases 0–4.
   exact spoofing shape the project forbids. The live SYN path in `l34/lib.rs`
   builds packets from the real source only.
 
-[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.46.0...HEAD
+[Unreleased]: https://github.com/h4b00b/jinrai/compare/v0.47.0...HEAD
+[0.47.0]: https://github.com/h4b00b/jinrai/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/h4b00b/jinrai/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/h4b00b/jinrai/compare/v0.44.0...v0.45.0
 [0.44.0]: https://github.com/h4b00b/jinrai/compare/v0.43.0...v0.44.0
