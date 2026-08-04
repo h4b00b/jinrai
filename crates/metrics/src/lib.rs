@@ -255,17 +255,39 @@ pub fn render_summary(
         // in every release build — the width guard below `row` is a
         // `debug_assert`, and no test rendered this row. The phrase lives in the
         // value now, where it has the room to be a sentence.
-        out.push_str(&row(
-            p,
-            "  not sent",
-            &p.warn(&format!(
-                "{} attempt{} never offered — our in-flight budget was saturated, not \
-                 the target's capacity (raise {} to offer more)",
+        let plural = if report.not_offered == 1 { "" } else { "s" };
+        let flag = ceiling_flag(ctx);
+        // THAT the budget saturated is a fact. WHY it saturated is a reading,
+        // and the two possible readings have opposite remedies — so this row
+        // may not assert one of them unconditionally, which is exactly what it
+        // did. It blamed the ceiling in every run, including the run where
+        // `concurrency_bound_note` had already done the arithmetic, found the
+        // ceiling had headroom for the entire cap, and stayed silent *because*
+        // the shortfall was the target's. The block then offered "saturated,
+        // not the target's capacity (raise --max-connections)" as its only
+        // explanation: against a target that had stopped answering, advice
+        // that buys nothing but more attempts parked on it.
+        let value = match offerable_ceiling(report, ctx) {
+            Some(c) if c.reaches(ctx.rate_per_sec) => format!(
+                "{} attempt{plural} never offered — every in-flight slot was still held \
+                 by an attempt awaiting an answer. That is not the ceiling's doing: {} in \
+                 flight at this run's {} {} residency covers {:.0}/s, above the {}/s cap. \
+                 The slots went to attempts slower than that, which is the target's doing \
+                 — raising {flag} would only park more attempts on it",
                 report.not_offered,
-                if report.not_offered == 1 { "" } else { "s" },
-                ceiling_flag(ctx)
-            )),
-        ));
+                c.concurrency,
+                fmt_micros(c.residency_micros),
+                c.basis,
+                c.per_sec,
+                ctx.rate_per_sec,
+            ),
+            _ => format!(
+                "{} attempt{plural} never offered — our in-flight budget was saturated, not \
+                 the target's capacity (raise {flag} to offer more)",
+                report.not_offered,
+            ),
+        };
+        out.push_str(&row(p, "  not sent", &p.warn(&value)));
     }
     // `completed` and `failed` are the pair a reader looks for first, and they
     // mean opposite things — so they are the pair that must not arrive in the
@@ -599,6 +621,59 @@ fn achieved_hint(effective: f64, ctx: &RunContext) -> String {
     format!(" ({pct:.0}% of the {}/s cap)", ctx.rate_per_sec)
 }
 
+/// The load the in-flight ceiling could have offered, at the residency this run
+/// actually observed.
+///
+/// Little's law: `N` slots, each occupied for `W`, offer at most `N / W` per
+/// second. Two rows of the summary turn on that one number — `not sent` and
+/// [`concurrency_bound_note`] — and they used to derive it separately, which is
+/// how a single block came to print "our in-flight budget was saturated, not the
+/// target's capacity (raise --max-connections)" directly above the silence of a
+/// note whose own arithmetic had just concluded the ceiling had headroom for the
+/// whole cap, and that the shortfall was therefore the target's. Computed once,
+/// here, so the block cannot contradict itself again.
+struct Ceiling {
+    /// The in-flight ceiling itself (`--max-connections` / `--concurrency`).
+    concurrency: usize,
+    /// `W`: what one attempt cost the budget.
+    residency_micros: u64,
+    /// How `W` was arrived at — `"mean"` when the layer measured true slot
+    /// residency, `"median"` for the fallback. Stated in the summary because the
+    /// two are not interchangeable: see the note on `W` below.
+    basis: &'static str,
+    /// `N / W`, the most this run could have offered.
+    per_sec: f64,
+}
+
+impl Ceiling {
+    /// Whether the ceiling could itself have delivered the rate cap. When it
+    /// could, a shortfall is a finding about the target and not about this knob.
+    fn reaches(&self, cap_per_sec: u64) -> bool {
+        self.per_sec >= cap_per_sec as f64
+    }
+}
+
+/// [`Ceiling`] for this run, or `None` when there is no ceiling, no cap, or no
+/// measured residency to judge it by.
+fn offerable_ceiling(report: &RunReport, ctx: &RunContext) -> Option<Ceiling> {
+    let concurrency = ctx.concurrency?;
+    // Prefer true mean residency; fall back to the completed-only median for
+    // layers that do not measure it.
+    let (residency_micros, basis) = match report.mean_micros {
+        0 => (report.p50_micros, "median"),
+        mean => (mean, "mean"),
+    };
+    if ctx.rate_per_sec == 0 || residency_micros == 0 || concurrency == 0 {
+        return None;
+    }
+    Some(Ceiling {
+        concurrency,
+        residency_micros,
+        basis,
+        per_sec: concurrency as f64 / (residency_micros as f64 / 1_000_000.0),
+    })
+}
+
 /// Explain a run that fell short of its rate cap because it could not have
 /// reached it, rather than because the target pushed back.
 ///
@@ -626,26 +701,17 @@ fn achieved_hint(effective: f64, ctx: &RunContext) -> String {
 /// So `W` is [`RunReport::mean_micros`] when the layer measured it, and the
 /// median only as a fallback for layers that do not.
 fn concurrency_bound_note(effective: f64, report: &RunReport, ctx: &RunContext) -> Option<String> {
-    let concurrency = ctx.concurrency?;
-    // Prefer true mean residency; fall back to the completed-only median for
-    // layers that do not measure it.
-    let (residency_micros, basis) = match report.mean_micros {
-        0 => (report.p50_micros, "median"),
-        mean => (mean, "mean"),
-    };
-    if ctx.rate_per_sec == 0 || residency_micros == 0 || concurrency == 0 {
-        return None;
-    }
+    let Ceiling { concurrency, residency_micros, basis, per_sec: ceiling } =
+        offerable_ceiling(report, ctx)?;
     let cap = ctx.rate_per_sec as f64;
     // Within reach of the cap: the pacer was in charge, which is the healthy case.
     if effective >= cap * 0.9 {
         return None;
     }
-    let residency = residency_micros as f64 / 1_000_000.0;
-    let ceiling = concurrency as f64 / residency;
     if ceiling >= cap {
         // The run had the headroom to reach the cap and did not — that is a
-        // finding about the target, not about this knob. Say nothing.
+        // finding about the target, not about this knob. Say nothing here; the
+        // `not sent` row above states that reading, from this same arithmetic.
         return None;
     }
     let mut note = format!(
@@ -1093,6 +1159,60 @@ mod tests {
         // width guard is a `debug_assert`, and until this test nothing rendered
         // the row at all.
         assert!(out.contains("not sent 500 attempts never offered"), "{out}");
+    }
+
+    /// REGRESSION: the `not sent` row blamed the in-flight ceiling in every run
+    /// — including the runs where this very block's arithmetic had already
+    /// cleared it, and said so by staying silent.
+    ///
+    /// A 10 s POST flood offered 6250 of a planned 10 000 attempts, and the only
+    /// explanation the summary carried was "our in-flight budget was saturated,
+    /// not the target's capacity (raise --max-connections to offer more)". The
+    /// target had gone silent four seconds in and every slot was held by a
+    /// request it never answered; 1024 slots at the observed residency covered
+    /// more than the 1000/s cap, which is exactly why `concurrency_bound_note`
+    /// printed nothing. Raising the ceiling would have bought no load at all —
+    /// only more attempts parked on an unresponsive target.
+    #[test]
+    fn a_ceiling_with_headroom_is_not_blamed_for_load_we_never_offered() {
+        let r = RunReport {
+            layer_label: "L7 post".into(),
+            units_sent: 5226,
+            errors: 1024,
+            not_offered: 3739,
+            status_2xx: 5226,
+            p50_micros: 10_700,
+            // 1024 in flight at this residency covers ~1178/s, above the cap.
+            mean_micros: 869_000,
+            ..Default::default()
+        };
+        let out = render_summary(
+            &r,
+            &RunContext {
+                concurrency: Some(1024),
+                rate_per_sec: 1_000,
+                planned: Duration::from_secs(10),
+                elapsed: Duration::from_secs(11),
+                ..ctx()
+            },
+            None,
+            &Palette::PLAIN,
+        );
+        // The row wraps to the block width, so match on the sentence rather than
+        // on whatever the wrap did to it.
+        let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("3739 attempts never offered"), "{out}");
+        assert!(
+            flat.contains("not the ceiling's doing"),
+            "the ceiling covered the cap, so the row has to say which side the \
+             shortfall came from: {out}"
+        );
+        assert!(
+            !flat.contains("raise --max-connections to offer more"),
+            "advice this block's own ceiling arithmetic contradicts: {out}"
+        );
+        // And the two rows must agree: the note stays silent for the same reason.
+        assert!(!flat.contains("bound by"), "the ceiling was not the bound: {out}");
     }
 
     /// The reading that used to be a mystery: "320/s achieved (3% of the 10000/s
