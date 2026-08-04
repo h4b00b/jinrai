@@ -260,7 +260,7 @@ reinterpreted per family, and a flag belonging to another family is inert
 
 | Family | `--rate` counts | Bound the footprint with | Does **not** read |
 |---|---|---|---|
-| `get` / `post` / `head` | requests/sec | `--max-connections` (default 1024; `0` = unbounded), `--request-timeout-ms`, `--drain-timeout-ms` | — |
+| `get` / `post` / `head` | requests/sec | `--max-connections` (default 1024; `0` = unbounded), `--request-timeout-ms`, `--drain-timeout-ms`, `--follow-redirects` | — |
 | `slowloris` / `slowbody` / `slow-read` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (tick) | `--slo-*`, `--watchdog`, `--profile`, `--http-version` |
 | `websocket` / `sse` | **connections opened**/sec | `--slow-connections` (ceiling), `--drip-ms` (Ping tick, `websocket` only) | same as above |
 | `tls-handshake` | handshakes/sec | `--max-connections` (default 1024) | same as above |
@@ -673,12 +673,15 @@ The `--url` host is validated as a *datum* against its own rule type — an
 IP-literal host against the CIDR rules, a DNS-name host against the DNS rules —
 and only then resolved once and pinned. A name is never resolved-then-IP-checked.
 
-**Redirects are not followed.** Pinning the connect address is only worth
-something if the client cannot be talked into connecting elsewhere, and a
-`3xx` with a `Location:` on another host is exactly that: the *target* choosing
-where your traffic and your `--header` values go next. A redirect is counted as
-the response it is (`3xx` in the summary) and the run stays on the host the gate
-authorized.
+**Redirects are not followed off the authorized origin.** Pinning the connect
+address is only worth something if the client cannot be talked into connecting
+elsewhere, and a `3xx` with a `Location:` on another host is exactly that: the
+*target* choosing where your traffic and your `--header` values go next. Such a
+redirect is counted as the response it is (`3xx` in the summary) and the run
+stays on the host the gate authorized — at every setting of
+[`--follow-redirects`](#what-the-client-looks-like-user-agent-and-redirects),
+which relaxes how far the client walks on the approved origin, never which
+origin it walks on.
 
 ### The L7 methods
 
@@ -793,6 +796,43 @@ longer `--request-timeout-ms`, which is why the bucket is kept separate from
 `timeout`. `--max-connections` prevents the pile-up at its source by capping how
 many requests can be in flight at once. An operator Ctrl-C or a watchdog abort
 skips the grace entirely and cancels immediately: an abort must be prompt.
+
+### What the client looks like: `User-Agent` and redirects
+
+Two properties of the request decide whether a run measures the target or the
+appliance in front of it. Both have bitten the same way: the summary reports a
+status class you cannot reproduce in a browser against the same URL, and nothing
+in the run says why.
+
+**Every request carries `User-Agent: jinrai/<version>`.** Sending no
+`User-Agent` at all is not the neutral choice it looks like — WAFs, CDNs and bot
+filters answer a headerless request differently from the same request carrying
+*any* UA, typically with a challenge or a redirect. Identifying the tool is also
+the honest default for a load generator pointed at authorized infrastructure.
+`--header "User-Agent: ..."` replaces it when the point of the test is a
+specific client profile; the default is a default, not a policy.
+
+**A redirect is counted, not followed — unless you ask for it.**
+
+| `--follow-redirects` | what a status class in the summary means |
+| --- | --- |
+| `0` (default) | the status of the **first** response. A target that answers `302` to a login page reports `3xx 100%`, even though a browser would end on the `404` two hops later |
+| `N > 0` | the status at the **end** of the chain, for up to `N` same-origin hops |
+
+Same-origin is the whole safety story: the hop is taken only when the
+`Location:` still names the host, port and scheme the gate approved — the origin
+the DNS pin already covers and the `--header` values already belong to. Anything
+else stops the chain and reports the `3xx`, at every value of `N`. The peer
+never chooses where the client connects.
+
+The cost is real and belongs to you, which is why it is opt-in: **a followed hop
+is a second request `--rate` never counted.** With `N` hops available a run can
+put up to `(1 + N) x --rate` requests/sec on the target. The rate cap still
+bounds what jinrai *dispatches*; it no longer bounds what the target receives.
+The summary says so — `following up to 3 same-origin redirects` in the module
+line — because `attempts` otherwise quietly stops meaning "requests the target
+saw". Keep `N` at the length of the chain you actually expect (usually `1`), and
+prefer pointing `--url` at the final URL when you know it.
 
 ### HTTP/1.1 vs HTTP/2 (`--http-version`)
 

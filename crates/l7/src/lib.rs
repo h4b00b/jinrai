@@ -24,10 +24,17 @@
 //! current requirement: a name is judged as a name.
 //!
 //! That pinning is only worth anything if the client cannot be talked into
-//! connecting somewhere else, so **redirects are refused** (`Policy::none()`):
-//! a `Location:` pointing at another host is the one way a peer could walk the
-//! client past the gate, and it would carry the operator's headers along. A 3xx
-//! is therefore counted as the response it is, never followed.
+//! connecting somewhere else, so by default **redirects are refused**
+//! (`Policy::none()`): a `Location:` pointing at another host is the one way a
+//! peer could walk the client past the gate, and it would carry the operator's
+//! headers along. A 3xx is therefore counted as the response it is.
+//!
+//! [`L7Engine::with_follow_redirects`] relaxes that to **same-origin** hops
+//! only: a `Location:` is followed when its host, port and scheme all match the
+//! datum the gate approved, and stopped otherwise — so the response is still the
+//! 3xx, and the peer still cannot choose where the client connects. It is opt-in
+//! because a followed hop is a second request the rate cap never accounted for;
+//! see the flag's docs.
 //!
 //! ## Wiring choice
 //!
@@ -379,7 +386,30 @@ pub struct L7Engine {
     /// How long the engine waits for still-in-flight requests *after* the run's
     /// window closes, before cancelling them. See [`DEFAULT_DRAIN_GRACE`].
     drain_grace: Duration,
+    /// How many **same-origin** redirect hops one request may follow. `0` (the
+    /// default) refuses every redirect, so a 3xx is counted as the response it
+    /// is. See [`with_follow_redirects`](Self::with_follow_redirects).
+    follow_redirects: u32,
 }
+
+/// The `User-Agent` every request carries unless the operator overrides it.
+///
+/// `reqwest` sends no `User-Agent` of its own, and a request with the header
+/// entirely absent is not a neutral request: WAFs, CDNs and bot filters answer
+/// it differently from the same request carrying *any* UA — typically with a
+/// challenge or a redirect. A run shaped that way measures the filter's opinion
+/// of an unusual client instead of the target's capacity, and the summary has no
+/// way to say so: it just reports a status class the operator cannot reproduce
+/// in a browser.
+///
+/// Identifying the tool by name is also the honest default for a load generator
+/// pointed at authorized infrastructure — it is what the raw-socket engines
+/// ([`slow`], [`long_lived`]) have always sent, and this is the constant they
+/// now share. An operator who needs a different client profile (a browser UA, an
+/// empty one, an oddball one) supplies it through [`RequestSpec::headers`],
+/// which overwrites this — the engine does not ship vendor-specific evasion of
+/// its own.
+pub const DEFAULT_USER_AGENT: &str = concat!("jinrai/", env!("CARGO_PKG_VERSION"));
 
 /// Default per-request timeout: how long one request may stay unresolved before
 /// the client abandons it. Deliberately generous — a target slow enough to hit
@@ -431,6 +461,7 @@ impl L7Engine {
             max_conns: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             drain_grace: DEFAULT_DRAIN_GRACE,
+            follow_redirects: 0,
         }
     }
 
@@ -497,6 +528,30 @@ impl L7Engine {
         self
     }
 
+    /// Follow up to `n` **same-origin** redirect hops per request, so the status
+    /// recorded is the one at the end of the chain rather than the 3xx that
+    /// started it. `0` (the default) keeps every redirect unfollowed.
+    ///
+    /// Why this is not simply `Policy::limited(n)`: the authorization gate
+    /// approved one datum, and `resolve_to_addrs` pins that host only. A
+    /// `Location:` naming anything else — another host, another port, another
+    /// scheme — would resolve through the system resolver to an origin the gate
+    /// never saw, carrying the operator's `--header` values with it. So the hop
+    /// is taken only when host, port and scheme all still match the approved
+    /// datum; anything else stops the chain and the 3xx is reported as before.
+    /// The peer therefore cannot choose where the client connects, which is the
+    /// property `Policy::none()` was protecting.
+    ///
+    /// The cost is real and belongs to the operator, which is why this is
+    /// opt-in: a followed hop is a **second request** the `--rate` ceiling never
+    /// counted, so a run with `n` hops available can put up to `(1 + n) x rate`
+    /// requests/sec on the target. The rate cap still bounds what the engine
+    /// *dispatches*; it no longer bounds what the target receives.
+    pub fn with_follow_redirects(mut self, n: u32) -> Self {
+        self.follow_redirects = n;
+        self
+    }
+
     /// Authorize the URL's host as a datum: IP literal against IP/CIDR rules, or
     /// DNS name against DNS rules. Public so the CLI can validate + report before
     /// building a plan. No DNS resolution happens here for name targets — the
@@ -511,6 +566,10 @@ impl L7Engine {
 
     fn headers(&self) -> Result<HeaderMap, L7Error> {
         let mut map = HeaderMap::new();
+        // Inserted first so an operator `--header "User-Agent: ..."` overwrites
+        // it rather than colliding with it. See [`DEFAULT_USER_AGENT`] for why
+        // sending no UA at all is not the neutral choice it looks like.
+        map.insert(reqwest::header::USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
         for (k, v) in &self.spec.headers {
             let name = HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| L7Error::BadHeader(format!("{k}: {e}")))?;
@@ -519,6 +578,51 @@ impl L7Engine {
             map.insert(name, value);
         }
         Ok(map)
+    }
+
+    /// The redirect policy for a run against `datum`.
+    ///
+    /// Refusing redirects is a safety control, not a preference:
+    /// `resolve_to_addrs` pins *this* host only, so a target answering
+    /// `301 Location: http://somewhere.else/` would send the client through the
+    /// system resolver to a host the gate never saw — an allowlist bypass driven
+    /// entirely by the peer, and one that also leaks the operator's `--header`
+    /// values to it.
+    ///
+    /// What that control actually has to prevent is the client *moving*, not the
+    /// client *following*. So with `--follow-redirects` the hop is taken only
+    /// when the `Location:` still names the approved origin — same host, same
+    /// port, same scheme — which is the case the pin already covers and the
+    /// headers already belong to. Everything else is `stop()`, not `error()`:
+    /// the operator asked to see where the chain lands, and "it left the
+    /// authorized origin" is answered honestly by reporting the 3xx that says
+    /// so, not by turning the response into a failure.
+    fn redirect_policy(&self, datum: &Datum) -> reqwest::redirect::Policy {
+        use reqwest::redirect::Policy;
+        if self.follow_redirects == 0 {
+            return Policy::none();
+        }
+        let host = datum.host.clone();
+        let port = datum.port;
+        let scheme = datum.url.scheme().to_string();
+        let max = self.follow_redirects as usize;
+        Policy::custom(move |attempt| {
+            // `previous()` starts with the original request URL, so this allows
+            // exactly `max` hops — and a redirect loop reports the 3xx it is
+            // stuck on instead of spinning.
+            if attempt.previous().len() > max {
+                return attempt.stop();
+            }
+            let next = attempt.url();
+            let same_origin = next.host_str() == Some(host.as_str())
+                && next.port_or_known_default() == Some(port)
+                && next.scheme() == scheme;
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        })
     }
 
     /// Authorize the datum, then resolve ONCE (for name targets) to build a
@@ -534,14 +638,7 @@ impl L7Engine {
         let headers = self.headers()?;
         let mut builder = reqwest::Client::builder()
             .resolve_to_addrs(&datum.host, addrs.all())
-            // Refuse redirects. This is a safety control, not a preference:
-            // `resolve_to_addrs` pins *this* host only, so a target answering
-            // `301 Location: http://somewhere.else/` would send the client
-            // through the system resolver to a host the gate never saw — an
-            // allowlist bypass driven entirely by the peer, and one that also
-            // leaks the operator's `--header` values to it. With `none`, the
-            // 3xx is simply a response like any other and lands in `s3xx`.
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(self.redirect_policy(&datum))
             .default_headers(headers)
             .timeout(self.request_timeout);
         // Pin the protocol version when the operator asked for one. `Auto` leaves
@@ -1240,64 +1337,22 @@ mod tests {
     /// status line and closes. Enough for reqwest to receive and classify a real
     /// response without pulling in an HTTP-server dependency.
     fn spawn_http_server(status_line: &'static str) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_srv = stop.clone();
-        let handle = thread::spawn(move || {
-            while !stop_srv.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut s, _)) => {
-                        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
-                        let mut buf = [0u8; 1024];
-                        let _ = s.read(&mut buf); // best-effort: drain the request line/headers
-                        let resp = format!(
-                            "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = s.write_all(resp.as_bytes());
-                    }
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        (port, stop, handle)
+        serve(move |_| {
+            format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        })
     }
 
     /// A server that answers every request with `302 Found` pointing at
-    /// `location`, plus a counter of how many connections it served.
+    /// `location`.
     fn spawn_redirect_server(
         location: String,
     ) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_srv = stop.clone();
-        let handle = thread::spawn(move || {
-            while !stop_srv.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut s, _)) => {
-                        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
-                        let mut buf = [0u8; 1024];
-                        let _ = s.read(&mut buf);
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
-                             Content-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = s.write_all(resp.as_bytes());
-                    }
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        (port, stop, handle)
+        serve(move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        })
     }
 
     #[test]
@@ -1336,6 +1391,181 @@ mod tests {
         );
         assert!(report.units_sent > 0, "should have completed some responses");
         assert_eq!(report.status_3xx, report.units_sent, "every completion was the 302");
+    }
+
+    /// A server that answers `302 Found -> /final` for every path except
+    /// `/final`, which answers `404`. The shape of a real target whose
+    /// interesting status only exists at the end of the chain.
+    fn spawn_two_hop_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        serve(|req| {
+            if req.starts_with("GET /final ") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            } else {
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+                    .to_string()
+            }
+        })
+    }
+
+    /// The accept loop the test servers share: answer each connection with
+    /// whatever `respond` makes of the request bytes, then close.
+    fn serve(
+        respond: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let handle = thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+                        let mut buf = [0u8; 2048];
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = s.write_all(respond(&req).as_bytes());
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, stop, handle)
+    }
+
+    /// Run a short flood against `url` and return the report. The knobs every
+    /// test below shares.
+    fn run_against(engine: &mut L7Engine) -> RunReport {
+        let plan = RunPlan {
+            targets: engine.authorize_target().unwrap(),
+            rate_cap: RateCap::new(50),
+            duration: Duration::from_millis(400),
+            kill: KillSwitch::new(),
+        };
+        engine.execute(&plan).expect("the run should execute")
+    }
+
+    /// REGRESSION: the client sent no `User-Agent` at all, because `reqwest`
+    /// adds none and the engine started from an empty header map. That is not a
+    /// neutral request — a WAF answers it with a challenge or a redirect, and
+    /// the run then reports a status class the operator cannot reproduce with a
+    /// browser against the same URL.
+    #[test]
+    fn every_request_identifies_itself_with_a_user_agent() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (port, stop, handle) = serve(move |req| {
+            sink.lock().unwrap().push(req.to_lowercase());
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "the server saw no request at all");
+        let want = format!("user-agent: {}", DEFAULT_USER_AGENT.to_lowercase());
+        assert!(
+            seen.iter().all(|r| r.contains(&want)),
+            "a request went out without the default User-Agent: {seen:?}"
+        );
+    }
+
+    /// The default is a default, not a policy: an operator testing a specific
+    /// client profile replaces it through `--header` and gets exactly that
+    /// header, once.
+    #[test]
+    fn an_operator_user_agent_replaces_the_default_rather_than_joining_it() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (port, stop, handle) = serve(move |req| {
+            sink.lock().unwrap().push(req.to_lowercase());
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut spec = RequestSpec::new(&url);
+        spec.headers = vec![("User-Agent".to_string(), "curl/8.4.0".to_string())];
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), spec);
+        run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "the server saw no request at all");
+        for req in seen.iter() {
+            assert!(req.contains("user-agent: curl/8.4.0"), "operator UA missing: {req}");
+            assert!(!req.contains("jinrai/"), "the default UA was sent as well: {req}");
+        }
+    }
+
+    /// The default stays what it was: a 3xx is a response, not a hop.
+    #[test]
+    fn redirects_are_not_followed_unless_asked_for() {
+        let (port, stop, handle) = spawn_two_hop_server();
+        let url = format!("http://127.0.0.1:{port}/start");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url));
+        let report = run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "should have completed some responses");
+        assert_eq!(report.status_3xx, report.units_sent, "every completion was the 302");
+        assert_eq!(report.status_4xx, 0, "nothing should have reached /final");
+    }
+
+    /// The fix for a run that reported `3xx 100%` while the target's own logs
+    /// showed the 404 at the end of the chain: with the hop allowed, the status
+    /// recorded is the one the chain lands on.
+    #[test]
+    fn a_same_origin_redirect_is_followed_to_its_final_status() {
+        let (port, stop, handle) = spawn_two_hop_server();
+        let url = format!("http://127.0.0.1:{port}/start");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_follow_redirects(3);
+        let report = run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(report.units_sent > 0, "should have completed some responses");
+        assert_eq!(report.status_4xx, report.units_sent, "every completion was the final 404");
+        assert_eq!(report.status_3xx, 0, "the 302 should have been followed, not counted");
+    }
+
+    /// The safety property survives the new flag. `--follow-redirects` relaxes
+    /// *how far* the client walks on the approved origin, never *which* origin
+    /// it walks on — so the off-host `Location:` is refused exactly as it is
+    /// with following off.
+    #[test]
+    fn following_redirects_still_never_walks_the_client_off_the_authorized_host() {
+        let elsewhere = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let elsewhere_port = elsewhere.local_addr().unwrap().port();
+        elsewhere.set_nonblocking(true).unwrap();
+
+        // A different port on the same loopback IP is enough: the gate approved
+        // one datum, and the pin covers that host *and* port.
+        let (port, stop, handle) =
+            spawn_redirect_server(format!("http://127.0.0.1:{elsewhere_port}/pwned"));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut engine = L7Engine::new(gate_cidrs(&["127.0.0.0/8"]), RequestSpec::new(&url))
+            .with_follow_redirects(5);
+        let report = run_against(&mut engine);
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(
+            matches!(elsewhere.accept(), Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "the client followed the redirect and connected to an unauthorized origin"
+        );
+        assert!(report.units_sent > 0, "should have completed some responses");
+        assert_eq!(report.status_3xx, report.units_sent, "the off-origin 302 stays a 302");
     }
 
     #[test]

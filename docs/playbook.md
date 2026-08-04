@@ -4,7 +4,7 @@ One section per row of a test plan, with the ready-to-paste command and an
 explanation of **every switch in it**, so whoever runs the test knows exactly
 what lands on the wire and how to read the result.
 
-Reference version: **0.42.0**.
+Reference version: **0.43.0**.
 
 ---
 
@@ -730,11 +730,28 @@ jinrai $A --url $URL --l7-method get \
 
 | Switch | What it does here |
 |---|---|
-| `--header '<K: V>'` | An extra request header, **repeatable**. This is the hook for request-profile tests (User-Agent, Referer, Cookie…). |
+| `--header '<K: V>'` | An extra request header, **repeatable**. This is the hook for request-profile tests (User-Agent, Referer, Cookie…). Requests already carry `User-Agent: jinrai/<version>`; a `--header` of the same name replaces it. |
 
 > Note: User-Agent/Referer rotation in the HULK style is **out of scope by
 > design** — that is evasion, not load. This flag exists to send a declared
 > profile, not to hide one.
+
+**When the summary and the target's log disagree.** Two request properties decide
+whether a run measures the target or the appliance in front of it, and both show
+up as a status class you cannot reproduce in a browser against the same URL:
+
+* **No `User-Agent`** — a WAF or bot filter answers a headerless request with a
+  challenge or a redirect, so the run reports the filter, not the target. Every
+  request now identifies itself; override with `--header` when the test is about
+  a specific client profile.
+* **A redirect that was counted, not followed** — a target answering `302` to a
+  login page reports `3xx 100%`, while a browser ends on the `404` two hops
+  later. `--follow-redirects <N>` records the status at the end of the chain
+  instead, for up to `N` hops that stay on the authorized origin (host, port and
+  scheme unchanged — a `Location:` naming anything else always stops the chain
+  and reports the `3xx`). **It costs rate**: a followed hop is a second request
+  `--rate` never counted, so `N` hops can offer up to `(1 + N) x --rate`
+  requests/sec. Keep `N` at the chain length you actually expect, usually `1`.
 
 ---
 

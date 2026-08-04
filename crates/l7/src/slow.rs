@@ -383,11 +383,13 @@ async fn drive_connection<S: AsyncRead + AsyncWrite + Unpin>(
 ) {
     // Opening bytes. Headers/Body deliberately never complete the request;
     // Read sends a *complete* request and then drains the response slowly.
+    // One `User-Agent` for the whole crate — see [`crate::DEFAULT_USER_AGENT`].
+    let ua = crate::DEFAULT_USER_AGENT;
     let opening = match mode {
         SlowMode::Headers => {
             // Request line + Host, but NO terminating "\r\n" — the server keeps
             // waiting for the rest of the headers.
-            format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: jinrai\r\n")
+            format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {ua}\r\n")
         }
         SlowMode::Body => {
             // Complete headers with an oversized body length, then trickle the body.
@@ -402,7 +404,7 @@ async fn drive_connection<S: AsyncRead + AsyncWrite + Unpin>(
             // sending a response, which we then refuse to drain quickly.
             format!(
                 "GET {target} HTTP/1.1\r\nHost: {host_header}\r\n\
-                 User-Agent: jinrai\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n"
+                 User-Agent: {ua}\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n"
             )
         }
     };

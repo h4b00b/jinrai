@@ -308,6 +308,17 @@ OPTIONS:
                           latency is the socket count, so this is what keeps a run
                           from becoming a descriptor self-test on YOUR box. 0
                           means unbounded — an explicit choice, never the default
+    --follow-redirects <N>  Follow up to N SAME-ORIGIN redirect hops per request,
+                          so the status recorded is the one at the end of the
+                          chain and not the 3xx that started it (default: 0 —
+                          every redirect is counted, never followed). A
+                          Location: naming a different host, port or scheme is
+                          never followed at any N: the gate authorized one
+                          origin and the DNS pin covers only that one, so the
+                          chain stops there and the 3xx is reported. COSTS RATE:
+                          a followed hop is a second request --rate never
+                          counted, so N hops can put up to (1+N) x --rate
+                          requests/sec on the target
     --request-timeout-ms <MS>  How long one l7 request may stay unresolved before
                           it is abandoned and counted in the `timeout` errno
                           bucket (default: 10000). Applies to the fast
@@ -367,7 +378,11 @@ OPTIONS:
                           traffic only UP TO this rate, never above it.
     --duration <SECS>     Run duration (default: 10, max 86400)
     --header <K: V>       Extra request header for l7 (repeatable). Also the hook
-                          for header-profile tests (User-Agent, Cookie, Referer…)
+                          for header-profile tests (User-Agent, Cookie, Referer…).
+                          Requests carry `User-Agent: jinrai/<version>` unless
+                          this overrides it — sending none at all makes WAFs and
+                          bot filters answer differently from a real client, so
+                          the run measures the filter, not the target
 
     Load profiles (l7 fast methods; --rate is the peak/ceiling for every shape):
     --profile <SHAPE>     constant  flat at the ceiling (default)
@@ -530,6 +545,9 @@ struct Args {
     slow_connections: usize,
     drip_ms: u64,
     max_connections: usize,
+    /// How many same-origin redirect hops one l7 request may follow. `0` counts
+    /// the 3xx without following it — the historical (and safe) default.
+    follow_redirects: u32,
     request_timeout_ms: u64,
     drain_timeout_ms: u64,
     layer: Layer,
@@ -954,6 +972,7 @@ fn run_l7(
             let mut engine = L7Engine::new(gate, spec)
                 .with_slo(args.slo)
                 .with_max_connections(args.max_connections)
+                .with_follow_redirects(args.follow_redirects)
                 .with_request_timeout(Duration::from_millis(args.request_timeout_ms))
                 .with_drain_grace(Duration::from_millis(args.drain_timeout_ms));
             if let Some(p) = l7_profile(args, rate_cap, duration) {
@@ -1146,6 +1165,17 @@ fn run_l7(
         }
         if args.max_connections > 0 {
             notes.push(format!("max {} concurrent connections", args.max_connections));
+        }
+        // Without this the summary's `attempts` silently stops meaning "requests
+        // the target saw": each attempt is one unit, but a followed hop is a
+        // second request on the wire that no counter here shows. Naming the
+        // ceiling lets the reader bound the difference.
+        if args.follow_redirects > 0 {
+            notes.push(format!(
+                "following up to {} same-origin redirect{}",
+                args.follow_redirects,
+                if args.follow_redirects == 1 { "" } else { "s" }
+            ));
         }
     }
     // The connection-holding methods open --slow-connections connections and then
@@ -1524,6 +1554,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
     let mut slow_connections = 100usize;
     let mut drip_ms = 10_000u64;
     let mut max_connections = jinrai_l7::DEFAULT_MAX_CONNS;
+    let mut follow_redirects = 0u32;
     let mut request_timeout_ms = jinrai_l7::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64;
     let mut drain_timeout_ms = jinrai_l7::DEFAULT_DRAIN_GRACE.as_millis() as u64;
     let mut layer = Layer::L7;
@@ -1686,6 +1717,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             "--max-connections" => {
                 max_connections =
                     parse_capped(&mut it, "--max-connections", MAX_CONNECTIONS as u64)? as usize;
+            }
+            "--follow-redirects" => {
+                follow_redirects =
+                    parse_capped(&mut it, "--follow-redirects", MAX_FOLLOW_REDIRECTS as u64)? as u32;
             }
             "--request-timeout-ms" => {
                 request_timeout_ms = parse_capped(&mut it, "--request-timeout-ms", MAX_TIMEOUT_MS)?;
@@ -1895,7 +1930,8 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
             &["--target", "--port", "--port-order", "--concurrency", "--connect-timeout-ms"][..],
         ),
         Layer::L3 | Layer::L4 => {
-            ("--target", &["--url", "--header", "--l7-method", "--max-connections"][..])
+            ("--target", &["--url", "--header", "--l7-method", "--max-connections",
+                "--follow-redirects"][..])
         }
     };
     // Reported through the same warning as the rest when the run is not l7 at all.
@@ -2004,6 +2040,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Option<Args>, S
         slow_connections,
         drip_ms,
         max_connections,
+        follow_redirects,
         request_timeout_ms,
         drain_timeout_ms,
         layer,
@@ -2078,6 +2115,14 @@ const MAX_DURATION_SECS: u64 = 86_400;
 /// value is also used as an allocation size, so an unbounded one aborts the
 /// process on a capacity overflow before a single packet is sent.
 const MAX_CONNECTIONS: usize = 1_048_576;
+
+/// Upper bound on `--follow-redirects`. Each hop the operator allows is another
+/// request per unit that `--rate` did not count, so the ceiling is what bounds
+/// how far the real request rate can diverge from the declared one: at 10 hops a
+/// run can already offer eleven times the load its own cap names. No legitimate
+/// chain on an authorized origin is that long — past a couple of hops it is a
+/// loop, and a loop stops at the ceiling rather than running to it.
+const MAX_FOLLOW_REDIRECTS: u32 = 10;
 
 /// Upper bound on `--watchdog-breaches`. The watchdog aborts after this many
 /// consecutive breaching windows, so `breaches × window` is how long a target may
@@ -2183,6 +2228,24 @@ mod tests {
             jinrai_l7::DEFAULT_MAX_CONNS,
             "concurrency must default to a finite cap, not unbounded"
         );
+        assert_eq!(
+            a.follow_redirects, 0,
+            "following redirects sends requests --rate never counted: it must be asked for"
+        );
+    }
+
+    /// The hop ceiling is what bounds how far the real request rate can diverge
+    /// from the declared `--rate`, so it is a parse-time refusal like every
+    /// other numeric ceiling — not something clamped quietly later.
+    #[test]
+    fn follow_redirects_is_capped_at_the_parser() {
+        let base = ["--allow", "10.0.0.0/8", "--url", "http://10.1.2.3/"];
+        let a = args_of(&[&base[..], &["--follow-redirects", "3"]].concat());
+        assert_eq!(a.follow_redirects, 3);
+
+        let err = parse(&[&base[..], &["--follow-redirects", "11"]].concat()).unwrap_err();
+        assert!(err.contains("--follow-redirects"), "{err}");
+        assert!(err.contains("at most 10"), "{err}");
     }
 
     #[test]
