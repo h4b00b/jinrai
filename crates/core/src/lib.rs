@@ -291,8 +291,20 @@ pub enum ErrnoBucket {
     /// Any other OS error, carrying the raw code so it stays actionable without
     /// a code change here.
     Other(i32),
-    /// The attempt was refused before it reached the OS (a structural mismatch,
-    /// e.g. an IPv6 target handed to an IPv4-only primitive). No errno exists.
+    /// A failure with **no OS error behind it**, from either of two places.
+    ///
+    /// For the packet layers it is a structural refusal before the attempt ever
+    /// reached the OS — an IPv6 target handed to an IPv4-only primitive, say.
+    ///
+    /// For L7 it is the opposite end: the socket worked, and the failure came
+    /// from the HTTP stack itself as a *synthetic* `io::Error` carrying no
+    /// errno — typically an in-flight request killed when the peer closed the
+    /// connection under it (an HTTP/2 `GOAWAY`, a per-connection request limit,
+    /// an idle reaper), or a TLS-layer error.
+    ///
+    /// The two have nothing in common but the absent errno, so the reporter
+    /// explains this bucket per layer rather than with one sentence that is
+    /// wrong for whichever layer is not being run. See `errno_meaning`.
     Internal,
 }
 
@@ -501,6 +513,20 @@ pub struct RunReport {
     /// response leave it empty and the reporter omits it. Sums to `units_sent` for
     /// the fast L7 methods.
     pub http_versions: BTreeMap<String, u64>,
+    /// Completed responses tallied by their **exact** status code (`200`, `429`,
+    /// `400`, …), where `status_2xx`/`status_4xx`/… only carry the class.
+    ///
+    /// The class is not enough to act on, and the gap is widest exactly where it
+    /// matters: inside `4xx`, a `400` says the request jinrai sent was malformed
+    /// (the *test* is broken and measured nothing), a `401`/`403` is the target
+    /// behaving normally, and a `429` is the rate limiter engaging — which is
+    /// usually the finding the run went looking for. Three opposite conclusions
+    /// reported as one number. `5xx` splits the same way: a `503` from a shed
+    /// load balancer is not a `500` from a crashing handler.
+    ///
+    /// Layers without a response leave it empty and the reporter omits it. Sums
+    /// to `units_sent` for the fast L7 methods.
+    pub status_codes: BTreeMap<u16, u64>,
     /// The module's own breakdown of what `units_sent` was made of, when the
     /// completed/failed split does not carry the finding.
     ///

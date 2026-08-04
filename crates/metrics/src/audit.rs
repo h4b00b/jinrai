@@ -88,6 +88,11 @@ pub enum AuditEvent {
         /// Completions by the HTTP version actually used on the wire — so a
         /// reviewer can tell months later whether a run was HTTP/1.1 or HTTP/2.
         http_versions: Vec<(String, u64)>,
+        /// Completions by **exact** status code, as `(code, count)` pairs. The
+        /// `status_*` classes above cannot distinguish "the target rate-limited
+        /// us" (429) from "our request was malformed" (400), and after the fact
+        /// nobody can re-run the traffic to find out which it was.
+        status_codes: Vec<(u16, u64)>,
         p50_micros: u64,
         p90_micros: u64,
         p99_micros: u64,
@@ -119,6 +124,7 @@ impl AuditEvent {
                 .iter()
                 .map(|(v, n)| (v.clone(), *n))
                 .collect(),
+            status_codes: report.status_codes.iter().map(|(c, n)| (*c, *n)).collect(),
             aborted_early: report.aborted_early,
             aborted_by_watchdog: report.aborted_by_watchdog,
             status_2xx: report.status_2xx,
@@ -174,6 +180,7 @@ impl AuditEvent {
                 timeouts,
                 errno,
                 http_versions,
+                status_codes,
                 p99_micros,
                 slo,
                 ..
@@ -190,6 +197,13 @@ impl AuditEvent {
                         "; status 2xx={status_2xx} 3xx={status_3xx} 4xx={status_4xx} \
                          5xx={status_5xx}"
                     ));
+                }
+                // The classes cannot answer "was that 4xx a rate limit?", and by
+                // the time anyone reads the log the traffic is long gone.
+                if !status_codes.is_empty() {
+                    let v: Vec<String> =
+                        status_codes.iter().map(|(c, n)| format!("{c}={n}")).collect();
+                    s.push_str(&format!("; codes {}", v.join(" ")));
                 }
                 if !http_versions.is_empty() {
                     let v: Vec<String> =
@@ -252,6 +266,7 @@ impl AuditEvent {
                 timeouts,
                 errno,
                 http_versions,
+                status_codes,
                 p50_micros,
                 p90_micros,
                 p99_micros,
@@ -262,7 +277,7 @@ impl AuditEvent {
                  \"units_sent\":{},\"errors\":{},\
                  \"aborted_early\":{},\"aborted_by_watchdog\":{},\
                  \"status\":{{\"c2xx\":{},\"c3xx\":{},\"c4xx\":{},\"c5xx\":{},\"timeout\":{}}},\
-                 \"errno\":{},\"http_versions\":{},\
+                 \"errno\":{},\"http_versions\":{},\"status_codes\":{},\
                  \"latency_us\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},\"slo\":\"{}\"",
                 json_escape(layer_label),
                 attempts,
@@ -277,6 +292,7 @@ impl AuditEvent {
                 timeouts,
                 json_count_object(errno),
                 json_count_object(http_versions),
+                json_code_object(status_codes),
                 p50_micros,
                 p90_micros,
                 p99_micros,
@@ -778,6 +794,21 @@ fn json_count_object(items: &[(String, u64)]) -> String {
         out.push_str(&json_escape(k));
         out.push_str("\":");
         out.push_str(&n.to_string());
+    }
+    out.push('}');
+    out
+}
+
+/// `(code, count)` pairs as a JSON object: `{"200":875,"429":118}`. Keys are
+/// strings because JSON objects have no other kind, and a numeric status is
+/// still the natural key to `jq` on.
+fn json_code_object(items: &[(u16, u64)]) -> String {
+    let mut out = String::from("{");
+    for (i, (c, n)) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("\"{c}\":{n}"));
     }
     out.push('}');
     out

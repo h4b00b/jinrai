@@ -531,6 +531,7 @@ instead (stable for scripts and log scraping):
  attempts   6000 total, 199.4/s achieved (100% of the 200/s cap)
  completed  5994 (99.9%)
    status   2xx 5900 (98.4%)   3xx 0 (0.0%)   4xx 40 (0.7%)   5xx 54 (0.9%)
+   of which 200 x5900   503 x54   429 x37   400 x3
    protocol HTTP/1.1 5994
  failed     6 (0.1%), of which 6 timed out
             6 x timeout — our own attempt timeout expired first
@@ -542,14 +543,22 @@ instead (stable for scripts and log scraping):
 
 On a terminal the block is coloured, in three senses only: **green** = the run
 did what it set out to do (`completed`, `failed 0`, `2xx`, `SLO: PASS`, `ran to
-completion`), **yellow** = a caveat about *our* side (`bound by`, `not offered`,
+completion`), **yellow** = a caveat about *our* side (`bound by`, `not sent`,
 a local errno ceiling, an operator abort, `4xx`), **red** = failure and the
 target's own errors (`failed`, `5xx`, a remote errno, `SLO: FAIL`, a watchdog
 abort, the hollow-run `WARNING`). `--color auto|always|never` controls it;
 `auto` paints only when stdout is a terminal and `NO_COLOR` is unset, so a
 redirected report is exactly the plain block above.
 
-Five things the block is there to make unmissable:
+Six things the block is there to make unmissable:
+
+* **Which status codes, not just which classes** — `4xx 40` is three different
+  findings depending on whether those were `400`s (the request *jinrai* sent was
+  malformed, so the run measured nothing), `401`/`403`s (the target behaving
+  normally) or `429`s (the rate limiter engaged — usually the result the run went
+  looking for). The `of which` row names them, ranked by count, and the audit log
+  records them under `status_codes` so the question is still answerable months
+  later. An all-`2xx` run gets no row: it would only repeat the class.
 
 * **When the run happened** — `started` / `finished` (RFC 3339 UTC) bracket the
   window, so the block can be lined up against the target's own logs, graphs and
@@ -797,12 +806,12 @@ longer `--request-timeout-ms`, which is why the bucket is kept separate from
 many requests can be in flight at once. An operator Ctrl-C or a watchdog abort
 skips the grace entirely and cancels immediately: an abort must be prompt.
 
-### What the client looks like: `User-Agent` and redirects
+### What the client looks like: `User-Agent`, body type, redirects
 
-Two properties of the request decide whether a run measures the target or the
-appliance in front of it. Both have bitten the same way: the summary reports a
-status class you cannot reproduce in a browser against the same URL, and nothing
-in the run says why.
+Three properties of the request decide whether a run measures the target or the
+appliance in front of it. All three have bitten the same way: the summary reports
+a status class you cannot reproduce in a browser against the same URL, and
+nothing in the run says why.
 
 **Every request carries `User-Agent: jinrai/<version>`.** Sending no
 `User-Agent` at all is not the neutral choice it looks like — WAFs, CDNs and bot
@@ -811,6 +820,18 @@ filters answer a headerless request differently from the same request carrying
 the honest default for a load generator pointed at authorized infrastructure.
 `--header "User-Agent: ..."` replaces it when the point of the test is a
 specific client profile; the default is a default, not a policy.
+
+**`--body` is sent verbatim, with no `Content-Type` of its own.** Guessing one
+from the bytes would put a header on the wire you never wrote, so jinrai does
+not — but a target that cannot tell what the body *is* rejects it (`415`/`400`)
+or ignores it, and either way the parsing, validation and persistence cost you
+meant to measure is never paid. The `4xx` that comes back then reads as a finding
+about the target instead of a broken request. jinrai warns when `--body` arrives
+without the header; pair them:
+
+```sh
+--body '{"q":"load"}' --header 'Content-Type: application/json'
+```
 
 **A redirect is counted, not followed — unless you ask for it.**
 
